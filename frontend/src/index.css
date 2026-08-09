@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+/*
+ * Accessibility: consistent, visible keyboard-focus indicator across every
+ * interactive element. Tailwind's utility classes handle hover/active
+ * states per-component, but a global :focus-visible rule is what makes
+ * keyboard navigation (Tab through the app) actually usable everywhere,
+ * not just on the handful of elements someone remembered to add a
+ * focus:ring class to. :focus-visible (not :focus) so mouse clicks don't
+ * show the ring — only keyboard/programmatic focus does.
+ */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid #0f172a;
+  outline-offset: 2px;
+}

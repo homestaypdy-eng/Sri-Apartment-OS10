@@ -1,0 +1,213 @@
+"""
+Tests completing the Users module to full production coverage: password
+reset (a completely missing flow) and session management (turning
+stateless JWTs into real, revocable sessions).
+Run with: pytest tests/test_users_completion.py -v
+"""
+import hashlib
+import secrets
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+ADMIN_EMAIL = "homestaypdy@gmail.com"
+ADMIN_PASSWORD = "Sri@2026"
+
+
+@pytest.fixture(scope="module")
+def headers():
+    resp = client.post("/api/v1/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
+    assert resp.status_code == 200
+    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+def _make_test_user(headers):
+    email = f"userscomp{uuid.uuid4().hex[:8]}@test.com"
+    resp = client.post("/api/v1/auth/register", headers=headers, json={"name": "Users Completion Test", "email": email, "password": "OldPass123!", "role": "staff"})
+    assert resp.status_code == 201, resp.text
+    return email, resp.json()
+
+
+def _make_reset_token(user_id, minutes=30):
+    from app.db.session import SessionLocal
+    from app.modules.auth.models import PasswordResetToken
+    db = SessionLocal()
+    try:
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        row = PasswordResetToken(user_id=uuid.UUID(user_id), token_hash=token_hash, expires_at=datetime.now(timezone.utc) + timedelta(minutes=minutes))
+        db.add(row)
+        db.commit()
+    finally:
+        db.close()
+    return raw_token
+
+
+def test_forgot_password_always_returns_generic_message_for_unknown_email(headers):
+    resp = client.post("/api/v1/auth/forgot-password", json={"email": f"doesnotexist{uuid.uuid4().hex[:8]}@test.com"})
+    assert resp.status_code == 200
+    assert "if that email is registered" in resp.json()["message"].lower()
+
+
+def test_forgot_password_creates_a_real_token_for_known_email(headers):
+    email, user = _make_test_user(headers)
+    resp = client.post("/api/v1/auth/forgot-password", json={"email": email})
+    assert resp.status_code == 200
+
+    from app.db.session import SessionLocal
+    from app.modules.auth.models import PasswordResetToken
+    db = SessionLocal()
+    try:
+        token_row = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == uuid.UUID(user["id"])).first()
+        assert token_row is not None
+        assert token_row.consumed_at is None
+    finally:
+        db.close()
+
+
+def test_reset_password_with_valid_token_actually_changes_password(headers):
+    email, user = _make_test_user(headers)
+    raw_token = _make_reset_token(user["id"])
+
+    resp = client.post("/api/v1/auth/reset-password", json={"token": raw_token, "new_password": "BrandNewPass456!"})
+    assert resp.status_code == 200, resp.text
+
+    old_login = client.post("/api/v1/auth/login", json={"email": email, "password": "OldPass123!"})
+    assert old_login.status_code == 401
+
+    new_login = client.post("/api/v1/auth/login", json={"email": email, "password": "BrandNewPass456!"})
+    assert new_login.status_code == 200
+
+
+def test_reset_password_token_is_single_use(headers):
+    email, user = _make_test_user(headers)
+    raw_token = _make_reset_token(user["id"])
+
+    first = client.post("/api/v1/auth/reset-password", json={"token": raw_token, "new_password": "FirstReset123!"})
+    assert first.status_code == 200
+
+    second = client.post("/api/v1/auth/reset-password", json={"token": raw_token, "new_password": "SecondReset123!"})
+    assert second.status_code == 400
+
+
+def test_reset_password_rejects_expired_token(headers):
+    email, user = _make_test_user(headers)
+    raw_token = _make_reset_token(user["id"], minutes=-1)
+
+    resp = client.post("/api/v1/auth/reset-password", json={"token": raw_token, "new_password": "TooLate123!"})
+    assert resp.status_code == 400
+
+
+def test_reset_password_rejects_garbage_token():
+    resp = client.post("/api/v1/auth/reset-password", json={"token": "not-a-real-token", "new_password": "Whatever123!"})
+    assert resp.status_code == 400
+
+
+def test_password_reset_revokes_all_existing_sessions(headers):
+    from app.db.session import SessionLocal
+    from app.modules.auth.models import UserSession
+
+    email, user = _make_test_user(headers)
+    login_resp = client.post("/api/v1/auth/login", json={"email": email, "password": "OldPass123!"})
+    assert login_resp.status_code == 200
+
+    db = SessionLocal()
+    try:
+        active_before = db.query(UserSession).filter(UserSession.user_id == uuid.UUID(user["id"]), UserSession.revoked_at.is_(None)).count()
+        assert active_before >= 1
+    finally:
+        db.close()
+
+    raw_token = _make_reset_token(user["id"])
+    client.post("/api/v1/auth/reset-password", json={"token": raw_token, "new_password": "PostResetPass123!"})
+
+    db = SessionLocal()
+    try:
+        active_after = db.query(UserSession).filter(UserSession.user_id == uuid.UUID(user["id"]), UserSession.revoked_at.is_(None)).count()
+        assert active_after == 0
+    finally:
+        db.close()
+
+
+def test_password_reset_logs_audit(headers):
+    email, user = _make_test_user(headers)
+    raw_token = _make_reset_token(user["id"])
+    client.post("/api/v1/auth/reset-password", json={"token": raw_token, "new_password": "AuditCheckPass123!"})
+    logs = client.get("/api/v1/audit/logs", headers=headers, params={"action": "auth.password_reset"}).json()
+    assert any(l["entity_id"] == user["id"] for l in logs)
+
+
+def test_login_creates_a_real_session(headers):
+    email, user = _make_test_user(headers)
+    login = client.post("/api/v1/auth/login", json={"email": email, "password": "OldPass123!"})
+    assert login.status_code == 200
+    user_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    sessions = client.get("/api/v1/auth/sessions", headers=user_headers).json()
+    assert len(sessions) >= 1
+
+
+def test_revoked_session_blocks_refresh(headers):
+    email, user = _make_test_user(headers)
+    login = client.post("/api/v1/auth/login", json={"email": email, "password": "OldPass123!"})
+    refresh_token = login.json()["refresh_token"]
+    user_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    sessions = client.get("/api/v1/auth/sessions", headers=user_headers).json()
+    session_id = sessions[0]["id"]
+
+    revoke_resp = client.post(f"/api/v1/auth/sessions/{session_id}/revoke", headers=user_headers)
+    assert revoke_resp.status_code == 204
+
+    refresh_resp = client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token})
+    assert refresh_resp.status_code == 401
+
+
+def test_revoke_all_sessions_logs_out_everywhere(headers):
+    email, user = _make_test_user(headers)
+    login1 = client.post("/api/v1/auth/login", json={"email": email, "password": "OldPass123!"})
+    refresh1 = login1.json()["refresh_token"]
+    user_headers1 = {"Authorization": f"Bearer {login1.json()['access_token']}"}
+
+    client.post("/api/v1/auth/sessions/revoke-all", headers=user_headers1)
+
+    refresh_resp = client.post("/api/v1/auth/refresh", json={"refresh_token": refresh1})
+    assert refresh_resp.status_code == 401
+
+
+def test_cannot_revoke_another_users_session(headers):
+    email_a, user_a = _make_test_user(headers)
+    email_b, user_b = _make_test_user(headers)
+    login_a = client.post("/api/v1/auth/login", json={"email": email_a, "password": "OldPass123!"})
+    headers_a = {"Authorization": f"Bearer {login_a.json()['access_token']}"}
+    sessions_a = client.get("/api/v1/auth/sessions", headers=headers_a).json()
+    session_a_id = sessions_a[0]["id"]
+
+    login_b = client.post("/api/v1/auth/login", json={"email": email_b, "password": "OldPass123!"})
+    headers_b = {"Authorization": f"Bearer {login_b.json()['access_token']}"}
+
+    resp = client.post(f"/api/v1/auth/sessions/{session_a_id}/revoke", headers=headers_b)
+    assert resp.status_code == 404
+
+
+def test_valid_refresh_still_works_after_this_change(headers):
+    email, user = _make_test_user(headers)
+    login = client.post("/api/v1/auth/login", json={"email": email, "password": "OldPass123!"})
+    refresh_token = login.json()["refresh_token"]
+
+    resp = client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token})
+    assert resp.status_code == 200
+    assert "access_token" in resp.json()
+
+
+def test_existing_login_flow_still_works(headers):
+    resp = client.post("/api/v1/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
+    assert resp.status_code == 200
+    assert "access_token" in resp.json()
+    assert "refresh_token" in resp.json()
