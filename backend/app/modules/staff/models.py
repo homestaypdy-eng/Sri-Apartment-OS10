@@ -10,6 +10,7 @@ from app.db.session import Base
 ATTENDANCE_STATUSES = ("present", "absent", "half_day", "on_leave")
 LEAVE_STATUSES = ("pending", "approved", "rejected")
 PAYROLL_STATUSES = ("draft", "paid")
+STAFF_ADVANCE_STATUSES = ("pending", "partially_deducted", "fully_deducted")
 
 
 class Attendance(Base):
@@ -131,3 +132,99 @@ class StaffPerformanceNote(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", foreign_keys=[user_id])
+
+
+class StaffProfile(Base):
+    """
+    A 1:1 HR profile attached to an existing User — deliberately NOT a
+    replacement identity. Attendance/LeaveRequest/Payroll/Shift/
+    StaffPerformanceNote/StaffApartmentAssignment all keep referencing
+    users.id exactly as before; this table only adds employment/personal/
+    bank data that has nowhere else to live, without touching any of them
+    or the users table itself. A User can exist with no StaffProfile row
+    (every existing sub-module keeps working either way) — this table is
+    purely additive.
+    """
+
+    __tablename__ = "staff_profiles"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), unique=True, nullable=False)
+
+    # Identity / employment
+    employee_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    designation: Mapped[str | None] = mapped_column(String(100), nullable=True)  # free text, e.g. "Housekeeping Supervisor" — not an enum
+    department: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    employment_type: Mapped[str | None] = mapped_column(String(30), nullable=True)  # e.g. full_time/part_time/contract
+    join_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    exit_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True)  # employment status — independent of User.is_active (login access)
+
+    # Contact
+    phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    alternate_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # Personal
+    date_of_birth: Mapped[date | None] = mapped_column(Date, nullable=True)
+    address: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Emergency contact
+    emergency_contact_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    emergency_contact_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    emergency_contact_relationship: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    # ID / documents (single-field, same pattern as Guest.id_proof_* — no upload subsystem in this phase)
+    id_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    id_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+    # Bank / payroll preference — NOT a salary field; actual pay history lives in Payroll
+    bank_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    account_holder_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    account_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    ifsc: Mapped[str | None] = mapped_column(String(15), nullable=True)
+    payment_method: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # Work
+    weekly_off_day: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    supervisor_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", foreign_keys=[user_id])
+    supervisor = relationship("User", foreign_keys=[supervisor_user_id])
+
+
+class StaffAdvance(Base):
+    """
+    A salary advance/bonus/reimbursement/loan given to a staff member,
+    with partial-deduction tracking against future payroll. References
+    user_id directly (same convention as every other staff-domain table)
+    rather than staff_profiles.id, so it works even before a StaffProfile
+    exists for that user. deducted_amount is a running total updated only
+    via the /advances/{id}/deduct endpoint — outstanding balance is always
+    amount - deducted_amount, computed on read, never stored separately.
+    """
+
+    __tablename__ = "staff_advances"
+    __table_args__ = (CheckConstraint(f"status IN {STAFF_ADVANCE_STATUSES}", name="ck_staff_advance_status"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    category: Mapped[str] = mapped_column(String(20), default="advance")  # advance/bonus/reimbursement/loan
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payment_method: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    reference_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    deducted_amount: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
+    linked_payroll_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("payroll.id"), nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", foreign_keys=[user_id])
+
+    @property
+    def outstanding_amount(self) -> float:
+        return float(self.amount) - float(self.deducted_amount)

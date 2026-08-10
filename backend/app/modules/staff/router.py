@@ -8,7 +8,17 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.modules.auth.models import User
-from app.modules.staff.models import Attendance, Holiday, LeaveRequest, Payroll, Shift, StaffApartmentAssignment, StaffPerformanceNote
+from app.modules.staff.models import (
+    Attendance,
+    Holiday,
+    LeaveRequest,
+    Payroll,
+    Shift,
+    StaffAdvance,
+    StaffApartmentAssignment,
+    StaffPerformanceNote,
+    StaffProfile,
+)
 from app.modules.staff.schemas import (
     AttendanceCreate,
     AttendanceOut,
@@ -21,14 +31,22 @@ from app.modules.staff.schemas import (
     PayrollOut,
     ShiftCreate,
     ShiftOut,
+    StaffAdvanceCreate,
+    StaffAdvanceDeduct,
+    StaffAdvanceOut,
+    StaffAdvanceUpdate,
     StaffApartmentAssignmentCreate,
     StaffApartmentAssignmentOut,
     StaffPerformanceNoteCreate,
     StaffPerformanceNoteOut,
+    StaffProfileCreate,
+    StaffProfileOut,
+    StaffProfileUpdate,
 )
 from app.modules.audit.schemas import record_audit_log
 from app.modules.finance.models import Expense
 from app.modules.notifications.service import trigger_leave_reviewed, trigger_payroll_paid
+from app.modules.properties.models import Unit
 from app.shared.rbac import get_current_user, require_role
 
 router = APIRouter(prefix="/api/v1/staff", tags=["staff"])
@@ -205,6 +223,13 @@ def list_holidays(db: Session = Depends(get_db)):
 
 @router.post("/apartment-assignments", response_model=StaffApartmentAssignmentOut, status_code=201, dependencies=[Depends(require_role("admin"))])
 def create_apartment_assignment(payload: StaffApartmentAssignmentCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if db.get(User, payload.user_id) is None:
+        raise HTTPException(404, "Staff user not found")
+    unit = db.get(Unit, payload.unit_id)
+    if unit is None:
+        raise HTTPException(404, "Unit not found")
+    if not unit.is_active or not unit.property.is_active:
+        raise HTTPException(409, "This unit (or its property) is deactivated and cannot accept new staff assignments")
     assignment = StaffApartmentAssignment(**payload.model_dump())
     db.add(assignment)
     try:
@@ -255,3 +280,190 @@ def list_performance_notes(user_id: uuid.UUID | None = None, db: Session = Depen
     if user_id:
         query = query.where(StaffPerformanceNote.user_id == user_id)
     return db.scalars(query).all()
+
+
+# --- Staff Profiles (1:1 HR profile attached to an existing User) ---
+
+@router.post("/profiles", response_model=StaffProfileOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+def create_staff_profile(payload: StaffProfileCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    target = db.get(User, payload.user_id)
+    if target is None:
+        raise HTTPException(404, "User not found")
+    if db.scalar(select(StaffProfile).where(StaffProfile.user_id == payload.user_id)) is not None:
+        raise HTTPException(409, "This user already has a staff profile")
+    if payload.supervisor_user_id is not None:
+        if payload.supervisor_user_id == payload.user_id:
+            raise HTTPException(400, "A staff member cannot be their own supervisor")
+        if db.get(User, payload.supervisor_user_id) is None:
+            raise HTTPException(404, "Supervisor user not found")
+
+    profile = StaffProfile(**payload.model_dump())
+    db.add(profile)
+    db.flush()
+    record_audit_log(db, user.id, "staff.create", entity_type="staff_profile", entity_id=str(profile.id), details=f"Profile created for user {payload.user_id}")
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+@router.get("/profiles", response_model=list[StaffProfileOut], dependencies=[Depends(require_role("admin", "staff"))])
+def list_staff_profiles(db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
+    query = select(StaffProfile)
+    if actor.role.name != "admin":
+        query = query.where(StaffProfile.user_id == actor.id)
+    return db.scalars(query).all()
+
+
+@router.get("/profiles/{profile_id}", response_model=StaffProfileOut, dependencies=[Depends(require_role("admin", "staff"))])
+def get_staff_profile(profile_id: uuid.UUID, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
+    profile = db.get(StaffProfile, profile_id)
+    if profile is None:
+        raise HTTPException(404, "Staff profile not found")
+    if actor.role.name != "admin" and profile.user_id != actor.id:
+        raise HTTPException(403, "You can only view your own staff profile")
+    return profile
+
+
+@router.patch("/profiles/{profile_id}", response_model=StaffProfileOut, dependencies=[Depends(require_role("admin"))])
+def update_staff_profile(profile_id: uuid.UUID, payload: StaffProfileUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    profile = db.get(StaffProfile, profile_id)
+    if profile is None:
+        raise HTTPException(404, "Staff profile not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(400, "No fields to update were provided")
+    if "supervisor_user_id" in changes and changes["supervisor_user_id"] is not None:
+        if changes["supervisor_user_id"] == profile.user_id:
+            raise HTTPException(400, "A staff member cannot be their own supervisor")
+        if db.get(User, changes["supervisor_user_id"]) is None:
+            raise HTTPException(404, "Supervisor user not found")
+    for field, value in changes.items():
+        setattr(profile, field, value)
+    record_audit_log(db, user.id, "staff.update", entity_type="staff_profile", entity_id=str(profile.id), details=f"Updated: {', '.join(changes.keys())}")
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+@router.patch("/profiles/{profile_id}/deactivate", response_model=StaffProfileOut, dependencies=[Depends(require_role("admin"))])
+def deactivate_staff_profile(profile_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Soft-deactivation only — the profile row and every attendance/leave/
+    payroll/shift/performance/advance record tied to its user_id are
+    untouched. Deliberately does NOT touch User.is_active (login access)
+    — employment status and login access are independent concerns.
+    """
+    profile = db.get(StaffProfile, profile_id)
+    if profile is None:
+        raise HTTPException(404, "Staff profile not found")
+    if not profile.is_active:
+        raise HTTPException(409, "Staff profile is already deactivated")
+    profile.is_active = False
+    record_audit_log(db, user.id, "staff.deactivate", entity_type="staff_profile", entity_id=str(profile.id), details=f"Deactivated user {profile.user_id}")
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+@router.patch("/profiles/{profile_id}/reactivate", response_model=StaffProfileOut, dependencies=[Depends(require_role("admin"))])
+def reactivate_staff_profile(profile_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    profile = db.get(StaffProfile, profile_id)
+    if profile is None:
+        raise HTTPException(404, "Staff profile not found")
+    if profile.is_active:
+        raise HTTPException(409, "Staff profile is already active")
+    profile.is_active = True
+    record_audit_log(db, user.id, "staff.reactivate", entity_type="staff_profile", entity_id=str(profile.id), details=f"Reactivated user {profile.user_id}")
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+# --- Staff Advances ---
+# No existing advance/deduction architecture was found to reuse — confirmed
+# by exhaustive search during the architecture audit; Payroll.deductions is
+# a single flat manual number with no category/reason/status/partial-
+# deduction tracking, and finance/advances is guest-booking-deposit
+# reporting, structurally unrelated. This is a new, minimal ledger.
+
+@router.post("/advances", response_model=StaffAdvanceOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+def create_staff_advance(payload: StaffAdvanceCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if db.get(User, payload.user_id) is None:
+        raise HTTPException(404, "User not found")
+    advance = StaffAdvance(**payload.model_dump(), created_by=user.id)
+    db.add(advance)
+    db.flush()
+    record_audit_log(db, user.id, "staff.advance.create", entity_type="staff_advance", entity_id=str(advance.id), details=f"Rs.{payload.amount} ({payload.category}) for user {payload.user_id}")
+    db.commit()
+    db.refresh(advance)
+    return advance
+
+
+@router.get("/advances", response_model=list[StaffAdvanceOut], dependencies=[Depends(require_role("admin", "staff"))])
+def list_staff_advances(user_id: uuid.UUID | None = None, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
+    query = select(StaffAdvance).order_by(StaffAdvance.date.desc())
+    if actor.role.name != "admin":
+        query = query.where(StaffAdvance.user_id == actor.id)
+    elif user_id:
+        query = query.where(StaffAdvance.user_id == user_id)
+    return db.scalars(query).all()
+
+
+@router.get("/advances/{advance_id}", response_model=StaffAdvanceOut, dependencies=[Depends(require_role("admin", "staff"))])
+def get_staff_advance(advance_id: uuid.UUID, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
+    advance = db.get(StaffAdvance, advance_id)
+    if advance is None:
+        raise HTTPException(404, "Staff advance not found")
+    if actor.role.name != "admin" and advance.user_id != actor.id:
+        raise HTTPException(403, "You can only view your own advances")
+    return advance
+
+
+@router.patch("/advances/{advance_id}", response_model=StaffAdvanceOut, dependencies=[Depends(require_role("admin"))])
+def update_staff_advance(advance_id: uuid.UUID, payload: StaffAdvanceUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    advance = db.get(StaffAdvance, advance_id)
+    if advance is None:
+        raise HTTPException(404, "Staff advance not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(400, "No fields to update were provided")
+    for field, value in changes.items():
+        setattr(advance, field, value)
+    record_audit_log(db, user.id, "staff.advance.update", entity_type="staff_advance", entity_id=str(advance.id), details=f"Updated: {', '.join(changes.keys())}")
+    db.commit()
+    db.refresh(advance)
+    return advance
+
+
+@router.post("/advances/{advance_id}/deduct", response_model=StaffAdvanceOut, dependencies=[Depends(require_role("admin"))])
+def deduct_staff_advance(advance_id: uuid.UUID, payload: StaffAdvanceDeduct, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    The only path that ever changes deducted_amount/status — keeps the
+    outstanding-balance math (amount - deducted_amount) impossible to
+    desync from a raw PATCH. Does not silently alter Payroll: it only
+    records which payroll run (if any) the deduction was applied against,
+    via linked_payroll_id — payroll's own net_pay calculation is untouched.
+    """
+    advance = db.get(StaffAdvance, advance_id)
+    if advance is None:
+        raise HTTPException(404, "Staff advance not found")
+    if advance.status == "fully_deducted":
+        raise HTTPException(409, "This advance has already been fully deducted")
+    outstanding = float(advance.amount) - float(advance.deducted_amount)
+    if payload.amount > outstanding:
+        raise HTTPException(400, f"Deduction amount (Rs.{payload.amount}) exceeds the outstanding balance (Rs.{outstanding})")
+    if payload.payroll_id is not None and db.get(Payroll, payload.payroll_id) is None:
+        raise HTTPException(404, "Payroll record not found")
+
+    advance.deducted_amount = float(advance.deducted_amount) + payload.amount
+    advance.status = "fully_deducted" if advance.deducted_amount >= float(advance.amount) else "partially_deducted"
+    if payload.payroll_id is not None:
+        advance.linked_payroll_id = payload.payroll_id
+
+    record_audit_log(
+        db, user.id, "staff.advance.deduction", entity_type="staff_advance", entity_id=str(advance.id),
+        details=f"Deducted Rs.{payload.amount}, status now {advance.status}, outstanding Rs.{float(advance.amount) - float(advance.deducted_amount)}",
+    )
+    db.commit()
+    db.refresh(advance)
+    return advance

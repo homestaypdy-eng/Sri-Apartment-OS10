@@ -1,14 +1,19 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, extractErrorMessage, type AttendanceOut, type LeaveRequestOut, type PayrollOut, type ShiftOut, type HolidayOut, type UserOut, type UnitOut, type StaffApartmentAssignmentOut, type StaffPerformanceNoteOut } from "../lib/api";
+import { api, extractErrorMessage, type AttendanceOut, type LeaveRequestOut, type PayrollOut, type ShiftOut, type HolidayOut, type UserOut, type UnitOut, type StaffApartmentAssignmentOut, type StaffPerformanceNoteOut, type StaffProfileOut, type StaffAdvanceOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
-type Tab = "attendance" | "leave" | "payroll" | "shifts" | "holidays" | "assignments" | "performance";
+type Tab = "directory" | "attendance" | "leave" | "payroll" | "shifts" | "holidays" | "assignments" | "performance";
+
+const DESIGNATION_SUGGESTIONS = [
+  "Property Manager", "Housekeeping Supervisor", "Housekeeping Attendant", "Maintenance Technician",
+  "Receptionist", "Accountant", "Security", "Driver", "Cleaner",
+];
 
 export default function StaffPage() {
   const { role } = useAuth();
   const isAdmin = role === "admin";
-  const [tab, setTab] = useState<Tab>("attendance");
+  const [tab, setTab] = useState<Tab>("directory");
   const [users, setUsers] = useState<UserOut[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -20,6 +25,7 @@ export default function StaffPage() {
   }, [isAdmin]);
 
   const tabs: { key: Tab; label: string }[] = [
+    { key: "directory", label: "Staff Directory" },
     { key: "attendance", label: "Attendance" },
     { key: "leave", label: "Leave" },
     { key: "payroll", label: "Payroll" },
@@ -49,6 +55,7 @@ export default function StaffPage() {
         ))}
       </div>
 
+      {tab === "directory" && <DirectoryTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "attendance" && <AttendanceTab users={users} setError={setError} setSuccess={setSuccess} />}
       {tab === "leave" && <LeaveTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "payroll" && <PayrollTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
@@ -62,6 +69,849 @@ export default function StaffPage() {
 
 function userName(users: UserOut[], id: string) {
   return users.find((u) => u.id === id)?.name ?? id.slice(0, 8);
+}
+
+// --- Staff Directory ---
+
+function DirectoryTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]; isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [profiles, setProfiles] = useState<StaffProfileOut[]>([]);
+  const [payroll, setPayroll] = useState<PayrollOut[]>([]);
+  const [modalTarget, setModalTarget] = useState<{ user: UserOut; profile: StaffProfileOut | null } | null>(null);
+
+  async function load() {
+    try {
+      const { data } = await api.get("/staff/profiles");
+      setProfiles(data);
+      if (isAdmin) {
+        const p = await api.get("/staff/payroll");
+        setPayroll(p.data);
+      }
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
+
+  function profileFor(userId: string) {
+    return profiles.find((p) => p.user_id === userId) ?? null;
+  }
+  function latestSalary(userId: string) {
+    const list = payroll.filter((p) => p.user_id === userId).sort((a, b) => b.period_year - a.period_year || b.period_month - a.period_month);
+    return list.length > 0 ? list[0].basic_salary : null;
+  }
+
+  function handleSaved(profile: StaffProfileOut) {
+    setProfiles((prev) => (prev.some((p) => p.id === profile.id) ? prev.map((p) => (p.id === profile.id ? profile : p)) : [...prev, profile]));
+    setModalTarget((prev) => (prev ? { ...prev, profile } : prev));
+  }
+
+  if (!isAdmin) {
+    const own = profiles[0] ?? null;
+    return (
+      <Card>
+        <h2 className="text-sm font-semibold text-slate-900 mb-4">My Staff Profile</h2>
+        {own === null ? (
+          <p className="text-sm text-slate-400">No staff profile has been created for you yet — contact an admin.</p>
+        ) : (
+          <div className="grid grid-cols-2 gap-3 text-sm max-w-xl">
+            <p><span className="text-slate-400">Designation:</span> {own.designation ?? "—"}</p>
+            <p><span className="text-slate-400">Department:</span> {own.department ?? "—"}</p>
+            <p><span className="text-slate-400">Employee ID:</span> {own.employee_id ?? "—"}</p>
+            <p><span className="text-slate-400">Employment Type:</span> {own.employment_type ?? "—"}</p>
+            <p><span className="text-slate-400">Phone:</span> {own.phone ?? "—"}</p>
+            <p><span className="text-slate-400">Join Date:</span> {own.join_date ?? "—"}</p>
+            <p><span className="text-slate-400">Weekly Off:</span> {own.weekly_off_day ?? "—"}</p>
+            <p><span className="text-slate-400">Status:</span> <Badge tone={own.is_active ? "green" : "slate"}>{own.is_active ? "Active" : "Inactive"}</Badge></p>
+          </div>
+        )}
+      </Card>
+    );
+  }
+
+  return (
+    <div>
+      <Card>
+        <h2 className="text-sm font-semibold text-slate-900 mb-4">Staff Directory</h2>
+        <div className="overflow-x-auto">
+          <Table headers={["Employee", "Designation", "Role", "Phone", "Salary", "Join Date", "Status", "Actions"]}>
+            {users.map((u) => {
+              const profile = profileFor(u.id);
+              const salary = latestSalary(u.id);
+              return (
+                <tr key={u.id}>
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{u.name}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{profile?.designation ?? "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500 capitalize">{u.role}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{profile?.phone ?? "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{salary !== null ? `₹${salary.toLocaleString()}` : "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{profile?.join_date ?? "—"}</td>
+                  <td className="px-4 py-2.5">
+                    {profile === null ? <Badge tone="slate">No Profile</Badge> : <Badge tone={profile.is_active ? "green" : "slate"}>{profile.is_active ? "Active" : "Inactive"}</Badge>}
+                  </td>
+                  <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
+                    {profile === null ? (
+                      <Button variant="secondary" onClick={() => setModalTarget({ user: u, profile: null })}>Create Profile</Button>
+                    ) : (
+                      <>
+                        <Button variant="secondary" onClick={() => setModalTarget({ user: u, profile })}>View</Button>
+                        <Button variant="secondary" onClick={() => setModalTarget({ user: u, profile })}>Edit</Button>
+                        <ToggleActiveProfileButton profile={profile} setError={setError} setSuccess={setSuccess} onDone={handleSaved} />
+                      </>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </Table>
+        </div>
+      </Card>
+
+      {modalTarget && (
+        <StaffProfileModal
+          user={modalTarget.user}
+          profile={modalTarget.profile}
+          users={users}
+          onClose={() => setModalTarget(null)}
+          onSaved={handleSaved}
+          setError={setError}
+          setSuccess={setSuccess}
+        />
+      )}
+    </div>
+  );
+}
+
+function ToggleActiveProfileButton({ profile, setError, setSuccess, onDone }: { profile: StaffProfileOut; setError: (e: string | null) => void; setSuccess: (s: string | null) => void; onDone: (p: StaffProfileOut) => void }) {
+  async function toggle() {
+    const action = profile.is_active ? "deactivate" : "reactivate";
+    if (!window.confirm(`${profile.is_active ? "Deactivate" : "Reactivate"} this staff profile? Attendance, payroll, leave, shift, performance, and advance history are all preserved either way.`)) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      const { data } = await api.patch(`/staff/profiles/${profile.id}/${action}`);
+      setSuccess(`Staff profile ${action}d.`);
+      onDone(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  return (
+    <Button variant={profile.is_active ? "danger" : "secondary"} onClick={toggle}>
+      {profile.is_active ? "Deactivate" : "Reactivate"}
+    </Button>
+  );
+}
+
+type ProfileModalTab =
+  | "overview" | "employment" | "personal" | "emergency" | "documents" | "bank" | "work"
+  | "attendance" | "leave" | "payroll" | "advances" | "shifts" | "performance" | "audit";
+
+const PROFILE_EDIT_TABS: ProfileModalTab[] = ["employment", "personal", "emergency", "documents", "bank", "work"];
+const WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+
+function StaffProfileModal({
+  user, profile, users, onClose, onSaved, setError, setSuccess,
+}: {
+  user: UserOut; profile: StaffProfileOut | null; users: UserOut[];
+  onClose: () => void; onSaved: (p: StaffProfileOut) => void;
+  setError: (e: string | null) => void; setSuccess: (s: string | null) => void;
+}) {
+  const [modalTab, setModalTab] = useState<ProfileModalTab>("overview");
+  const [currentProfile, setCurrentProfile] = useState<StaffProfileOut | null>(profile);
+  const [form, setForm] = useState<Record<string, string>>({
+    employee_id: profile?.employee_id ?? "", designation: profile?.designation ?? "", department: profile?.department ?? "",
+    employment_type: profile?.employment_type ?? "", join_date: profile?.join_date ?? "", exit_date: profile?.exit_date ?? "",
+    phone: profile?.phone ?? "", alternate_phone: profile?.alternate_phone ?? "",
+    date_of_birth: profile?.date_of_birth ?? "", address: profile?.address ?? "",
+    emergency_contact_name: profile?.emergency_contact_name ?? "", emergency_contact_phone: profile?.emergency_contact_phone ?? "",
+    emergency_contact_relationship: profile?.emergency_contact_relationship ?? "",
+    id_type: profile?.id_type ?? "", id_number: profile?.id_number ?? "",
+    bank_name: profile?.bank_name ?? "", account_holder_name: profile?.account_holder_name ?? "",
+    account_number: profile?.account_number ?? "", ifsc: profile?.ifsc ?? "", payment_method: profile?.payment_method ?? "",
+    weekly_off_day: profile?.weekly_off_day ?? "", supervisor_user_id: profile?.supervisor_user_id ?? "", notes: profile?.notes ?? "",
+  });
+
+  async function handleSave() {
+    setError(null);
+    setSuccess(null);
+    try {
+      const payload: Record<string, string | undefined> = {};
+      Object.entries(form).forEach(([k, v]) => { payload[k] = v || undefined; });
+      if (currentProfile === null) {
+        const { data } = await api.post("/staff/profiles", { user_id: user.id, ...payload });
+        setCurrentProfile(data);
+        setSuccess("Staff profile created.");
+        onSaved(data);
+      } else {
+        const { data } = await api.patch(`/staff/profiles/${currentProfile.id}`, payload);
+        setCurrentProfile(data);
+        setSuccess("Staff profile updated.");
+        onSaved(data);
+      }
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  const modalTabs: { key: ProfileModalTab; label: string }[] = [
+    { key: "overview", label: "Overview" },
+    { key: "employment", label: "Employment" },
+    { key: "personal", label: "Personal" },
+    { key: "emergency", label: "Emergency Contact" },
+    { key: "documents", label: "Documents / ID" },
+    { key: "bank", label: "Bank & Payroll" },
+    { key: "work", label: "Work Assignment" },
+    { key: "attendance", label: "Attendance" },
+    { key: "leave", label: "Leave" },
+    { key: "payroll", label: "Payroll" },
+    { key: "advances", label: "Advances" },
+    { key: "shifts", label: "Shifts" },
+    { key: "performance", label: "Performance" },
+    { key: "audit", label: "Audit History" },
+  ];
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded-xl max-w-4xl w-full max-h-[90vh] overflow-y-auto p-6" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-slate-900">{user.name}{currentProfile?.designation ? ` — ${currentProfile.designation}` : ""}</h2>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-sm">Close</button>
+        </div>
+
+        <div className="flex gap-1 mb-4 border-b border-slate-200 overflow-x-auto">
+          {modalTabs.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setModalTab(t.key)}
+              className={`px-3 py-1.5 text-xs font-medium whitespace-nowrap border-b-2 -mb-px ${
+                modalTab === t.key ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400 hover:text-slate-600"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {modalTab === "overview" && (
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <p><span className="text-slate-400">Name:</span> {user.name}</p>
+            <p><span className="text-slate-400">Email:</span> {user.email}</p>
+            <p><span className="text-slate-400">System Role:</span> <span className="capitalize">{user.role}</span></p>
+            <p><span className="text-slate-400">Designation:</span> {currentProfile?.designation ?? "—"}</p>
+            <p><span className="text-slate-400">Employee ID:</span> {currentProfile?.employee_id ?? "—"}</p>
+            <p><span className="text-slate-400">Department:</span> {currentProfile?.department ?? "—"}</p>
+            <p><span className="text-slate-400">Phone:</span> {currentProfile?.phone ?? "—"}</p>
+            <p><span className="text-slate-400">Join Date:</span> {currentProfile?.join_date ?? "—"}</p>
+            <p><span className="text-slate-400">Status:</span> {currentProfile ? <Badge tone={currentProfile.is_active ? "green" : "slate"}>{currentProfile.is_active ? "Active" : "Inactive"}</Badge> : <Badge tone="slate">No Profile</Badge>}</p>
+            <p><span className="text-slate-400">Supervisor:</span> {currentProfile?.supervisor_user_id ? (users.find((u) => u.id === currentProfile.supervisor_user_id)?.name ?? "—") : "—"}</p>
+          </div>
+        )}
+
+        {modalTab === "employment" && (
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <input placeholder="Employee ID" value={form.employee_id} onChange={(e) => setForm({ ...form, employee_id: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="Designation" list="designation-suggestions" value={form.designation} onChange={(e) => setForm({ ...form, designation: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <datalist id="designation-suggestions">
+              {DESIGNATION_SUGGESTIONS.map((d) => <option key={d} value={d} />)}
+            </datalist>
+            <input placeholder="Department" value={form.department} onChange={(e) => setForm({ ...form, department: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="Employment type (e.g. full_time)" value={form.employment_type} onChange={(e) => setForm({ ...form, employment_type: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <div>
+              <label className="block text-slate-500 mb-1">Join Date</label>
+              <input type="date" value={form.join_date} onChange={(e) => setForm({ ...form, join_date: e.target.value })} className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+            </div>
+            <div>
+              <label className="block text-slate-500 mb-1">Exit Date</label>
+              <input type="date" value={form.exit_date} onChange={(e) => setForm({ ...form, exit_date: e.target.value })} className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+            </div>
+            <select value={form.supervisor_user_id} onChange={(e) => setForm({ ...form, supervisor_user_id: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 col-span-2">
+              <option value="">No supervisor</option>
+              {users.filter((u) => u.id !== user.id).map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
+            <textarea placeholder="Notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="col-span-2 rounded-lg border border-slate-300 px-2 py-1.5" rows={2} />
+          </div>
+        )}
+
+        {modalTab === "personal" && (
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <div>
+              <label className="block text-slate-500 mb-1">Date of Birth</label>
+              <input type="date" value={form.date_of_birth} onChange={(e) => setForm({ ...form, date_of_birth: e.target.value })} className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+            </div>
+            <input placeholder="Phone" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="Alternate Phone" value={form.alternate_phone} onChange={(e) => setForm({ ...form, alternate_phone: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="Address" value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} className="col-span-2 rounded-lg border border-slate-300 px-2 py-1.5" />
+          </div>
+        )}
+
+        {modalTab === "emergency" && (
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <input placeholder="Emergency Contact Name" value={form.emergency_contact_name} onChange={(e) => setForm({ ...form, emergency_contact_name: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="Emergency Contact Phone" value={form.emergency_contact_phone} onChange={(e) => setForm({ ...form, emergency_contact_phone: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="Relationship" value={form.emergency_contact_relationship} onChange={(e) => setForm({ ...form, emergency_contact_relationship: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+          </div>
+        )}
+
+        {modalTab === "documents" && (
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <input placeholder="ID Type (e.g. aadhaar)" value={form.id_type} onChange={(e) => setForm({ ...form, id_type: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="ID Number" value={form.id_number} onChange={(e) => setForm({ ...form, id_number: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+          </div>
+        )}
+
+        {modalTab === "bank" && (
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <input placeholder="Bank Name" value={form.bank_name} onChange={(e) => setForm({ ...form, bank_name: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="Account Holder Name" value={form.account_holder_name} onChange={(e) => setForm({ ...form, account_holder_name: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="Account Number" value={form.account_number} onChange={(e) => setForm({ ...form, account_number: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <input placeholder="IFSC" value={form.ifsc} onChange={(e) => setForm({ ...form, ifsc: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+            <select value={form.payment_method} onChange={(e) => setForm({ ...form, payment_method: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5">
+              <option value="">Payment method...</option>
+              <option value="bank_transfer">Bank Transfer</option>
+              <option value="cash">Cash</option>
+              <option value="upi">UPI</option>
+            </select>
+            {currentProfile && <p className="col-span-2 text-slate-400">Current salary is read from the latest Payroll record — see the Payroll tab. No separate salary field is stored here to avoid it drifting out of sync.</p>}
+          </div>
+        )}
+
+        {modalTab === "work" && (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-xs text-slate-500 mb-1">Weekly Off Day</label>
+              <select value={form.weekly_off_day} onChange={(e) => setForm({ ...form, weekly_off_day: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+                <option value="">Not set</option>
+                {WEEKDAYS.map((d) => <option key={d} value={d} className="capitalize">{d}</option>)}
+              </select>
+            </div>
+            {currentProfile ? (
+              <WorkAssignmentPanel targetUserId={user.id} setError={setError} setSuccess={setSuccess} />
+            ) : (
+              <p className="text-xs text-slate-400">Create the staff profile first (any tab, then Create Profile) before assigning apartments.</p>
+            )}
+          </div>
+        )}
+
+        {PROFILE_EDIT_TABS.includes(modalTab) && (
+          <Button variant="secondary" onClick={handleSave} type="button">
+            {currentProfile === null ? "Create Profile" : "Save Changes"}
+          </Button>
+        )}
+
+        {modalTab === "attendance" && <ScopedAttendancePanel userId={user.id} setError={setError} setSuccess={setSuccess} />}
+        {modalTab === "leave" && <ScopedLeavePanel userId={user.id} setError={setError} setSuccess={setSuccess} />}
+        {modalTab === "payroll" && <ScopedPayrollPanel userId={user.id} setError={setError} setSuccess={setSuccess} />}
+        {modalTab === "advances" && <ScopedAdvancesPanel userId={user.id} setError={setError} setSuccess={setSuccess} />}
+        {modalTab === "shifts" && <ScopedShiftsPanel userId={user.id} setError={setError} setSuccess={setSuccess} />}
+        {modalTab === "performance" && <ScopedPerformancePanel userId={user.id} setError={setError} setSuccess={setSuccess} />}
+        {modalTab === "audit" && (currentProfile ? <ScopedAuditPanel entityId={currentProfile.id} setError={setError} /> : <p className="text-xs text-slate-400">Create the staff profile first to see its audit history.</p>)}
+      </div>
+    </div>
+  );
+}
+
+function WorkAssignmentPanel({ targetUserId, setError, setSuccess }: { targetUserId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [units, setUnits] = useState<UnitOut[]>([]);
+  const [assignments, setAssignments] = useState<StaffApartmentAssignmentOut[]>([]);
+  const [unitId, setUnitId] = useState("");
+
+  async function load() {
+    try {
+      const [u, a] = await Promise.all([api.get("/units"), api.get("/staff/apartment-assignments", { params: { user_id: targetUserId } })]);
+      setUnits(u.data);
+      setAssignments(a.data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetUserId]);
+
+  function unitName(id: string) {
+    return units.find((u) => u.id === id)?.name ?? "—";
+  }
+
+  async function assign() {
+    if (!unitId) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post("/staff/apartment-assignments", { user_id: targetUserId, unit_id: unitId });
+      setSuccess("Apartment assigned.");
+      setUnitId("");
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function remove(id: string) {
+    setError(null);
+    try {
+      await api.delete(`/staff/apartment-assignments/${id}`);
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  return (
+    <div>
+      <h3 className="text-xs font-semibold text-slate-700 mb-2 uppercase tracking-wide">Assigned Apartments</h3>
+      <div className="flex gap-2 mb-3">
+        <select value={unitId} onChange={(e) => setUnitId(e.target.value)} className="flex-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+          <option value="">Select apartment...</option>
+          {units.filter((u) => u.is_active).map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+        </select>
+        <Button variant="secondary" onClick={assign}>Assign</Button>
+      </div>
+      {assignments.length === 0 ? (
+        <p className="text-xs text-slate-400">No apartments assigned yet.</p>
+      ) : (
+        <div className="space-y-1">
+          {assignments.map((a) => (
+            <div key={a.id} className="flex items-center justify-between border border-slate-100 rounded-lg px-3 py-1.5 text-xs">
+              <span>{unitName(a.unit_id)}</span>
+              <button onClick={() => remove(a.id)} className="text-red-500 hover:underline">Remove</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScopedAttendancePanel({ userId, setError, setSuccess }: { userId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [records, setRecords] = useState<AttendanceOut[]>([]);
+  const [form, setForm] = useState({ date: "", status: "present" });
+
+  async function load() {
+    try {
+      const { data } = await api.get("/staff/attendance", { params: { user_id: userId } });
+      setRecords(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post("/staff/attendance", { user_id: userId, date: form.date, status: form.status });
+      setSuccess("Attendance recorded.");
+      setForm({ date: "", status: "present" });
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2 mb-3">
+        <input required type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+          <option value="present">Present</option>
+          <option value="absent">Absent</option>
+          <option value="half_day">Half Day</option>
+          <option value="on_leave">On Leave</option>
+        </select>
+        <Button type="submit">Record</Button>
+      </form>
+      {records.length === 0 ? (
+        <p className="text-xs text-slate-400">No attendance recorded yet.</p>
+      ) : (
+        <div className="space-y-1">
+          {records.map((r) => (
+            <div key={r.id} className="flex items-center justify-between border border-slate-100 rounded-lg px-3 py-1.5 text-xs">
+              <span>{r.date}</span>
+              <Badge tone={r.status === "present" ? "green" : r.status === "absent" ? "red" : "amber"}>{r.status.replace("_", " ")}</Badge>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScopedLeavePanel({ userId, setError, setSuccess }: { userId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [records, setRecords] = useState<LeaveRequestOut[]>([]);
+  const [form, setForm] = useState({ from_date: "", to_date: "", reason: "" });
+
+  async function load() {
+    try {
+      const { data } = await api.get("/staff/leave", { params: { user_id: userId } });
+      setRecords(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post("/staff/leave", { user_id: userId, ...form });
+      setSuccess("Leave request submitted.");
+      setForm({ from_date: "", to_date: "", reason: "" });
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function review(id: string, status: "approved" | "rejected") {
+    setError(null);
+    try {
+      await api.patch(`/staff/leave/${id}`, { status });
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2 mb-3">
+        <input required type="date" value={form.from_date} onChange={(e) => setForm({ ...form, from_date: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input required type="date" value={form.to_date} onChange={(e) => setForm({ ...form, to_date: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input placeholder="Reason" value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} className="flex-1 min-w-[100px] rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <Button type="submit">Apply</Button>
+      </form>
+      {records.length === 0 ? (
+        <p className="text-xs text-slate-400">No leave requests yet.</p>
+      ) : (
+        <div className="space-y-1">
+          {records.map((r) => (
+            <div key={r.id} className="flex items-center justify-between border border-slate-100 rounded-lg px-3 py-1.5 text-xs">
+              <span>{r.from_date} → {r.to_date}{r.reason ? ` — ${r.reason}` : ""}</span>
+              <div className="flex items-center gap-2">
+                <Badge tone={r.status === "approved" ? "green" : r.status === "rejected" ? "red" : "slate"}>{r.status}</Badge>
+                {r.status === "pending" && (
+                  <>
+                    <button onClick={() => review(r.id, "approved")} className="text-emerald-600 hover:underline">Approve</button>
+                    <button onClick={() => review(r.id, "rejected")} className="text-red-500 hover:underline">Reject</button>
+                  </>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScopedPayrollPanel({ userId, setError, setSuccess }: { userId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [records, setRecords] = useState<PayrollOut[]>([]);
+  const [form, setForm] = useState({ period_year: String(new Date().getFullYear()), period_month: String(new Date().getMonth() + 1), basic_salary: "", deductions: "0", bonus: "0" });
+
+  async function load() {
+    try {
+      const { data } = await api.get("/staff/payroll", { params: { user_id: userId } });
+      setRecords(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post("/staff/payroll", {
+        user_id: userId, period_year: Number(form.period_year), period_month: Number(form.period_month),
+        basic_salary: Number(form.basic_salary), deductions: Number(form.deductions), bonus: Number(form.bonus),
+      });
+      setSuccess("Payroll generated.");
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function markPaid(id: string) {
+    setError(null);
+    try {
+      await api.patch(`/staff/payroll/${id}/mark-paid`);
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2 mb-3">
+        <input required type="number" placeholder="Year" value={form.period_year} onChange={(e) => setForm({ ...form, period_year: e.target.value })} className="w-20 rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input required type="number" placeholder="Month" value={form.period_month} onChange={(e) => setForm({ ...form, period_month: e.target.value })} className="w-20 rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input required type="number" placeholder="Basic salary" value={form.basic_salary} onChange={(e) => setForm({ ...form, basic_salary: e.target.value })} className="w-28 rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input type="number" placeholder="Deductions" value={form.deductions} onChange={(e) => setForm({ ...form, deductions: e.target.value })} className="w-24 rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input type="number" placeholder="Bonus" value={form.bonus} onChange={(e) => setForm({ ...form, bonus: e.target.value })} className="w-24 rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <Button type="submit">Generate</Button>
+      </form>
+      {records.length === 0 ? (
+        <p className="text-xs text-slate-400">No payroll records yet.</p>
+      ) : (
+        <div className="space-y-1">
+          {records.map((r) => (
+            <div key={r.id} className="flex items-center justify-between border border-slate-100 rounded-lg px-3 py-1.5 text-xs">
+              <span>{r.period_month}/{r.period_year} — Net ₹{r.net_pay.toLocaleString()}</span>
+              <div className="flex items-center gap-2">
+                <Badge tone={r.status === "paid" ? "green" : "slate"}>{r.status}</Badge>
+                {r.status === "draft" && <button onClick={() => markPaid(r.id)} className="text-emerald-600 hover:underline">Mark Paid</button>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScopedAdvancesPanel({ userId, setError, setSuccess }: { userId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [records, setRecords] = useState<StaffAdvanceOut[]>([]);
+  const [form, setForm] = useState({ date: "", amount: "", category: "advance", reason: "" });
+  const [deductForm, setDeductForm] = useState<{ id: string; amount: string } | null>(null);
+
+  async function load() {
+    try {
+      const { data } = await api.get("/staff/advances", { params: { user_id: userId } });
+      setRecords(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post("/staff/advances", { user_id: userId, date: form.date, amount: Number(form.amount), category: form.category, reason: form.reason || undefined });
+      setSuccess("Advance recorded.");
+      setForm({ date: "", amount: "", category: "advance", reason: "" });
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleDeduct(e: FormEvent) {
+    e.preventDefault();
+    if (!deductForm) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post(`/staff/advances/${deductForm.id}/deduct`, { amount: Number(deductForm.amount) });
+      setSuccess("Deduction recorded.");
+      setDeductForm(null);
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2 mb-3">
+        <input required type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input required type="number" placeholder="Amount" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} className="w-24 rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+          <option value="advance">Advance</option>
+          <option value="bonus">Bonus</option>
+          <option value="reimbursement">Reimbursement</option>
+          <option value="loan">Loan</option>
+        </select>
+        <input placeholder="Reason" value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} className="flex-1 min-w-[100px] rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <Button type="submit">Record</Button>
+      </form>
+      {records.length === 0 ? (
+        <p className="text-xs text-slate-400">No advances recorded yet.</p>
+      ) : (
+        <div className="space-y-2">
+          {records.map((r) => (
+            <div key={r.id} className="border border-slate-100 rounded-lg px-3 py-2 text-xs">
+              <div className="flex items-center justify-between">
+                <span>{r.date} — ₹{r.amount.toLocaleString()} ({r.category}){r.reason ? `: ${r.reason}` : ""}</span>
+                <Badge tone={r.status === "fully_deducted" ? "green" : r.status === "partially_deducted" ? "amber" : "slate"}>{r.status.replace("_", " ")}</Badge>
+              </div>
+              <p className="text-slate-400 mt-1">Outstanding: ₹{r.outstanding_amount.toLocaleString()}</p>
+              {r.status !== "fully_deducted" && deductForm?.id !== r.id && (
+                <button onClick={() => setDeductForm({ id: r.id, amount: "" })} className="text-emerald-600 hover:underline mt-1">Record Deduction</button>
+              )}
+              {deductForm?.id === r.id && (
+                <form onSubmit={handleDeduct} className="mt-2 flex gap-2 items-center bg-emerald-50 rounded-lg p-2">
+                  <input required type="number" placeholder="Deduct amount" value={deductForm.amount} onChange={(e) => setDeductForm({ ...deductForm, amount: e.target.value })} className="w-28 rounded-md border border-slate-300 px-2 py-1 text-xs" />
+                  <Button type="submit">Confirm</Button>
+                  <button type="button" onClick={() => setDeductForm(null)} className="text-slate-500 hover:underline">Cancel</button>
+                </form>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScopedShiftsPanel({ userId, setError, setSuccess }: { userId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [records, setRecords] = useState<ShiftOut[]>([]);
+  const [form, setForm] = useState({ date: "", shift_start: "09:00", shift_end: "17:00" });
+
+  async function load() {
+    try {
+      const { data } = await api.get("/staff/shifts", { params: { user_id: userId } });
+      setRecords(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post("/staff/shifts", { user_id: userId, date: form.date, shift_start: `${form.shift_start}:00`, shift_end: `${form.shift_end}:00` });
+      setSuccess("Shift created.");
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} className="flex flex-wrap gap-2 mb-3">
+        <input required type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input type="time" value={form.shift_start} onChange={(e) => setForm({ ...form, shift_start: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input type="time" value={form.shift_end} onChange={(e) => setForm({ ...form, shift_end: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <Button type="submit">Create</Button>
+      </form>
+      {records.length === 0 ? (
+        <p className="text-xs text-slate-400">No shifts scheduled yet.</p>
+      ) : (
+        <div className="space-y-1">
+          {records.map((r) => (
+            <div key={r.id} className="flex items-center justify-between border border-slate-100 rounded-lg px-3 py-1.5 text-xs">
+              <span>{r.date}</span>
+              <span>{r.shift_start} – {r.shift_end}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScopedPerformancePanel({ userId, setError, setSuccess }: { userId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [notes, setNotes] = useState<StaffPerformanceNoteOut[]>([]);
+  const [note, setNote] = useState("");
+
+  async function load() {
+    try {
+      const { data } = await api.get("/staff/performance-notes", { params: { user_id: userId } });
+      setNotes(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post("/staff/performance-notes", { user_id: userId, note });
+      setSuccess("Note added.");
+      setNote("");
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} className="flex gap-2 mb-3">
+        <textarea required rows={2} placeholder="Note" value={note} onChange={(e) => setNote(e.target.value)} className="flex-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <Button type="submit">Add</Button>
+      </form>
+      {notes.length === 0 ? (
+        <p className="text-xs text-slate-400">No performance notes yet.</p>
+      ) : (
+        <div className="space-y-2">
+          {notes.map((n) => (
+            <div key={n.id} className="border border-slate-100 rounded-lg p-2 text-xs">
+              <p className="text-slate-400 mb-1">{new Date(n.created_at).toLocaleDateString()}</p>
+              <p className="text-slate-700">{n.note}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScopedAuditPanel({ entityId, setError }: { entityId: string; setError: (e: string | null) => void }) {
+  const [logs, setLogs] = useState<{ id: string; action: string; details: string | null; created_at: string }[]>([]);
+
+  useEffect(() => {
+    api
+      .get("/audit/logs", { params: { entity_type: "staff_profile", entity_id: entityId } })
+      .then((r) => setLogs(r.data))
+      .catch((err) => setError(extractErrorMessage(err)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entityId]);
+
+  if (logs.length === 0) return <p className="text-xs text-slate-400">No audit history yet.</p>;
+  return (
+    <div className="space-y-2">
+      {logs.map((l) => (
+        <div key={l.id} className="text-xs border-l-2 border-slate-200 pl-3 py-1">
+          <div className="flex items-center justify-between">
+            <span className="font-medium text-slate-800">{l.action}</span>
+            <span className="text-slate-400">{new Date(l.created_at).toLocaleString()}</span>
+          </div>
+          {l.details && <p className="text-slate-500 mt-0.5">{l.details}</p>}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {

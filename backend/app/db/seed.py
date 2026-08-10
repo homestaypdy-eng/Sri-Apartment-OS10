@@ -20,7 +20,7 @@ from app.modules.maintenance.models import MaintenanceTicket, MaintenancePhoto  
 from app.modules.inquiries.models import Inquiry, InquiryAttachment, InquiryCounter, InquiryCommunication  # noqa: F401
 from app.modules.settings.models import BusinessSettings  # noqa: F401
 from app.modules.inventory.models import Supplier, InventoryItem, StockMovement  # noqa: F401
-from app.modules.staff.models import Attendance, LeaveRequest, Payroll, Shift, Holiday, StaffApartmentAssignment, StaffPerformanceNote  # noqa: F401
+from app.modules.staff.models import Attendance, LeaveRequest, Payroll, Shift, Holiday, StaffApartmentAssignment, StaffPerformanceNote, StaffProfile, StaffAdvance  # noqa: F401
 from app.modules.audit.models import AuditLog, LoginEvent  # noqa: F401
 from app.modules.notifications.models import NotificationLog  # noqa: F401
 from app.modules.payment_gateway.models import GatewayOrder, WebhookEvent, Refund  # noqa: F401

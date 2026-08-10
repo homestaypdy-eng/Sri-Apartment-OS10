@@ -645,6 +645,53 @@ export interface StaffPerformanceNoteOut {
   created_at: string;
 }
 
+export interface StaffProfileOut {
+  id: string;
+  user_id: string;
+  employee_id: string | null;
+  designation: string | null;
+  department: string | null;
+  employment_type: string | null;
+  join_date: string | null;
+  exit_date: string | null;
+  is_active: boolean;
+  phone: string | null;
+  alternate_phone: string | null;
+  date_of_birth: string | null;
+  address: string | null;
+  emergency_contact_name: string | null;
+  emergency_contact_phone: string | null;
+  emergency_contact_relationship: string | null;
+  id_type: string | null;
+  id_number: string | null;
+  bank_name: string | null;
+  account_holder_name: string | null;
+  account_number: string | null;
+  ifsc: string | null;
+  payment_method: string | null;
+  weekly_off_day: string | null;
+  supervisor_user_id: string | null;
+  notes: string | null;
+  created_at: string;
+}
+
+export interface StaffAdvanceOut {
+  id: string;
+  user_id: string;
+  date: string;
+  amount: number;
+  category: string;
+  reason: string | null;
+  payment_method: string | null;
+  reference_number: string | null;
+  status: string;
+  deducted_amount: number;
+  outstanding_amount: number;
+  linked_payroll_id: string | null;
+  created_by: string | null;
+  created_at: string;
+}
+
 // --- Audit ---
 export interface AuditLogOut {
   id: string;
