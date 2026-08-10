@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.modules.reports import service
-from app.modules.reports.schemas import SummaryReport, RevenuePoint, UnitPerformance, GstBreakdown, OperationalDashboard, DashboardCalendar
+from app.modules.reports.schemas import SummaryReport, RevenuePoint, UnitPerformance, GstBreakdown, OperationalDashboard, DashboardCalendar, SummaryComparison, CancellationReport
 from app.modules.inquiries.schemas import SalesFunnelReport
 from app.shared.rbac import require_role
 
@@ -47,6 +47,28 @@ def get_summary(
 ):
     d_from, d_to = _default_range(date_from, date_to)
     return service.build_summary(db, d_from, d_to, property_id)
+
+
+@router.get("/summary-comparison", response_model=SummaryComparison, dependencies=[Depends(require_role("admin", "staff"))])
+def get_summary_comparison(
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    property_id: uuid.UUID | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    d_from, d_to = _default_range(date_from, date_to)
+    return service.build_summary_comparison(db, d_from, d_to, property_id)
+
+
+@router.get("/cancellations", response_model=CancellationReport, dependencies=[Depends(require_role("admin", "staff"))])
+def get_cancellation_report(
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    property_id: uuid.UUID | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    d_from, d_to = _default_range(date_from, date_to)
+    return service.build_cancellation_report(db, d_from, d_to, property_id)
 
 
 @router.get("/revenue-series", response_model=list[RevenuePoint], dependencies=[Depends(require_role("admin", "staff"))])

@@ -156,6 +156,129 @@ def build_summary(db: Session, date_from: date, date_to: date, property_id: uuid
     }
 
 
+def build_summary_comparison(db: Session, date_from: date, date_to: date, property_id: uuid.UUID | None = None) -> dict:
+    """
+    Period-over-period comparison for Occupancy / ADR / RevPAR only. Calls
+    build_summary() for both the current and previous period rather than
+    recomputing these formulas, so the comparison numbers can never drift
+    from the numbers shown elsewhere in Reports Center for the same range.
+
+    The comparison period is deterministic and not calendar-aligned: for a
+    selected range of N days, the previous period is the immediately
+    preceding N-day block ([date_from - N days, date_from)). This is well
+    defined for any arbitrary date range, unlike a "previous month/year"
+    convention which breaks down for irregular ranges.
+    """
+    n_days = max((date_to - date_from).days, 1)
+    prev_date_to = date_from
+    prev_date_from = date_from - timedelta(days=n_days)
+
+    current = build_summary(db, date_from, date_to, property_id)
+    previous = build_summary(db, prev_date_from, prev_date_to, property_id)
+
+    def _pct_change(curr: float, prev: float) -> float | None:
+        if prev == 0:
+            return None
+        return round((curr - prev) / prev * 100, 2)
+
+    return {
+        "current_period": {"date_from": date_from, "date_to": date_to},
+        "previous_period": {"date_from": prev_date_from, "date_to": prev_date_to},
+        "occupancy": {
+            "current": current["occupancy_rate_percent"],
+            "previous": previous["occupancy_rate_percent"],
+            "change_percent": _pct_change(current["occupancy_rate_percent"], previous["occupancy_rate_percent"]),
+            "change_percentage_points": round(current["occupancy_rate_percent"] - previous["occupancy_rate_percent"], 2),
+        },
+        "adr": {
+            "current": current["adr"],
+            "previous": previous["adr"],
+            "change_percent": _pct_change(current["adr"], previous["adr"]),
+        },
+        "revpar": {
+            "current": current["revpar"],
+            "previous": previous["revpar"],
+            "change_percent": _pct_change(current["revpar"], previous["revpar"]),
+        },
+    }
+
+
+# The "firm booking" population for cancellation reporting: confirmed,
+# checked_in, checked_out, cancelled, no_show. "inquiry" (an unconfirmed
+# hold, not yet a real reservation) is deliberately excluded from this
+# denominator, per explicit product decision — see build_cancellation_report().
+FIRM_BOOKING_STATUSES = ("confirmed", "checked_in", "checked_out", "cancelled", "no_show")
+
+
+def _fetch_firm_bookings_for_period(db: Session, date_from: date, date_to: date, property_id: uuid.UUID | None):
+    """
+    Same check_in-date-basis period filter as _fetch_bookings_for_period,
+    but deliberately WITHOUT excluding cancelled/no_show bookings — those
+    are exactly what a cancellation report needs to count. Only "inquiry"
+    (not yet a firm booking) is excluded.
+    """
+    query = select(Booking).join(Unit, Booking.unit_id == Unit.id).where(
+        Booking.check_in >= date_from,
+        Booking.check_in < date_to,
+        Booking.status.in_(FIRM_BOOKING_STATUSES),
+    )
+    if property_id:
+        query = query.where(Unit.property_id == property_id)
+    return db.scalars(query).all()
+
+
+def _cancellation_period_stats(db: Session, date_from: date, date_to: date, property_id: uuid.UUID | None) -> dict:
+    bookings = _fetch_firm_bookings_for_period(db, date_from, date_to, property_id)
+    total = len(bookings)
+    cancelled = sum(1 for b in bookings if b.status == "cancelled")
+    no_show = sum(1 for b in bookings if b.status == "no_show")
+    return {
+        "total": total,
+        "cancelled": cancelled,
+        "no_show": no_show,
+        "cancellation_rate": round(cancelled / total * 100, 2) if total else 0.0,
+        "no_show_rate": round(no_show / total * 100, 2) if total else 0.0,
+    }
+
+
+def build_cancellation_report(db: Session, date_from: date, date_to: date, property_id: uuid.UUID | None = None) -> dict:
+    """
+    "Of the firm bookings scheduled to check in during this period, what
+    fraction were cancelled?" — NOT "cancellations recorded during the
+    period" (OS10 has no cancellation timestamp to measure that). Same
+    check_in-date-basis convention, and the same N-day preceding-period
+    comparison approach, as build_summary_comparison() above.
+    """
+    n_days = max((date_to - date_from).days, 1)
+    prev_date_to = date_from
+    prev_date_from = date_from - timedelta(days=n_days)
+
+    current = _cancellation_period_stats(db, date_from, date_to, property_id)
+    previous = _cancellation_period_stats(db, prev_date_from, prev_date_to, property_id)
+
+    def _pct_change(curr: float, prev: float) -> float | None:
+        if prev == 0:
+            return None
+        return round((curr - prev) / prev * 100, 2)
+
+    return {
+        "current_period": {"date_from": date_from, "date_to": date_to},
+        "previous_period": {"date_from": prev_date_from, "date_to": prev_date_to},
+        "total_bookings_in_period": current["total"],
+        "cancelled_count": current["cancelled"],
+        "cancellation_rate_percent": current["cancellation_rate"],
+        "no_show_count": current["no_show"],
+        "no_show_rate_percent": current["no_show_rate"],
+        "previous_total_bookings_in_period": previous["total"],
+        "previous_cancelled_count": previous["cancelled"],
+        "previous_cancellation_rate_percent": previous["cancellation_rate"],
+        "previous_no_show_count": previous["no_show"],
+        "previous_no_show_rate_percent": previous["no_show_rate"],
+        "cancellation_rate_change_percent": _pct_change(current["cancellation_rate"], previous["cancellation_rate"]),
+        "no_show_rate_change_percent": _pct_change(current["no_show_rate"], previous["no_show_rate"]),
+    }
+
+
 def build_revenue_series(db: Session, date_from: date, date_to: date, property_id: uuid.UUID | None = None) -> list[dict]:
     rows = _fetch_bookings_for_period(db, date_from, date_to, property_id)
     by_day: dict[date, dict] = defaultdict(lambda: {"revenue": 0.0, "room_nights_sold": 0})
@@ -421,11 +544,17 @@ def operational_dashboard(db: Session) -> dict:
     pending_payments_amount = round(sum(o["pending_balance"] for o in outstanding), 2)
 
     housekeeping_pending = db.scalar(select(func.count()).select_from(HousekeepingTask).where(HousekeepingTask.status != "completed")) or 0
-    maintenance_open = db.scalar(select(func.count()).select_from(MaintenanceTicket).where(MaintenanceTicket.status.in_(("open", "in_progress")))) or 0
+    # Fetched as full rows (not just count()) so build_attention_items()
+    # below can build a WHAT/WHY/action line per ticket without a second
+    # round-trip — the count is simply len() of what we already have.
+    open_maintenance_tickets = db.scalars(select(MaintenanceTicket).where(MaintenanceTicket.status.in_(("open", "in_progress")))).all()
+    maintenance_open = len(open_maintenance_tickets)
     from app.modules.portal.models import GuestRequest
-    guest_requests_open = db.scalar(select(func.count()).select_from(GuestRequest).where(GuestRequest.status != "resolved")) or 0
+    open_guest_requests = db.scalars(select(GuestRequest).where(GuestRequest.status != "resolved")).all()
+    guest_requests_open = len(open_guest_requests)
     from app.modules.inventory.models import InventoryItem
-    low_stock_count = db.scalar(select(func.count()).select_from(InventoryItem).where(InventoryItem.current_stock <= InventoryItem.minimum_stock)) or 0
+    low_stock_items = db.scalars(select(InventoryItem).where(InventoryItem.current_stock <= InventoryItem.minimum_stock)).all()
+    low_stock_count = len(low_stock_items)
     from app.modules.staff.models import Attendance
     staff_present_today = db.scalar(select(func.count()).select_from(Attendance).where(Attendance.date == today, Attendance.status == "present")) or 0
     staff_absent_today = db.scalar(select(func.count()).select_from(Attendance).where(Attendance.date == today, Attendance.status == "absent")) or 0
@@ -509,6 +638,12 @@ def operational_dashboard(db: Session) -> dict:
         m_expenses = round(sum(float(e.amount) for e in db.scalars(select(Expense).where(Expense.expense_date >= m_start, Expense.expense_date < m_end)).all()), 2)
         monthly_trend.append({"year": year, "month": month, "revenue": m_revenue, "expenses": m_expenses, "profit": round(m_revenue - m_expenses, 2)})
 
+    attention_items = build_attention_items(
+        db, today, outstanding=outstanding,
+        open_guest_requests=open_guest_requests, open_maintenance_tickets=open_maintenance_tickets,
+        low_stock_items=low_stock_items, unit_by_id=unit_by_id,
+    )
+
     return {
         "as_of": today,
         "arrivals_today": arrivals_today,
@@ -538,7 +673,133 @@ def operational_dashboard(db: Session) -> dict:
         "month_profit": month_profit,
         "apartment_performance": apartment_performance,
         "monthly_trend": monthly_trend,
+        "attention_items": attention_items,
     }
+
+
+# Same priority/response-time convention already used by the escalation
+# scheduler (notifications/service.py) — reused here rather than inventing
+# a second threshold scheme, so "past its response target" means the same
+# thing on the Dashboard as it does in the escalation emails.
+_ATTENTION_THRESHOLD_HOURS = {"urgent": 4, "high": 24, "medium": 72, "low": 72}
+
+# Ranking is a fixed, documented two-key sort — not a black-box score:
+# 1. severity (critical before warning)
+# 2. category, in this fixed order — guest-facing/revenue-affecting
+#    concerns before property/supply concerns, since a guest experiencing
+#    a problem right now outranks a maintenance ticket or stock level that
+#    doesn't have an in-house guest waiting on it.
+_ATTENTION_SEVERITY_RANK = {"critical": 0, "warning": 1}
+_ATTENTION_CATEGORY_RANK = {"unpaid_balance": 0, "guest_request": 1, "maintenance": 2, "low_stock": 3}
+
+
+def build_attention_items(
+    db: Session, today: date, outstanding: list[dict],
+    open_guest_requests: list, open_maintenance_tickets: list, low_stock_items: list, unit_by_id: dict,
+) -> list[dict]:
+    """
+    Deterministic, explainable "what needs attention today" list — every
+    item is a plain if/then rule over data the Dashboard (and the pages
+    behind each link) already shows to admin and staff alike; nothing
+    here is inferred, predicted, or generated. Only genuinely time-
+    sensitive exceptions are included (e.g. a future, not-yet-due balance
+    is not "today's" problem and is deliberately left out) so this stays
+    a short, actionable list rather than a restatement of every open row
+    in the system.
+    """
+    from app.modules.bookings.models import Guest
+
+    items: list[dict] = []
+
+    # --- Unpaid balances: only overdue, or check-in within 3 days ---
+    for o in outstanding:
+        days_to_checkin = (o["check_in"] - today).days
+        if o["is_overdue"]:
+            severity = "critical"
+            reason = f"Payment was due {o['due_date']} and is still pending."
+        elif days_to_checkin <= 0:
+            severity = "critical"
+            reason = f"Guest has checked in (or checks in today) with ₹{o['pending_balance']:,.0f} still unpaid."
+        elif days_to_checkin <= 3:
+            severity = "warning"
+            reason = f"Guest arrives in {days_to_checkin} day(s) with ₹{o['pending_balance']:,.0f} still unpaid."
+        else:
+            continue
+        items.append({
+            "category": "unpaid_balance",
+            "severity": severity,
+            "title": f"{o['guest_name']} — ₹{o['pending_balance']:,.0f} unpaid ({o['unit_name']})",
+            "reason": reason,
+            "action": "Follow up with the guest for payment before/at check-in.",
+            "reference_id": str(o["booking_id"]),
+            "link": "/finance",
+        })
+
+    now = datetime.now(timezone.utc)
+
+    # --- Guest requests: past response-time target, or high/urgent priority ---
+    guest_ids = {r.guest_id for r in open_guest_requests}
+    guests_by_id = {g.id: g for g in db.scalars(select(Guest).where(Guest.id.in_(guest_ids))).all()} if guest_ids else {}
+    for r in open_guest_requests:
+        hours_open = (now - r.created_at).total_seconds() / 3600
+        threshold = _ATTENTION_THRESHOLD_HOURS.get(r.priority, 72)
+        if hours_open >= threshold:
+            severity = "critical"
+            reason = f"Open for {hours_open:.0f}h — past the {threshold}h response target for {r.priority} priority."
+        elif r.priority in ("urgent", "high"):
+            severity = "warning"
+            reason = f"{r.priority.capitalize()} priority request, open {hours_open:.0f}h."
+        else:
+            continue
+        guest = guests_by_id.get(r.guest_id)
+        items.append({
+            "category": "guest_request",
+            "severity": severity,
+            "title": f"{r.priority.capitalize()} request from {guest.name if guest else 'a guest'}: {r.description[:60]}",
+            "reason": reason,
+            "action": "Assign and resolve, or update the guest on progress.",
+            "reference_id": str(r.id),
+            "link": "/guest-requests",
+        })
+
+    # --- Maintenance: past response-time target, or high/urgent priority ---
+    for t in open_maintenance_tickets:
+        hours_open = (now - t.created_at).total_seconds() / 3600
+        threshold = _ATTENTION_THRESHOLD_HOURS.get(t.priority, 72)
+        if hours_open >= threshold:
+            severity = "critical"
+            reason = f"Open for {hours_open:.0f}h — past the {threshold}h target for {t.priority} priority."
+        elif t.priority in ("urgent", "high"):
+            severity = "warning"
+            reason = f"{t.priority.capitalize()} priority ticket, open {hours_open:.0f}h."
+        else:
+            continue
+        unit = unit_by_id.get(t.unit_id)
+        items.append({
+            "category": "maintenance",
+            "severity": severity,
+            "title": f"{t.priority.capitalize()} maintenance — {unit.name if unit else 'a unit'}: {t.description[:60]}",
+            "reason": reason,
+            "action": "Assign and resolve.",
+            "reference_id": str(t.id),
+            "link": "/maintenance",
+        })
+
+    # --- Low stock: out of stock is critical, at/below minimum is a warning ---
+    for item in low_stock_items:
+        out_of_stock = item.current_stock <= 0
+        items.append({
+            "category": "low_stock",
+            "severity": "critical" if out_of_stock else "warning",
+            "title": f"{item.name} — {item.current_stock} {item.unit_of_measure} left (min {item.minimum_stock})",
+            "reason": "Completely out of stock." if out_of_stock else f"At or below the minimum stock threshold of {item.minimum_stock}.",
+            "action": "Reorder or record a stock-in.",
+            "reference_id": str(item.id),
+            "link": "/inventory",
+        })
+
+    items.sort(key=lambda i: (_ATTENTION_SEVERITY_RANK[i["severity"]], _ATTENTION_CATEGORY_RANK[i["category"]]))
+    return items
 
 
 def _pdf_safe(text) -> str:

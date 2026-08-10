@@ -24,6 +24,7 @@ from app.modules.bookings.schemas import (
     GuestMergeRequest,
     GuestMergeResult,
     GuestOut,
+    GuestSegment,
     GuestUpdate,
 )
 from app.modules.finance.models import OTACommission, SecurityDeposit
@@ -204,6 +205,116 @@ def list_guests(
         )
     query = query.order_by(Guest.name).offset(offset).limit(limit)
     return db.scalars(query).all()
+
+
+_GUEST_SEGMENT_SORT_KEYS = ("name", "total_bookings", "total_spent", "last_stay", "segment", "source")
+
+
+@router.get("/guests/segments", response_model=list[GuestSegment], dependencies=[Depends(require_role("admin", "staff"))])
+def list_guest_segments(
+    search: str | None = Query(None, description="Matches name, phone, or email"),
+    ids: str | None = Query(None, description="Comma-separated guest IDs — returns exactly these guests' segmentation stats, ignoring filter/sort/pagination, same convention as GET /guests"),
+    include_merged: bool = Query(False),
+    segment: str | None = Query(None, description="Filter: 'new' or 'repeat'"),
+    source: str | None = Query(None, description="Filter: exact match on latest_source"),
+    sort_by: str = Query("name", description="name | total_bookings | total_spent | last_stay | segment | source"),
+    sort_dir: str = Query("asc", description="asc | desc"),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """
+    Batched guest-list segmentation: total_bookings/is_repeat_guest/
+    total_spent reuse the exact same definitions as get_guest_history()
+    below (ALL bookings regardless of status; total_spent = payments
+    actually received) — deliberately NOT reimplemented, so the list and
+    the per-guest detail view can never disagree about the same guest.
+
+    Unlike GET /guests, which paginates in SQL before doing any work, this
+    endpoint must aggregate across the full search/ids-matched guest set
+    BEFORE sorting/filtering/paginating, since sorting by an aggregate
+    (e.g. total_spent) is only possible once every matching guest's stats
+    are known. It stays N+1-free (exactly 3 queries total: guests, then
+    one IN-query for their bookings, one IN-query for those bookings'
+    payments — the same batching pattern already used by the "guests"
+    report export in export_report() below), but the candidate guest set
+    itself is bounded only by `search`/`ids`, not by `limit`/`offset` — an
+    intentional tradeoff for this product's guest-list scale, matching
+    every other guest export/report in this module.
+    """
+    if sort_by not in _GUEST_SEGMENT_SORT_KEYS:
+        raise HTTPException(400, f"Invalid sort_by '{sort_by}'. Must be one of {_GUEST_SEGMENT_SORT_KEYS}")
+    if sort_dir not in ("asc", "desc"):
+        raise HTTPException(400, "sort_dir must be 'asc' or 'desc'")
+    if segment is not None and segment not in ("new", "repeat"):
+        raise HTTPException(400, "segment must be 'new' or 'repeat'")
+
+    if ids:
+        id_list = [i.strip() for i in ids.split(",") if i.strip()]
+        guests = db.scalars(select(Guest).where(Guest.id.in_(id_list))).all()
+    else:
+        query = select(Guest)
+        if not include_merged:
+            query = query.where(Guest.merged_into_guest_id.is_(None))
+        if search:
+            query = query.where(
+                (Guest.name.ilike(f"%{search}%")) | (Guest.phone.ilike(f"%{search}%")) | (Guest.email.ilike(f"%{search}%"))
+            )
+        guests = db.scalars(query).all()
+
+    guest_ids = [g.id for g in guests]
+    bookings_by_guest: dict = defaultdict(list)
+    if guest_ids:
+        for b in db.scalars(select(Booking).where(Booking.guest_id.in_(guest_ids))).all():
+            bookings_by_guest[b.guest_id].append(b)
+    booking_ids = [b.id for blist in bookings_by_guest.values() for b in blist]
+    spend_by_booking: dict = defaultdict(float)
+    if booking_ids:
+        for p in db.scalars(select(Payment).where(Payment.booking_id.in_(booking_ids))).all():
+            spend_by_booking[p.booking_id] += float(p.amount)
+
+    rows = []
+    for g in guests:
+        g_bookings = bookings_by_guest.get(g.id, [])
+        total_bookings = len(g_bookings)
+        is_repeat = total_bookings > 1  # same rule as GuestHistory.is_repeat_guest
+        total_spent = round(sum(spend_by_booking.get(b.id, 0.0) for b in g_bookings), 2)
+        latest = max(g_bookings, key=lambda b: b.check_in) if g_bookings else None
+        rows.append({
+            "guest_id": g.id, "name": g.name, "phone": g.phone, "email": g.email,
+            "is_vip": g.is_vip, "is_blacklisted": g.is_blacklisted,
+            "is_repeat_guest": is_repeat, "total_bookings": total_bookings, "total_spent": total_spent,
+            "latest_source": latest.source if latest else None,
+            "last_stay": latest.check_in if latest else None,
+        })
+
+    if ids:
+        # Same convention as GET /guests: an explicit id set is returned
+        # exactly as-is, ignoring filter/sort/pagination.
+        return rows
+
+    if segment == "new":
+        rows = [r for r in rows if not r["is_repeat_guest"]]
+    elif segment == "repeat":
+        rows = [r for r in rows if r["is_repeat_guest"]]
+    if source:
+        rows = [r for r in rows if r["latest_source"] == source]
+
+    reverse = sort_dir == "desc"
+    if sort_by == "name":
+        rows.sort(key=lambda r: r["name"].lower(), reverse=reverse)
+    elif sort_by == "total_bookings":
+        rows.sort(key=lambda r: r["total_bookings"], reverse=reverse)
+    elif sort_by == "total_spent":
+        rows.sort(key=lambda r: r["total_spent"], reverse=reverse)
+    elif sort_by == "last_stay":
+        rows.sort(key=lambda r: (r["last_stay"] is not None, r["last_stay"]), reverse=reverse)
+    elif sort_by == "segment":
+        rows.sort(key=lambda r: r["is_repeat_guest"], reverse=reverse)
+    elif sort_by == "source":
+        rows.sort(key=lambda r: (r["latest_source"] or ""), reverse=reverse)
+
+    return rows[offset: offset + limit]
 
 
 @router.get("/guests/{guest_id}/history", response_model=GuestHistory, dependencies=[Depends(require_role("admin", "staff"))])

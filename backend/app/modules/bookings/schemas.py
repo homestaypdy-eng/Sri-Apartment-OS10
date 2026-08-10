@@ -57,6 +57,29 @@ class GuestOut(GuestCreate):
         from_attributes = True
 
 
+class GuestSegment(BaseModel):
+    """
+    One guest's list-level segmentation stats — total_bookings/is_repeat_guest/
+    total_spent use the exact same definitions as GuestHistory above (ALL
+    bookings regardless of status; total_spent is payments actually
+    received, not gross booking value), so a guest never looks "repeat" in
+    one view and "new" in the other. latest_source/last_stay come from the
+    guest's most recent booking by check_in — "latest", not permanent,
+    since source is recorded per-booking, not per-guest.
+    """
+    guest_id: uuid.UUID
+    name: str
+    phone: str
+    email: str | None = None
+    is_vip: bool
+    is_blacklisted: bool
+    is_repeat_guest: bool
+    total_bookings: int
+    total_spent: float
+    latest_source: str | None = None
+    last_stay: date | None = None
+
+
 class GuestDocumentOut(BaseModel):
     id: uuid.UUID
     guest_id: uuid.UUID

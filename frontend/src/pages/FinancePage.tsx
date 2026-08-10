@@ -160,7 +160,6 @@ function GstDashboardTab({ setError }: { setError: (e: string | null) => void })
             <StatBox label="GST Collected" value={`₹${report.gst_collected.toLocaleString()}`} />
             <StatBox label="GST Input Credit (eligible)" value={`₹${report.gst_input_credit_eligible.toLocaleString()}`} tone="green" />
             <StatBox label="GST Payable" value={`₹${report.gst_payable.toLocaleString()}`} tone="red" />
-            <StatBox label="GST Liability" value={`₹${report.gst_liability.toLocaleString()}`} tone="red" />
           </div>
           <Card>
             <h2 className="text-sm font-semibold text-slate-900 mb-4">Monthly GST Summary</h2>
@@ -663,11 +662,11 @@ function ApartmentPnLTab({ setError }: { setError: (e: string | null) => void })
       {pnl && (
         <>
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-6">
-            <StatBox label="Revenue" value={`₹${pnl.revenue.toLocaleString()}`} tone="green" />
+            <StatBox label="Revenue (room rate only)" value={`₹${pnl.revenue.toLocaleString()}`} tone="green" />
             <StatBox label="Advance Received" value={`₹${pnl.advance_received.toLocaleString()}`} />
             <StatBox label="Outstanding" value={`₹${pnl.outstanding_balance.toLocaleString()}`} tone={pnl.outstanding_balance > 0 ? "red" : undefined} />
-            <StatBox label="Total Expenses" value={`₹${pnl.total_expenses.toLocaleString()}`} tone="red" />
-            <StatBox label="Net Profit" value={`₹${pnl.net_profit.toLocaleString()}`} tone={pnl.net_profit >= 0 ? "green" : "red"} />
+            <StatBox label="Total Expenses (this unit)" value={`₹${pnl.total_expenses.toLocaleString()}`} tone="red" />
+            <StatBox label="Net Profit (this unit)" value={`₹${pnl.net_profit.toLocaleString()}`} tone={pnl.net_profit >= 0 ? "green" : "red"} />
           </div>
           <Card>
             <h2 className="text-sm font-semibold text-slate-900 mb-1 flex items-center justify-between">
@@ -1677,7 +1676,7 @@ function IncomeRegisterTab({ setError }: { setError: (e: string | null) => void 
 
           {Object.keys(register.by_source).length > 0 && (
             <Card className="mb-6">
-              <h2 className="text-sm font-semibold text-slate-900 mb-3">Revenue by Source</h2>
+              <h2 className="text-sm font-semibold text-slate-900 mb-3">Revenue by Source (room rate only)</h2>
               <div className="flex flex-wrap gap-4">
                 {Object.entries(register.by_source).map(([source, amount]) => (
                   <div key={source} className="text-sm">
@@ -1714,7 +1713,7 @@ function IncomeRegisterTab({ setError }: { setError: (e: string | null) => void 
                               <th className="py-2 px-4">Guest</th>
                               <th className="py-2 px-4">Guests</th>
                               <th className="py-2 px-4">Contact</th>
-                              <th className="py-2 px-4">Amount</th>
+                              <th className="py-2 px-4">Amount (room rate only)</th>
                               <th className="py-2 px-4">Advance</th>
                               <th className="py-2 px-4">Balance</th>
                               <th className="py-2 px-4">Source</th>

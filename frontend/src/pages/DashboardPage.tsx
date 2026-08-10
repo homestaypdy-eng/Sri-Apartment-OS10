@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { BarChart, Bar, LineChart, Line, Legend, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { api, extractErrorMessage, type OperationalDashboard, type DashboardCalendar } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, Spinner } from "../components/ui";
+import { useAuth } from "../context/AuthContext";
 
 // Polling interval for the "keep this reasonably fresh across multiple
 // staff using the system at once" behavior. This is honest, simple
@@ -13,6 +14,8 @@ import { Card, PageHeader, ErrorBanner, Spinner } from "../components/ui";
 const REFRESH_INTERVAL_MS = 20_000;
 
 export default function DashboardPage() {
+  const { role } = useAuth();
+  const isAdmin = role === "admin";
   const [data, setData] = useState<OperationalDashboard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -84,42 +87,148 @@ export default function DashboardPage() {
         <Link to="/inquiries" className="rounded-lg border border-slate-300 text-xs font-medium px-3 py-2 hover:bg-slate-50">+ New Enquiry</Link>
       </div>
 
-      {(data.low_stock_count > 0 || data.pending_payments_count > 0 || data.maintenance_open > 0 || data.guest_requests_open > 0 || data.follow_ups_due_today > 0 || data.staff_absent_today > 0) && (
+      {(data.attention_items.length > 0 || data.follow_ups_due_today > 0 || data.staff_absent_today > 0) && (
         <Card className="mb-6 border-amber-300 bg-amber-50">
           <h2 className="text-sm font-semibold text-amber-900 mb-2">Needs Attention</h2>
-          <ul className="text-xs text-amber-900 space-y-1 list-disc list-inside">
-            {data.pending_payments_count > 0 && <li><Link to="/finance" className="hover:underline">{data.pending_payments_count} booking(s) with an outstanding balance — ₹{data.pending_payments_amount.toLocaleString()}</Link></li>}
-            {data.maintenance_open > 0 && <li><Link to="/maintenance" className="hover:underline">{data.maintenance_open} open maintenance ticket(s)</Link></li>}
-            {data.guest_requests_open > 0 && <li><Link to="/guest-requests" className="hover:underline">{data.guest_requests_open} unresolved guest request(s)</Link></li>}
-            {data.low_stock_count > 0 && <li><Link to="/inventory" className="hover:underline">{data.low_stock_count} inventory item(s) at or below minimum stock</Link></li>}
-            {data.follow_ups_due_today > 0 && <li><Link to="/inquiries" className="hover:underline">{data.follow_ups_due_today} enquiry follow-up(s) due today</Link></li>}
-            {data.staff_absent_today > 0 && <li><Link to="/staff" className="hover:underline">{data.staff_absent_today} staff member(s) absent today</Link></li>}
-          </ul>
+          {data.attention_items.length > 0 && (
+            <ul className="text-xs text-amber-900 space-y-2 mb-2">
+              {data.attention_items.map((item, i) => (
+                <li key={i} className="flex items-start gap-2">
+                  <span className={`mt-0.5 shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase ${item.severity === "critical" ? "bg-red-600 text-white" : "bg-amber-500 text-white"}`}>
+                    {item.severity}
+                  </span>
+                  <span>
+                    <Link to={item.link} className="font-medium hover:underline">{item.title}</Link>
+                    <span className="block text-amber-800">{item.reason} {item.action}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {(data.follow_ups_due_today > 0 || data.staff_absent_today > 0) && (
+            <ul className="text-xs text-amber-900 space-y-1 list-disc list-inside">
+              {data.follow_ups_due_today > 0 && <li><Link to="/inquiries" className="hover:underline">{data.follow_ups_due_today} enquiry follow-up(s) due today</Link></li>}
+              {data.staff_absent_today > 0 && <li><Link to="/staff" className="hover:underline">{data.staff_absent_today} staff member(s) absent today</Link></li>}
+            </ul>
+          )}
         </Card>
       )}
 
+      <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Today's Operational Picture</h2>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
         <StatCard label="Arrivals Today" value={data.arrivals_today} to="/bookings" />
         <StatCard label="Departures Today" value={data.departures_today} to="/bookings" />
         <StatCard label="In-House Guests" value={data.in_house_guests} to="/bookings" />
+        <StatCard label="Pending Check-ins" value={data.pending_checkins} to="/bookings" />
+        <StatCard label="Pending Check-outs" value={data.pending_checkouts} to="/bookings" />
         <StatCard label="Vacant Units" value={data.vacant_units} to="/properties" />
         <StatCard label="Total Guests" value={data.total_guests} to="/guests" />
         <StatCard label="Active Bookings" value={data.active_bookings} to="/bookings" />
       </div>
+      {isAdmin && (
+        <Card className="mb-8">
+          <h2 className="text-sm font-semibold text-slate-900 mb-3">Today</h2>
+          <div className="space-y-2 text-sm">
+            <Row label="Revenue" value={`₹${data.today_revenue.toLocaleString()}`} />
+            <Row label="Expenses" value={`₹${data.today_expenses.toLocaleString()}`} />
+            <Row label="Profit" value={`₹${data.today_profit.toLocaleString()}`} bold tone={data.today_profit >= 0 ? "green" : "red"} />
+          </div>
+        </Card>
+      )}
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
         <StatCard label="Occupancy" value={`${data.occupancy_percent}%`} />
-        <StatCard label="Pending Check-ins" value={data.pending_checkins} to="/bookings" />
-        <StatCard label="Pending Check-outs" value={data.pending_checkouts} to="/bookings" />
+      </div>
+
+      {!isAdmin && (
+        <p className="text-xs text-slate-400 mb-8">Revenue and P&amp;L are available under Finance and Reports Center.</p>
+      )}
+
+      {isAdmin && (
+        <>
+          <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">This Month — Financial Summary</h2>
+          <Card className="mb-8">
+            <h2 className="text-sm font-semibold text-slate-900 mb-3">This Month</h2>
+            <div className="space-y-2 text-sm">
+              <Row label="Revenue" value={`₹${data.month_revenue.toLocaleString()}`} />
+              <Row label="Expenses" value={`₹${data.month_expenses.toLocaleString()}`} />
+              <Row label="Profit" value={`₹${data.month_profit.toLocaleString()}`} bold tone={data.month_profit >= 0 ? "green" : "red"} />
+            </div>
+          </Card>
+
+          <Card className="mb-8">
+            <h2 className="text-sm font-semibold text-slate-900 mb-1">Apartment-wise Performance (this month)</h2>
+            <p className="text-xs text-slate-400 mb-4">Revenue vs. expenses per unit, sorted by revenue highest to lowest.</p>
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={data.apartment_performance.slice(0, 12)} margin={{ top: 5, right: 10, left: 0, bottom: 40 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="unit_name" angle={-35} textAnchor="end" interval={0} height={60} tick={{ fontSize: 11 }} />
+                  <YAxis tick={{ fontSize: 11 }} />
+                  <Tooltip formatter={(value: unknown) => `₹${Number(value).toLocaleString()}`} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Bar dataKey="month_revenue" name="Revenue" fill="#0f172a" radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="month_expenses" name="Expenses" fill="#dc2626" radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="overflow-x-auto mt-4">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-left text-slate-400 border-b border-slate-100">
+                    <th className="py-1.5 pr-4">Unit</th>
+                    <th className="py-1.5 pr-4">Revenue</th>
+                    <th className="py-1.5 pr-4">Expenses</th>
+                    <th className="py-1.5 pr-4">Profit</th>
+                    <th className="py-1.5 pr-4">Nights Booked</th>
+                    <th className="py-1.5">Occupancy</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.apartment_performance.map((a) => (
+                    <tr key={a.unit_id} className="border-b border-slate-50">
+                      <td className="py-1.5 pr-4 font-medium text-slate-700">{a.unit_name}</td>
+                      <td className="py-1.5 pr-4 text-slate-500">₹{a.month_revenue.toLocaleString()}</td>
+                      <td className="py-1.5 pr-4 text-slate-500">₹{a.month_expenses.toLocaleString()}</td>
+                      <td className={`py-1.5 pr-4 font-medium ${a.month_profit >= 0 ? "text-emerald-600" : "text-red-600"}`}>₹{a.month_profit.toLocaleString()}</td>
+                      <td className="py-1.5 pr-4 text-slate-500">{a.month_nights_booked}</td>
+                      <td className="py-1.5 text-slate-500">{a.month_occupancy_percent}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+
+          <Card className="mb-8">
+            <h2 className="text-sm font-semibold text-slate-900 mb-1">Monthly Trend (last 6 months)</h2>
+            <p className="text-xs text-slate-400 mb-4">Revenue, expenses, and profit — including the current, in-progress month.</p>
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={data.monthly_trend.map((t) => ({ ...t, label: `${t.month}/${t.year}` }))} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fontSize: 11 }} />
+                  <YAxis tick={{ fontSize: 11 }} />
+                  <Tooltip formatter={(value: unknown) => `₹${Number(value).toLocaleString()}`} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Line type="monotone" dataKey="revenue" name="Revenue" stroke="#0f172a" strokeWidth={2} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="expenses" name="Expenses" stroke="#dc2626" strokeWidth={2} dot={{ r: 3 }} />
+                  <Line type="monotone" dataKey="profit" name="Profit" stroke="#059669" strokeWidth={2} dot={{ r: 3 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </Card>
+        </>
+      )}
+
+      <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Reference</h2>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
         <StatCard
           label="Pending Payments"
           value={data.pending_payments_count}
           sub={`₹${data.pending_payments_amount.toLocaleString()}`}
           to="/finance"
         />
-      </div>
-
-      <div className="grid grid-cols-2 sm:grid-cols-2 gap-4 mb-8">
         <StatCard label="Housekeeping Pending" value={data.housekeeping_pending} to="/housekeeping" tone={data.housekeeping_pending > 0 ? "amber" : undefined} />
         <StatCard label="Maintenance Open" value={data.maintenance_open} to="/maintenance" tone={data.maintenance_open > 0 ? "amber" : undefined} />
         <StatCard label="Guest Requests Open" value={data.guest_requests_open} to="/guest-requests" tone={data.guest_requests_open > 0 ? "amber" : undefined} />
@@ -128,88 +237,6 @@ export default function DashboardPage() {
         <StatCard label="Staff Absent Today" value={data.staff_absent_today} to="/staff" tone={data.staff_absent_today > 0 ? "amber" : undefined} />
         <StatCard label="Follow-ups Due Today" value={data.follow_ups_due_today} to="/inquiries" tone={data.follow_ups_due_today > 0 ? "amber" : undefined} />
       </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-8">
-        <Card>
-          <h2 className="text-sm font-semibold text-slate-900 mb-3">Today</h2>
-          <div className="space-y-2 text-sm">
-            <Row label="Revenue" value={`₹${data.today_revenue.toLocaleString()}`} />
-            <Row label="Expenses" value={`₹${data.today_expenses.toLocaleString()}`} />
-            <Row label="Profit" value={`₹${data.today_profit.toLocaleString()}`} bold tone={data.today_profit >= 0 ? "green" : "red"} />
-          </div>
-        </Card>
-        <Card>
-          <h2 className="text-sm font-semibold text-slate-900 mb-3">This Month</h2>
-          <div className="space-y-2 text-sm">
-            <Row label="Revenue" value={`₹${data.month_revenue.toLocaleString()}`} />
-            <Row label="Expenses" value={`₹${data.month_expenses.toLocaleString()}`} />
-            <Row label="Profit" value={`₹${data.month_profit.toLocaleString()}`} bold tone={data.month_profit >= 0 ? "green" : "red"} />
-          </div>
-        </Card>
-      </div>
-
-      <Card className="mb-8">
-        <h2 className="text-sm font-semibold text-slate-900 mb-1">Apartment-wise Performance (this month)</h2>
-        <p className="text-xs text-slate-400 mb-4">Revenue vs. expenses per unit, sorted by revenue highest to lowest.</p>
-        <div className="h-72">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={data.apartment_performance.slice(0, 12)} margin={{ top: 5, right: 10, left: 0, bottom: 40 }}>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} />
-              <XAxis dataKey="unit_name" angle={-35} textAnchor="end" interval={0} height={60} tick={{ fontSize: 11 }} />
-              <YAxis tick={{ fontSize: 11 }} />
-              <Tooltip formatter={(value: unknown) => `₹${Number(value).toLocaleString()}`} />
-              <Legend wrapperStyle={{ fontSize: 11 }} />
-              <Bar dataKey="month_revenue" name="Revenue" fill="#0f172a" radius={[4, 4, 0, 0]} />
-              <Bar dataKey="month_expenses" name="Expenses" fill="#dc2626" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-        <div className="overflow-x-auto mt-4">
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="text-left text-slate-400 border-b border-slate-100">
-                <th className="py-1.5 pr-4">Unit</th>
-                <th className="py-1.5 pr-4">Revenue</th>
-                <th className="py-1.5 pr-4">Expenses</th>
-                <th className="py-1.5 pr-4">Profit</th>
-                <th className="py-1.5 pr-4">Nights Booked</th>
-                <th className="py-1.5">Occupancy</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.apartment_performance.map((a) => (
-                <tr key={a.unit_id} className="border-b border-slate-50">
-                  <td className="py-1.5 pr-4 font-medium text-slate-700">{a.unit_name}</td>
-                  <td className="py-1.5 pr-4 text-slate-500">₹{a.month_revenue.toLocaleString()}</td>
-                  <td className="py-1.5 pr-4 text-slate-500">₹{a.month_expenses.toLocaleString()}</td>
-                  <td className={`py-1.5 pr-4 font-medium ${a.month_profit >= 0 ? "text-emerald-600" : "text-red-600"}`}>₹{a.month_profit.toLocaleString()}</td>
-                  <td className="py-1.5 pr-4 text-slate-500">{a.month_nights_booked}</td>
-                  <td className="py-1.5 text-slate-500">{a.month_occupancy_percent}%</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </Card>
-
-      <Card>
-        <h2 className="text-sm font-semibold text-slate-900 mb-1">Monthly Trend (last 6 months)</h2>
-        <p className="text-xs text-slate-400 mb-4">Revenue, expenses, and profit — including the current, in-progress month.</p>
-        <div className="h-72">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={data.monthly_trend.map((t) => ({ ...t, label: `${t.month}/${t.year}` }))} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} />
-              <XAxis dataKey="label" tick={{ fontSize: 11 }} />
-              <YAxis tick={{ fontSize: 11 }} />
-              <Tooltip formatter={(value: unknown) => `₹${Number(value).toLocaleString()}`} />
-              <Legend wrapperStyle={{ fontSize: 11 }} />
-              <Line type="monotone" dataKey="revenue" name="Revenue" stroke="#0f172a" strokeWidth={2} dot={{ r: 3 }} />
-              <Line type="monotone" dataKey="expenses" name="Expenses" stroke="#dc2626" strokeWidth={2} dot={{ r: 3 }} />
-              <Line type="monotone" dataKey="profit" name="Profit" stroke="#059669" strokeWidth={2} dot={{ r: 3 }} />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      </Card>
 
       <Card className="mt-8">
         <div className="flex items-center justify-between mb-4">

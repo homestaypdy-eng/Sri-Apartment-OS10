@@ -1,4 +1,5 @@
 from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -31,6 +32,57 @@ class SummaryReport(BaseModel):
     net_revenue_after_maintenance: float
 
 
+class PeriodRange(BaseModel):
+    date_from: date
+    date_to: date
+
+
+class MetricComparison(BaseModel):
+    current: float
+    previous: float
+    change_percent: float | None
+    change_percentage_points: float | None = None
+
+
+class SummaryComparison(BaseModel):
+    current_period: PeriodRange
+    previous_period: PeriodRange
+    occupancy: MetricComparison
+    adr: MetricComparison
+    revpar: MetricComparison
+
+
+class CancellationReport(BaseModel):
+    """
+    "Of the firm bookings scheduled to check in during this period, what
+    fraction were cancelled?" — check_in-date basis, same convention as
+    every other booking metric in this module. This is NOT "cancellations
+    recorded during the period": OS10 has no cancellation timestamp, so a
+    booking cancelled today for a stay three months from now counts toward
+    that future period, not today. See build_cancellation_report() in
+    reports/service.py for the exact rule.
+
+    The firm-booking population (the denominator) is confirmed +
+    checked_in + checked_out + cancelled + no_show — "inquiry" bookings
+    (unconfirmed holds) are excluded entirely, from both the cancellation
+    and no-show rates.
+    """
+    current_period: PeriodRange
+    previous_period: PeriodRange
+    total_bookings_in_period: int
+    cancelled_count: int
+    cancellation_rate_percent: float
+    no_show_count: int
+    no_show_rate_percent: float
+    previous_total_bookings_in_period: int
+    previous_cancelled_count: int
+    previous_cancellation_rate_percent: float
+    previous_no_show_count: int
+    previous_no_show_rate_percent: float
+    cancellation_rate_change_percent: float | None
+    no_show_rate_change_percent: float | None
+
+
 class ApartmentPerformanceLine(BaseModel):
     unit_id: str
     unit_name: str
@@ -47,6 +99,20 @@ class MonthlyTrendPoint(BaseModel):
     revenue: float
     expenses: float
     profit: float
+
+
+class AttentionItem(BaseModel):
+    """One deterministic, rule-based "needs attention today" exception.
+    Every field is derived directly from existing operational data — see
+    build_attention_items() in reports/service.py for the exact rule
+    behind each item; nothing here is predicted or AI-generated."""
+    category: Literal["unpaid_balance", "guest_request", "maintenance", "low_stock"]
+    severity: Literal["critical", "warning"]
+    title: str
+    reason: str
+    action: str
+    reference_id: str
+    link: str
 
 
 class OperationalDashboard(BaseModel):
@@ -78,6 +144,7 @@ class OperationalDashboard(BaseModel):
     month_profit: float
     apartment_performance: list[ApartmentPerformanceLine]
     monthly_trend: list[MonthlyTrendPoint]
+    attention_items: list[AttentionItem]
 
 
 class RevenuePoint(BaseModel):

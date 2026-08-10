@@ -1,14 +1,21 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, extractErrorMessage, type GuestOut, type GuestHistory, type GuestDocumentOut } from "../lib/api";
+import { api, extractErrorMessage, type GuestOut, type GuestHistory, type GuestDocumentOut, type GuestSegment } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState } from "../components/ui";
+
+type SortBy = "name" | "total_bookings" | "total_spent" | "last_stay" | "segment" | "source";
 
 const DOCUMENT_TYPES = ["aadhaar", "pan", "passport", "driving_license", "other"];
 
 export default function GuestsPage() {
   const [guests, setGuests] = useState<GuestOut[]>([]);
+  const [segments, setSegments] = useState<GuestSegment[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [segmentFilter, setSegmentFilter] = useState<"" | "new" | "repeat">("");
+  const [sourceFilter, setSourceFilter] = useState("");
+  const [sortBy, setSortBy] = useState<SortBy>("name");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [form, setForm] = useState({
     name: "", phone: "", email: "", address: "", date_of_birth: "", gender: "", nationality: "", occupation: "",
     whatsapp_number: "", emergency_contact_name: "", emergency_contact_phone: "", notes: "",
@@ -34,10 +41,26 @@ export default function GuestsPage() {
     }
   }
 
+  async function loadSegments() {
+    try {
+      const params: Record<string, string> = { sort_by: sortBy, sort_dir: sortDir };
+      if (search) params.search = search;
+      if (segmentFilter) params.segment = segmentFilter;
+      if (sourceFilter) params.source = sourceFilter;
+      const { data } = await api.get("/guests/segments", { params });
+      setSegments(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
   useEffect(() => {
     loadGuests();
+    loadSegments();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [search]);
+  }, [search, segmentFilter, sourceFilter, sortBy, sortDir]);
+
+  const guestsById = new Map(guests.map((g) => [g.id, g]));
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
@@ -54,6 +77,7 @@ export default function GuestsPage() {
       setGuests((prev) => [...prev, data]);
       setSuccess(`Guest "${data.name}" created.`);
       setForm({ name: "", phone: "", email: "", address: "", date_of_birth: "", gender: "", nationality: "", occupation: "", whatsapp_number: "", emergency_contact_name: "", emergency_contact_phone: "", notes: "" });
+      loadSegments();
     } catch (err) {
       setError(extractErrorMessage(err));
     }
@@ -190,6 +214,7 @@ export default function GuestsPage() {
       setMergeMode(false);
       setMergeDuplicateId("");
       loadGuests();
+      loadSegments();
     } catch (err) {
       setError(extractErrorMessage(err));
     }
@@ -234,30 +259,74 @@ export default function GuestsPage() {
       </Card>
 
       <Card>
-        <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
           <h2 className="text-sm font-semibold text-slate-900">Guests</h2>
           <input placeholder="Search name, phone, or email..." value={search} onChange={(e) => setSearch(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs min-w-[220px]" />
         </div>
-        {guests.length === 0 ? (
+        <div className="flex flex-wrap items-center gap-2 mb-4 pb-3 border-b border-slate-100">
+          <span className="text-xs text-slate-400">Filter:</span>
+          <select value={segmentFilter} onChange={(e) => setSegmentFilter(e.target.value as "" | "new" | "repeat")} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+            <option value="">All guests</option>
+            <option value="new">New</option>
+            <option value="repeat">Repeat</option>
+          </select>
+          <input
+            placeholder="Latest source (e.g. direct, whatsapp)..."
+            value={sourceFilter}
+            onChange={(e) => setSourceFilter(e.target.value)}
+            className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs min-w-[180px]"
+          />
+          <span className="text-xs text-slate-400 ml-2">Sort by:</span>
+          <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+            <option value="name">Name</option>
+            <option value="total_bookings">Bookings</option>
+            <option value="total_spent">Total Spent</option>
+            <option value="last_stay">Last Stay</option>
+            <option value="segment">New / Repeat</option>
+            <option value="source">Latest Source</option>
+          </select>
+          <button
+            onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+            className="text-xs rounded-lg border border-slate-300 px-2 py-1.5 text-slate-600 hover:bg-slate-50"
+            title="Toggle sort direction"
+          >
+            {sortDir === "asc" ? "↑ Asc" : "↓ Desc"}
+          </button>
+        </div>
+        {segments.length === 0 ? (
           <EmptyState message="No guests match this search." />
         ) : (
-          <Table headers={["Name", "Phone", "Email", "Status", "Actions"]}>
-            {guests.map((g) => (
-              <tr key={g.id}>
-                <td className="px-4 py-2.5 font-medium text-slate-800">{g.name}</td>
-                <td className="px-4 py-2.5 text-slate-500">{g.phone}</td>
-                <td className="px-4 py-2.5 text-slate-500">{g.email ?? "—"}</td>
-                <td className="px-4 py-2.5 space-x-1">
-                  {g.is_vip && <Badge tone="amber">VIP</Badge>}
-                  {g.is_blacklisted && <Badge tone="red">Blacklisted</Badge>}
-                </td>
-                <td className="px-4 py-2.5">
-                  <Button variant="secondary" onClick={() => openDetail(g)}>
-                    View / Edit
-                  </Button>
-                </td>
-              </tr>
-            ))}
+          <Table headers={["Name", "Phone", "Email", "Segment", "Stays", "Total Spent", "Latest Source", "Last Stay", "Status", "Actions"]}>
+            {segments.map((seg) => {
+              const g = guestsById.get(seg.guest_id);
+              return (
+                <tr key={seg.guest_id}>
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{seg.name}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{seg.phone}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{seg.email ?? "—"}</td>
+                  <td className="px-4 py-2.5">
+                    {seg.is_repeat_guest ? <Badge tone="green">Repeat</Badge> : <Badge tone="slate">New</Badge>}
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-500">{seg.total_bookings}</td>
+                  <td className="px-4 py-2.5 text-slate-500">₹{seg.total_spent.toLocaleString()}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{seg.latest_source ?? "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{seg.last_stay ?? "—"}</td>
+                  <td className="px-4 py-2.5 space-x-1">
+                    {(g?.is_vip ?? seg.is_vip) && <Badge tone="amber">VIP</Badge>}
+                    {(g?.is_blacklisted ?? seg.is_blacklisted) && <Badge tone="red">Blacklisted</Badge>}
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {g ? (
+                      <Button variant="secondary" onClick={() => openDetail(g)}>
+                        View / Edit
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-slate-300">—</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
           </Table>
         )}
       </Card>

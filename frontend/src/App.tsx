@@ -19,6 +19,7 @@ const MaintenancePage = lazy(() => import("./pages/MaintenancePage"));
 const BillingPage = lazy(() => import("./pages/BillingPage"));
 const FinancePage = lazy(() => import("./pages/FinancePage"));
 const ReportsPage = lazy(() => import("./pages/ReportsPage"));
+const ProfitSimulatorPage = lazy(() => import("./pages/ProfitSimulatorPage"));
 const UsersPage = lazy(() => import("./pages/UsersPage"));
 const InventoryPage = lazy(() => import("./pages/InventoryPage"));
 const StaffPage = lazy(() => import("./pages/StaffPage"));
@@ -67,6 +68,7 @@ export default function App() {
               <Route path="billing" element={<Suspense fallback={<PageLoading />}><BillingPage /></Suspense>} />
               <Route path="finance" element={<Suspense fallback={<PageLoading />}><FinancePage /></Suspense>} />
               <Route path="reports" element={<Suspense fallback={<PageLoading />}><ReportsPage /></Suspense>} />
+              <Route path="profit-simulator" element={<Suspense fallback={<PageLoading />}><ProfitSimulatorPage /></Suspense>} />
               <Route path="notifications" element={<Suspense fallback={<PageLoading />}><NotificationsPage /></Suspense>} />
               <Route path="settings" element={<Suspense fallback={<PageLoading />}><SettingsPage /></Suspense>} />
               <Route

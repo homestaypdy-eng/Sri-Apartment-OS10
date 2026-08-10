@@ -201,6 +201,20 @@ export interface GuestOut {
   merged_into_guest_id: string | null;
 }
 
+export interface GuestSegment {
+  guest_id: string;
+  name: string;
+  phone: string;
+  email: string | null;
+  is_vip: boolean;
+  is_blacklisted: boolean;
+  is_repeat_guest: boolean;
+  total_bookings: number;
+  total_spent: number;
+  latest_source: string | null;
+  last_stay: string | null;
+}
+
 export interface GuestDocumentOut {
   id: string;
   guest_id: string;
@@ -308,6 +322,43 @@ export interface SummaryReport {
   gst: GstBreakdown;
   maintenance_cost_total: number;
   net_revenue_after_maintenance: number;
+}
+
+export interface PeriodRange {
+  date_from: string;
+  date_to: string;
+}
+
+export interface MetricComparison {
+  current: number;
+  previous: number;
+  change_percent: number | null;
+  change_percentage_points?: number | null;
+}
+
+export interface SummaryComparison {
+  current_period: PeriodRange;
+  previous_period: PeriodRange;
+  occupancy: MetricComparison;
+  adr: MetricComparison;
+  revpar: MetricComparison;
+}
+
+export interface CancellationReport {
+  current_period: PeriodRange;
+  previous_period: PeriodRange;
+  total_bookings_in_period: number;
+  cancelled_count: number;
+  cancellation_rate_percent: number;
+  no_show_count: number;
+  no_show_rate_percent: number;
+  previous_total_bookings_in_period: number;
+  previous_cancelled_count: number;
+  previous_cancellation_rate_percent: number;
+  previous_no_show_count: number;
+  previous_no_show_rate_percent: number;
+  cancellation_rate_change_percent: number | null;
+  no_show_rate_change_percent: number | null;
 }
 
 export interface RevenuePoint {
@@ -952,6 +1003,16 @@ export interface MonthlyTrendPoint {
   profit: number;
 }
 
+export interface AttentionItem {
+  category: "unpaid_balance" | "guest_request" | "maintenance" | "low_stock";
+  severity: "critical" | "warning";
+  title: string;
+  reason: string;
+  action: string;
+  reference_id: string;
+  link: string;
+}
+
 export interface OperationalDashboard {
   as_of: string;
   arrivals_today: number;
@@ -981,6 +1042,7 @@ export interface OperationalDashboard {
   month_profit: number;
   apartment_performance: ApartmentPerformanceLine[];
   monthly_trend: MonthlyTrendPoint[];
+  attention_items: AttentionItem[];
 }
 
 export interface CalendarDay {

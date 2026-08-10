@@ -17,6 +17,7 @@ const navItems = [
   { to: "/billing", label: "Billing" },
   { to: "/finance", label: "Finance" },
   { to: "/reports", label: "Reports Center" },
+  { to: "/profit-simulator", label: "Profit Simulator" },
   { to: "/notifications", label: "Notifications" },
   { to: "/settings", label: "Settings" },
   { to: "/audit", label: "Audit", adminOnly: true },
