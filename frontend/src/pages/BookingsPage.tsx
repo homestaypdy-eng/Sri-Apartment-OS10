@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type BookingAttachmentOut, type BookingOut, type GuestOut, type UnitOut, type PaymentOut, type PropertyOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, SkeletonRows, EmptyState } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import GuestPicker from "../components/GuestPicker";
 
 export default function BookingsPage() {
   const { role } = useAuth();
@@ -15,6 +16,7 @@ export default function BookingsPage() {
   const [success, setSuccess] = useState<string | null>(null);
 
   const [form, setForm] = useState({ unit_id: "", guest_id: "", check_in: "", check_out: "", adults: "1", children: "0", extra_bed: false, arrival_time: "", departure_time: "" });
+  const [selectedNewGuest, setSelectedNewGuest] = useState<GuestOut | null>(null);
   const [availability, setAvailability] = useState<{ checked: boolean; available: boolean }>({
     checked: false,
     available: false,
@@ -24,6 +26,7 @@ export default function BookingsPage() {
 
   const [detailsBookingId, setDetailsBookingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState({ guest_id: "", unit_id: "", check_in: "", check_out: "", rate_applied: "", reason: "", adults: "1", children: "0", extra_bed: false, arrival_time: "", departure_time: "" });
+  const [selectedEditGuest, setSelectedEditGuest] = useState<GuestOut | null>(null);
   const [attachments, setAttachments] = useState<BookingAttachmentOut[]>([]);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [timeline, setTimeline] = useState<{ action: string; user_name: string; details: string | null; previous_value: string | null; new_value: string | null; created_at: string }[]>([]);
@@ -79,6 +82,10 @@ export default function BookingsPage() {
     e.preventDefault();
     setError(null);
     setSuccess(null);
+    if (!form.guest_id) {
+      setError("Select or create a guest before confirming the booking.");
+      return;
+    }
     try {
       const { data } = await api.post("/bookings", {
         ...form,
@@ -89,6 +96,7 @@ export default function BookingsPage() {
       });
       setSuccess(`Booking confirmed: ${data.check_in} → ${data.check_out}`);
       setForm({ unit_id: "", guest_id: "", check_in: "", check_out: "", adults: "1", children: "0", extra_bed: false, arrival_time: "", departure_time: "" });
+      setSelectedNewGuest(null);
       setAvailability({ checked: false, available: false });
       loadAll();
     } catch (err) {
@@ -154,6 +162,7 @@ export default function BookingsPage() {
       adults: String(b.adults), children: String(b.children), extra_bed: b.extra_bed,
       arrival_time: b.arrival_time ?? "", departure_time: b.departure_time ?? "",
     });
+    setSelectedEditGuest(guests.find((g) => g.id === b.guest_id) ?? null);
     api.get(`/bookings/${b.id}/attachments`).then((r) => setAttachments(r.data)).catch(() => setAttachments([]));
     api.get(`/bookings/${b.id}/timeline`).then((r) => setTimeline(r.data.events)).catch(() => setTimeline([]));
     api.get(`/payments/${b.id}`).then((r) => setPayments(r.data)).catch(() => setPayments([]));
@@ -168,6 +177,7 @@ export default function BookingsPage() {
     setUploadFile(null);
     setPayments([]);
     setRefundingPaymentId(null);
+    setSelectedEditGuest(null);
   }
 
   async function handleAddPayment(e: FormEvent) {
@@ -221,6 +231,10 @@ export default function BookingsPage() {
     if (!detailsBookingId) return;
     setError(null);
     setSuccess(null);
+    if (!editForm.guest_id) {
+      setError("Select a guest before saving changes.");
+      return;
+    }
     try {
       await api.patch(`/bookings/${detailsBookingId}`, {
         guest_id: editForm.guest_id, unit_id: editForm.unit_id,
@@ -311,12 +325,15 @@ export default function BookingsPage() {
             ))}
           </select>
 
-          <select required value={form.guest_id} onChange={(e) => setForm({ ...form, guest_id: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            <option value="">Select guest...</option>
-            {guests.map((g) => (
-              <option key={g.id} value={g.id}>{g.name} ({g.phone})</option>
-            ))}
-          </select>
+          <div>
+            <label className="block text-xs text-slate-500 mb-1">Guest</label>
+            <GuestPicker
+              selectedGuest={selectedNewGuest}
+              onSelect={(g) => { setSelectedNewGuest(g); setForm({ ...form, guest_id: g.id }); }}
+              onClear={() => { setSelectedNewGuest(null); setForm({ ...form, guest_id: "" }); }}
+              setError={setError}
+            />
+          </div>
 
           <div className="flex gap-3">
             <div className="w-full">
@@ -378,9 +395,15 @@ export default function BookingsPage() {
           </div>
 
           <form onSubmit={handleSaveEdit} className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
-            <select value={editForm.guest_id} onChange={(e) => setEditForm({ ...editForm, guest_id: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">
-              {guests.map((g) => <option key={g.id} value={g.id}>{g.name} ({g.phone})</option>)}
-            </select>
+            <div className="sm:col-span-2">
+              <label className="block text-xs text-slate-500 mb-1">Guest</label>
+              <GuestPicker
+                selectedGuest={selectedEditGuest}
+                onSelect={(g) => { setSelectedEditGuest(g); setEditForm({ ...editForm, guest_id: g.id }); }}
+                onClear={() => { setSelectedEditGuest(null); setEditForm({ ...editForm, guest_id: "" }); }}
+                setError={setError}
+              />
+            </div>
             <select value={editForm.unit_id} onChange={(e) => setEditForm({ ...editForm, unit_id: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">
               {units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
             </select>
