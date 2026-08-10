@@ -144,18 +144,22 @@ def generate_invoice(booking_id: uuid.UUID, db: Session = Depends(get_db), user:
     db.add(invoice)
     db.flush()  # get invoice.id without committing yet
 
-    settings_row = db.scalar(select(BusinessSettings))
-    bank_details = None
-    qr_path = None
-    if settings_row:
-        bank_details = {
-            "bank_name": settings_row.bank_name,
-            "bank_account_name": settings_row.bank_account_name,
-            "bank_account_number": settings_row.bank_account_number,
-            "bank_ifsc": settings_row.bank_ifsc,
-            "bank_branch": settings_row.bank_branch,
-        }
-        qr_path = settings_row.qr_code_path
+settings_row = db.scalar(select(BusinessSettings))
+bank_details = None
+qr_path = None
+
+if settings_row:
+    bank_details = {
+        "bank_name": settings_row.bank_name,
+        "bank_account_name": settings_row.bank_account_name,
+        "bank_account_number": settings_row.bank_account_number,
+        "bank_ifsc": settings_row.bank_ifsc,
+        "bank_branch": settings_row.bank_branch,
+        "upi_id": settings_row.upi_id,
+        "signatory_name": settings_row.signatory_name,
+        "signatory_title": settings_row.signatory_title,
+    }
+    qr_path = settings_row.qr_code_path
 
     pdf_path = generate_invoice_pdf(
         invoice_no=invoice_no,
