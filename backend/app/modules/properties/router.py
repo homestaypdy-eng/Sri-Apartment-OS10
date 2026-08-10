@@ -60,6 +60,40 @@ def update_property(property_id: uuid.UUID, payload: PropertyUpdate, db: Session
     return prop
 
 
+@router.patch("/properties/{property_id}/deactivate", response_model=PropertyOut, dependencies=[Depends(require_role("admin"))])
+def deactivate_property(property_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Soft-deactivation — the property row, its units, and every booking/
+    payment/invoice history under them are untouched. A deactivated
+    property is simply excluded from new-booking pickers/availability
+    (see bookings/router.py) and shown with an inactive badge in the UI.
+    """
+    prop = db.get(Property, property_id)
+    if prop is None:
+        raise HTTPException(404, "Property not found")
+    if not prop.is_active:
+        raise HTTPException(409, "Property is already deactivated")
+    prop.is_active = False
+    record_audit_log(db, user.id, "property.deactivate", entity_type="property", entity_id=str(prop.id), details=f"Deactivated: {prop.name}")
+    db.commit()
+    db.refresh(prop)
+    return prop
+
+
+@router.patch("/properties/{property_id}/reactivate", response_model=PropertyOut, dependencies=[Depends(require_role("admin"))])
+def reactivate_property(property_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    prop = db.get(Property, property_id)
+    if prop is None:
+        raise HTTPException(404, "Property not found")
+    if prop.is_active:
+        raise HTTPException(409, "Property is already active")
+    prop.is_active = True
+    record_audit_log(db, user.id, "property.reactivate", entity_type="property", entity_id=str(prop.id), details=f"Reactivated: {prop.name}")
+    db.commit()
+    db.refresh(prop)
+    return prop
+
+
 PROPERTY_FILE_STORAGE_DIR = os.environ.get("PROPERTY_FILE_STORAGE_DIR", "/tmp/sri_apartment_property_files")
 os.makedirs(PROPERTY_FILE_STORAGE_DIR, exist_ok=True)
 
@@ -130,6 +164,8 @@ def list_properties(db: Session = Depends(get_db)):
 
 @router.post("/units", response_model=UnitOut, status_code=201, dependencies=[Depends(require_role("admin"))])
 def create_unit(payload: UnitCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if db.get(Property, payload.property_id) is None:
+        raise HTTPException(404, "Property not found")
     unit = Unit(**payload.model_dump())
     db.add(unit)
     db.flush()
@@ -154,6 +190,40 @@ def update_unit(unit_id: uuid.UUID, payload: UnitUpdate, db: Session = Depends(g
         setattr(unit, field, value)
     if changes:
         record_audit_log(db, user.id, "unit.update", entity_type="unit", entity_id=str(unit.id), details=f"Updated: {', '.join(changes.keys())}")
+    db.commit()
+    db.refresh(unit)
+    return unit
+
+
+@router.patch("/units/{unit_id}/deactivate", response_model=UnitOut, dependencies=[Depends(require_role("admin"))])
+def deactivate_unit(unit_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Soft-deactivation — the unit row and every booking/payment/invoice
+    history against it are untouched. A deactivated unit is simply
+    excluded from new-booking pickers/availability (see
+    bookings/router.py) and shown with an inactive badge in the UI.
+    """
+    unit = db.get(Unit, unit_id)
+    if unit is None:
+        raise HTTPException(404, "Unit not found")
+    if not unit.is_active:
+        raise HTTPException(409, "Unit is already deactivated")
+    unit.is_active = False
+    record_audit_log(db, user.id, "unit.deactivate", entity_type="unit", entity_id=str(unit.id), details=f"Deactivated: {unit.name}")
+    db.commit()
+    db.refresh(unit)
+    return unit
+
+
+@router.patch("/units/{unit_id}/reactivate", response_model=UnitOut, dependencies=[Depends(require_role("admin"))])
+def reactivate_unit(unit_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    unit = db.get(Unit, unit_id)
+    if unit is None:
+        raise HTTPException(404, "Unit not found")
+    if unit.is_active:
+        raise HTTPException(409, "Unit is already active")
+    unit.is_active = True
+    record_audit_log(db, user.id, "unit.reactivate", entity_type="unit", entity_id=str(unit.id), details=f"Reactivated: {unit.name}")
     db.commit()
     db.refresh(unit)
     return unit

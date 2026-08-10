@@ -123,6 +123,9 @@ class UnitCreate(BaseModel):
 
 
 class UnitUpdate(BaseModel):
+    name: str | None = None
+    unit_type: str | None = None
+    max_occupancy: int | None = Field(default=None, gt=0)
     base_rate: float | None = Field(default=None, gt=0)
     weekend_rate: float | None = Field(default=None, gt=0)
     status: str | None = None  # available / maintenance / blocked
@@ -137,6 +140,7 @@ class UnitOut(UnitCreate):
     id: uuid.UUID
     status: str
     housekeeping_status: str
+    is_active: bool = True
 
     class Config:
         from_attributes = True

@@ -23,6 +23,7 @@ class Property(Base):
     owner_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
     owner_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
     google_maps_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True)  # soft-deactivation — see deactivate/reactivate endpoints; never hard-deleted
 
     units: Mapped[list["Unit"]] = relationship(back_populates="property", cascade="all, delete-orphan")
 
@@ -43,6 +44,7 @@ class Unit(Base):
     floor: Mapped[str | None] = mapped_column(String(20), nullable=True)
     flat_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
     amenities: Mapped[str | None] = mapped_column(Text, nullable=True)  # free-text/comma-separated — e.g. "AC, WiFi, Kitchen, Balcony"
+    is_active: Mapped[bool] = mapped_column(default=True)  # soft-deactivation — see deactivate/reactivate endpoints; never hard-deleted
 
     property: Mapped["Property"] = relationship(back_populates="units")
 

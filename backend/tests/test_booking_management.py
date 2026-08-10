@@ -214,3 +214,143 @@ def test_attachment_upload_rejects_empty_file(headers):
         files={"file": ("empty.jpg", empty, "image/jpeg")},
     )
     assert resp.status_code == 400
+
+
+# --- Invoice-edit guard: once a booking has an invoice, dates/unit/rate
+# (the fields that feed GST/total calculation) can no longer be edited,
+# since that would silently desynchronize the invoice from the booking. ---
+
+def test_edit_booking_blocked_after_invoice_for_dates(headers):
+    booking, _ = _make_booking(headers)
+    gen = client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
+    assert gen.status_code == 201, gen.text
+
+    new_check_in = (date.today() + timedelta(days=500)).isoformat()
+    new_check_out = (date.today() + timedelta(days=503)).isoformat()
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"check_in": new_check_in, "check_out": new_check_out})
+    assert resp.status_code == 409
+    assert "invoice" in resp.json()["detail"].lower()
+
+
+def test_edit_booking_blocked_after_invoice_for_rate(headers):
+    booking, _ = _make_booking(headers)
+    client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
+
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 5000})
+    assert resp.status_code == 409
+    assert "invoice" in resp.json()["detail"].lower()
+
+
+def test_edit_booking_blocked_after_invoice_for_unit(headers):
+    booking, _ = _make_booking(headers)
+    other_unit_id = _make_unit(headers)
+    client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
+
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"unit_id": other_unit_id})
+    assert resp.status_code == 409
+    assert "invoice" in resp.json()["detail"].lower()
+
+
+def test_edit_booking_still_allowed_after_invoice_for_non_invoice_fields(headers):
+    """The guard only blocks the fields that feed GST/total calculation —
+    everything else (notes, guest count, arrival time, etc.) must remain
+    editable even after an invoice exists."""
+    booking, _ = _make_booking(headers)
+    client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
+
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"internal_notes": "Post-invoice note", "adults": 3})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["internal_notes"] == "Post-invoice note"
+    assert resp.json()["adults"] == 3
+
+
+def test_edit_booking_dates_still_works_before_invoice(headers):
+    """Regression: the guard must not fire when no invoice exists yet."""
+    booking, _ = _make_booking(headers)
+    new_check_in = (date.today() + timedelta(days=600)).isoformat()
+    new_check_out = (date.today() + timedelta(days=602)).isoformat()
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"check_in": new_check_in, "check_out": new_check_out})
+    assert resp.status_code == 200, resp.text
+
+
+# --- Cancel (reuses the existing status-transition endpoint) ---
+
+def test_cancel_booking_valid_transition_from_confirmed(headers):
+    booking, _ = _make_booking(headers)
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "cancelled"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "cancelled"
+
+
+def test_cancel_booking_rejected_from_checked_in(headers):
+    booking, _ = _make_booking(headers)
+    client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "checked_in"})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "cancelled"})
+    assert resp.status_code == 409
+
+
+def test_cancel_booking_rejected_when_already_cancelled(headers):
+    booking, _ = _make_booking(headers)
+    client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "cancelled"})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "cancelled"})
+    assert resp.status_code == 409
+
+
+def test_cancel_booking_logs_audit(headers):
+    booking, _ = _make_booking(headers)
+    client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "cancelled"})
+
+    logs = client.get("/api/v1/audit/logs", headers=headers, params={"action": "booking.status_change"}).json()
+    match = next((l for l in logs if l["entity_id"] == booking["id"] and "cancelled" in l["details"]), None)
+    assert match is not None
+    assert "confirmed -> cancelled" in match["details"]
+
+
+def test_cancel_booking_preserves_existing_payment(headers):
+    """Cancelling must not touch existing financial records — the payment
+    stays exactly as it was; refunding (if needed) is a separate, explicit
+    action against the payment itself."""
+    booking, _ = _make_booking(headers)
+    payment = client.post("/api/v1/payments", headers=headers, json={"booking_id": booking["id"], "amount": 1000, "mode": "upi", "reference_no": "CANCELPAYTEST"}).json()
+
+    client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "cancelled"})
+
+    payments_after = client.get(f"/api/v1/payments/{booking['id']}", headers=headers).json()
+    match = next((p for p in payments_after if p["id"] == payment["id"]), None)
+    assert match is not None
+    assert match["amount"] == 1000.0
+    assert match["status"] == "completed"
+
+
+# --- Delete blockers not yet covered (Payment is already tested above) ---
+
+def test_delete_booking_with_invoice_is_blocked(headers):
+    booking, _ = _make_booking(headers)
+    gen = client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
+    assert gen.status_code == 201, gen.text
+
+    resp = client.delete(f"/api/v1/bookings/{booking['id']}", headers=headers)
+    assert resp.status_code == 409
+    assert "invoice" in resp.json()["detail"].lower()
+
+
+def test_delete_booking_with_security_deposit_is_blocked(headers):
+    booking, _ = _make_booking(headers)
+    dep = client.post("/api/v1/finance/deposits", headers=headers, json={"booking_id": booking["id"], "amount": 2000})
+    assert dep.status_code == 201, dep.text
+
+    resp = client.delete(f"/api/v1/bookings/{booking['id']}", headers=headers)
+    assert resp.status_code == 409
+    assert "security deposit" in resp.json()["detail"].lower()
+
+
+def test_delete_booking_with_ota_commission_is_blocked(headers):
+    booking, _ = _make_booking(headers)
+    comm = client.post("/api/v1/finance/ota-commissions", headers=headers, json={
+        "booking_id": booking["id"], "channel": "booking_com", "commission_percent": 15, "commission_amount": 300,
+    })
+    assert comm.status_code == 201, comm.text
+
+    resp = client.delete(f"/api/v1/bookings/{booking['id']}", headers=headers)
+    assert resp.status_code == 409
+    assert "ota commission" in resp.json()["detail"].lower()

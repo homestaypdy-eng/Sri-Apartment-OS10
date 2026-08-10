@@ -19,6 +19,7 @@ class PropertyCreate(BaseModel):
 
 class PropertyOut(PropertyCreate):
     id: uuid.UUID
+    is_active: bool = True
 
     class Config:
         from_attributes = True

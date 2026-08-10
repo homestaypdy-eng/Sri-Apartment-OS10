@@ -125,6 +125,11 @@ MIGRATION_STATEMENTS = [
     # Payment gateway: link a GatewayOrder to the BookingHold that initiated it.
     # booking_holds must already exist (created by create_all) before this FK is added.
     "ALTER TABLE gateway_orders ADD COLUMN IF NOT EXISTS hold_id UUID REFERENCES booking_holds(id)",
+    # Property/Unit soft-deactivation (Edit + Deactivate/Reactivate CRUD
+    # completion). Defaults every existing row to active so nothing already
+    # in production silently disappears from booking pickers/availability.
+    "ALTER TABLE properties ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true",
+    "ALTER TABLE units ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true",
 ]
 
 # Property files (documents/photos) is a genuinely new table, not an

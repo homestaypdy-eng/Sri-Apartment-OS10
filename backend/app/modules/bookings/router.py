@@ -51,6 +51,13 @@ ALLOWED_TRANSITIONS = {
     "no_show": set(),
 }
 
+# Fields that feed directly into GST/total calculation at invoice-generation
+# time (see payments/service.py calculate_gst, which uses booking.rate_applied
+# and the check_in/check_out-derived night count). Once an Invoice row exists
+# for a booking, changing any of these would silently desynchronize the
+# invoice from the booking it was generated from — blocked in update_booking.
+INVOICE_IMPACTING_FIELDS = {"check_in", "check_out", "unit_id", "rate_applied"}
+
 
 @router.post("/guests", response_model=GuestOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
 def create_guest(payload: GuestCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
@@ -277,6 +284,8 @@ def check_availability(
         raise HTTPException(404, "Unit not found")
     if unit.status != "available":
         return {"unit_id": unit_id, "check_in": check_in, "check_out": check_out, "available": False}
+    if not unit.is_active or not unit.property.is_active:
+        return {"unit_id": unit_id, "check_in": check_in, "check_out": check_out, "available": False}
 
     # Mirrors the DB EXCLUDE constraint logic for a pre-flight check
     # (fast, friendly UX) — the constraint itself is the actual guarantee.
@@ -312,6 +321,8 @@ def create_booking(payload: BookingCreate, db: Session = Depends(get_db), user: 
             f"Unit is not available for booking (status: {unit.status}). "
             "Change the unit status to 'available' first.",
         )
+    if not unit.is_active or not unit.property.is_active:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This unit (or its property) has been deactivated and is not available for new bookings")
 
     guest = db.get(Guest, payload.guest_id)
     if guest is None:
@@ -445,6 +456,18 @@ def update_booking(booking_id: uuid.UUID, payload: BookingUpdate, db: Session = 
     changes = payload.model_dump(exclude_unset=True, exclude={"reason"})
     if not changes:
         raise HTTPException(400, "No fields to update were provided")
+
+    invoice_impacting = INVOICE_IMPACTING_FIELDS & changes.keys()
+    if invoice_impacting:
+        existing_invoice = db.scalar(select(Invoice).where(Invoice.booking_id == booking_id))
+        if existing_invoice is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"This booking already has an issued invoice ({existing_invoice.invoice_no}) — "
+                f"{', '.join(sorted(invoice_impacting))} cannot be changed since that would desynchronize "
+                "the invoice from the booking. Void or credit-note the existing invoice first if this "
+                "change is genuinely needed.",
+            )
 
     if "guest_id" in changes:
         guest = db.get(Guest, changes["guest_id"])

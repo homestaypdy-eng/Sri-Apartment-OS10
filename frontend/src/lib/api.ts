@@ -92,6 +92,7 @@ export interface PropertyOut {
   owner_phone: string | null;
   owner_email: string | null;
   google_maps_url: string | null;
+  is_active: boolean;
 }
 
 export interface PropertyFileOut {
@@ -129,6 +130,7 @@ export interface UnitOut {
   floor: string | null;
   flat_number: string | null;
   amenities: string | null;
+  is_active: boolean;
 }
 
 export interface UnitPhotoOut {

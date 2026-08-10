@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, extractErrorMessage, type BookingAttachmentOut, type BookingOut, type GuestOut, type UnitOut, type PaymentOut } from "../lib/api";
+import { api, extractErrorMessage, type BookingAttachmentOut, type BookingOut, type GuestOut, type UnitOut, type PaymentOut, type PropertyOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, SkeletonRows, EmptyState } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
@@ -9,6 +9,7 @@ export default function BookingsPage() {
 
   const [bookings, setBookings] = useState<BookingOut[]>([]);
   const [units, setUnits] = useState<UnitOut[]>([]);
+  const [properties, setProperties] = useState<PropertyOut[]>([]);
   const [guests, setGuests] = useState<GuestOut[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -36,10 +37,11 @@ export default function BookingsPage() {
 
   async function loadAll() {
     try {
-      const [b, u, g] = await Promise.all([api.get("/bookings"), api.get("/units"), api.get("/guests")]);
+      const [b, u, g, p] = await Promise.all([api.get("/bookings"), api.get("/units"), api.get("/guests"), api.get("/properties")]);
       setBookings(b.data);
       setUnits(u.data);
       setGuests(g.data);
+      setProperties(p.data);
     } catch (err) {
       setError(extractErrorMessage(err));
     } finally {
@@ -105,6 +107,14 @@ export default function BookingsPage() {
       setError(extractErrorMessage(err));
     }
   }
+
+  async function handleCancelBooking(bookingId: string) {
+    if (!window.confirm("Cancel this booking? The booking record, payments, and any invoice are preserved — this only changes its status. Refunds (if needed) are handled separately from the payment's own Refund action.")) return;
+    await transitionStatus(bookingId, "cancelled");
+  }
+
+  const activePropertyIds = new Set(properties.filter((p) => p.is_active).map((p) => p.id));
+  const bookableUnits = units.filter((u) => u.is_active && activePropertyIds.has(u.property_id));
 
   function unitName(id: string) {
     return units.find((u) => u.id === id)?.name ?? "—";
@@ -296,7 +306,7 @@ export default function BookingsPage() {
         <form onSubmit={handleCreate} className="space-y-3">
           <select required value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
             <option value="">Select unit...</option>
-            {units.map((u) => (
+            {bookableUnits.map((u) => (
               <option key={u.id} value={u.id}>{u.name} (₹{u.base_rate}/night)</option>
             ))}
           </select>
@@ -388,6 +398,11 @@ export default function BookingsPage() {
             <input placeholder="Reason for change (for audit log)" value={editForm.reason} onChange={(e) => setEditForm({ ...editForm, reason: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
             <div className="sm:col-span-2 flex gap-3">
               <Button type="submit">Save Changes</Button>
+              {(detailsBooking.status === "confirmed" || detailsBooking.status === "inquiry") && (
+                <Button type="button" variant="danger" onClick={() => handleCancelBooking(detailsBooking.id)}>
+                  Cancel Booking
+                </Button>
+              )}
               {isAdmin && (
                 <Button type="button" variant="danger" onClick={() => handleDelete(detailsBooking.id)}>
                   Delete Booking
@@ -563,6 +578,9 @@ export default function BookingsPage() {
                       )}
                       {b.status === "checked_in" && (
                         <Button variant="secondary" onClick={() => transitionStatus(b.id, "checked_out")}>Check Out</Button>
+                      )}
+                      {(b.status === "confirmed" || b.status === "inquiry") && (
+                        <Button variant="danger" onClick={() => handleCancelBooking(b.id)}>Cancel</Button>
                       )}
                       <Button variant="secondary" onClick={() => openDetails(b)}>Details</Button>
                     </td>

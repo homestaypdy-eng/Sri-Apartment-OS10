@@ -42,6 +42,7 @@ export default function PropertiesPage() {
   const [pnlMonth, setPnlMonth] = useState(new Date().getMonth() + 1);
   const [unitSearch, setUnitSearch] = useState("");
   const [manageUnit, setManageUnit] = useState<UnitOut | null>(null);
+  const [manageUnitForm, setManageUnitForm] = useState<Record<string, string>>({});
   const [unitPhotos, setUnitPhotos] = useState<UnitPhotoOut[]>([]);
   const [unitPhotoCaption, setUnitPhotoCaption] = useState("");
   const [unitUploadFile, setUnitUploadFile] = useState<File | null>(null);
@@ -226,8 +227,66 @@ export default function PropertiesPage() {
     }
   }
 
+  async function handleToggleActiveProperty(prop: PropertyOut) {
+    const action = prop.is_active ? "deactivate" : "reactivate";
+    if (!window.confirm(`${prop.is_active ? "Deactivate" : "Reactivate"} "${prop.name}"? All existing bookings, payments, invoices, units, and history are preserved either way.${prop.is_active ? " It will be excluded from new-booking pickers until reactivated." : ""}`)) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      const { data } = await api.patch(`/properties/${prop.id}/${action}`);
+      setSuccess(`Property ${action}d.`);
+      setProperties((prev) => prev.map((p) => (p.id === prop.id ? data : p)));
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleToggleActiveUnit(unit: UnitOut) {
+    const action = unit.is_active ? "deactivate" : "reactivate";
+    if (!window.confirm(`${unit.is_active ? "Deactivate" : "Reactivate"} "${unit.name}"? All existing bookings, payments, invoices, and history are preserved either way.${unit.is_active ? " It will be excluded from new-booking pickers/availability until reactivated." : ""}`)) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      const { data } = await api.patch(`/units/${unit.id}/${action}`);
+      setSuccess(`Unit ${action}d.`);
+      setUnits((prev) => prev.map((u) => (u.id === unit.id ? data : u)));
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleSaveManageUnit() {
+    if (!manageUnit) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      const payload: Record<string, string | number | undefined> = {
+        name: manageUnitForm.name || undefined,
+        unit_type: manageUnitForm.unit_type || undefined,
+        max_occupancy: manageUnitForm.max_occupancy ? Number(manageUnitForm.max_occupancy) : undefined,
+        base_rate: manageUnitForm.base_rate ? Number(manageUnitForm.base_rate) : undefined,
+        weekend_rate: manageUnitForm.weekend_rate ? Number(manageUnitForm.weekend_rate) : undefined,
+        unit_code: manageUnitForm.unit_code || undefined,
+        floor: manageUnitForm.floor || undefined,
+        flat_number: manageUnitForm.flat_number || undefined,
+        amenities: manageUnitForm.amenities || undefined,
+      };
+      const { data } = await api.patch(`/units/${manageUnit.id}`, payload);
+      setSuccess("Unit updated.");
+      setUnits((prev) => prev.map((u) => (u.id === manageUnit.id ? data : u)));
+      setManageUnit(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
   async function openManageUnit(unit: UnitOut) {
     setManageUnit(unit);
+    setManageUnitForm({
+      name: unit.name, unit_type: unit.unit_type, max_occupancy: String(unit.max_occupancy),
+      base_rate: String(unit.base_rate), weekend_rate: unit.weekend_rate != null ? String(unit.weekend_rate) : "",
+      unit_code: unit.unit_code ?? "", floor: unit.floor ?? "", flat_number: unit.flat_number ?? "", amenities: unit.amenities ?? "",
+    });
     setError(null);
     try {
       const [photos, tickets, tasks] = await Promise.all([
@@ -245,6 +304,7 @@ export default function PropertiesPage() {
 
   function closeManageUnit() {
     setManageUnit(null);
+    setManageUnitForm({});
     setUnitPhotos([]);
     setUnitMaintTickets([]);
     setUnitHkTasks([]);
@@ -472,7 +532,7 @@ export default function PropertiesPage() {
                 className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
               >
                 <option value="">Select property...</option>
-                {properties.map((p) => (
+                {properties.filter((p) => p.is_active).map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
                   </option>
@@ -559,7 +619,7 @@ export default function PropertiesPage() {
           />
         </div>
         <div className="overflow-x-auto">
-          <Table headers={["Code", "Name", "Address", "State Code", "GSTIN", "Owner", "Actions"]}>
+          <Table headers={["Code", "Name", "Address", "State Code", "GSTIN", "Owner", "Status", "Actions"]}>
             {properties
               .filter((p) => !propSearch || p.name.toLowerCase().includes(propSearch.toLowerCase()) || (p.property_code ?? "").toLowerCase().includes(propSearch.toLowerCase()) || (p.owner_name ?? "").toLowerCase().includes(propSearch.toLowerCase()))
               .map((p) => (
@@ -571,7 +631,16 @@ export default function PropertiesPage() {
                 <td className="px-4 py-2.5 text-slate-500">{p.gst_number ?? "—"}</td>
                 <td className="px-4 py-2.5 text-slate-500">{p.owner_name ?? "—"}</td>
                 <td className="px-4 py-2.5">
+                  <Badge tone={p.is_active ? "green" : "slate"}>{p.is_active ? "Active" : "Inactive"}</Badge>
+                </td>
+                <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
                   <Button variant="secondary" onClick={() => openManage(p)}>Manage</Button>
+                  {isAdmin && <Button variant="secondary" onClick={() => openManage(p)}>Edit</Button>}
+                  {isAdmin && (
+                    <Button variant={p.is_active ? "danger" : "secondary"} onClick={() => handleToggleActiveProperty(p)}>
+                      {p.is_active ? "Deactivate" : "Reactivate"}
+                    </Button>
+                  )}
                 </td>
               </tr>
             ))}
@@ -604,10 +673,20 @@ export default function PropertiesPage() {
                   <td className="px-4 py-2.5 text-slate-500">{u.weekend_rate ? `₹${u.weekend_rate}` : "— (same as weekday)"}</td>
                   <td className="px-4 py-2.5 text-slate-500 max-w-[160px] truncate">{u.amenities ?? "—"}</td>
                   <td className="px-4 py-2.5">
-                    <Badge tone={u.status === "available" ? "green" : "amber"}>{u.status}</Badge>
+                    {u.is_active ? (
+                      <Badge tone={u.status === "available" ? "green" : "amber"}>{u.status}</Badge>
+                    ) : (
+                      <Badge tone="slate">Inactive</Badge>
+                    )}
                   </td>
-                  <td className="px-4 py-2.5">
+                  <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
                     <Button variant="secondary" onClick={() => openManageUnit(u)}>Manage</Button>
+                    {isAdmin && <Button variant="secondary" onClick={() => openManageUnit(u)}>Edit</Button>}
+                    {isAdmin && (
+                      <Button variant={u.is_active ? "danger" : "secondary"} onClick={() => handleToggleActiveUnit(u)}>
+                        {u.is_active ? "Deactivate" : "Reactivate"}
+                      </Button>
+                    )}
                   </td>
                 </tr>
               );
@@ -818,7 +897,25 @@ export default function PropertiesPage() {
               <button onClick={closeManageUnit} className="text-slate-400 hover:text-slate-600 text-sm">Close</button>
             </div>
 
-            <h3 className="text-sm font-semibold text-slate-900 mb-2">Photos</h3>
+            {isAdmin && (
+              <>
+                <h3 className="text-sm font-semibold text-slate-900 mb-2">Edit Details</h3>
+                <div className="grid grid-cols-2 gap-2 mb-4 text-xs">
+                  <input placeholder="Name" value={manageUnitForm.name ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, name: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+                  <input placeholder="Unit type" value={manageUnitForm.unit_type ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, unit_type: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+                  <input type="number" min={1} placeholder="Max occupancy" value={manageUnitForm.max_occupancy ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, max_occupancy: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+                  <input type="number" placeholder="Weekday rate / night" value={manageUnitForm.base_rate ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, base_rate: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+                  <input type="number" placeholder="Weekend rate (optional)" value={manageUnitForm.weekend_rate ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, weekend_rate: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+                  <input placeholder="Unit code" value={manageUnitForm.unit_code ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, unit_code: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+                  <input placeholder="Floor" value={manageUnitForm.floor ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, floor: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+                  <input placeholder="Flat number" value={manageUnitForm.flat_number ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, flat_number: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5" />
+                  <input placeholder="Amenities" value={manageUnitForm.amenities ?? ""} onChange={(e) => setManageUnitForm({ ...manageUnitForm, amenities: e.target.value })} className="col-span-2 rounded-lg border border-slate-300 px-2 py-1.5" />
+                </div>
+                <Button variant="secondary" onClick={handleSaveManageUnit}>Save Changes</Button>
+              </>
+            )}
+
+            <h3 className="text-sm font-semibold text-slate-900 mt-6 mb-2">Photos</h3>
             <div className="flex flex-wrap gap-2 mb-3">
               <input placeholder="Caption (optional)" value={unitPhotoCaption} onChange={(e) => setUnitPhotoCaption(e.target.value)} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
               <input type="file" onChange={(e) => setUnitUploadFile(e.target.files?.[0] ?? null)} className="text-xs" />
