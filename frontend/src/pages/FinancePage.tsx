@@ -96,7 +96,7 @@ export default function FinancePage() {
       {tab === "budget" && <BudgetTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "utility" && <UtilityTab setError={setError} setSuccess={setSuccess} />}
       {tab === "purchases" && <PurchasesTab setError={setError} setSuccess={setSuccess} />}
-      {tab === "laundry" && <LaundryTab setError={setError} setSuccess={setSuccess} />}
+      {tab === "laundry" && <LaundryTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
     </div>
   );
 }
@@ -1465,7 +1465,7 @@ function ExpensesTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setE
 }
 
 // --- Laundry Register ---
-function LaundryTab({ setError, setSuccess }: { setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+function LaundryTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [entries, setEntries] = useState<LaundryEntryOut[]>([]);
   const [summary, setSummary] = useState<LaundryMonthlySummary | null>(null);
   const [year, setYear] = useState(new Date().getFullYear());
@@ -1515,10 +1515,11 @@ function LaundryTab({ setError, setSuccess }: { setError: (e: string | null) => 
     }
   }
 
-  async function handleDelete(id: string) {
+  async function handleDelete(entry: LaundryEntryOut) {
+    if (!window.confirm(`Delete this laundry entry — ${entry.item_type.replace("_", " ")} x${entry.quantity} on ${entry.entry_date} (₹${entry.total_amount.toLocaleString()})? This cannot be undone.`)) return;
     setError(null);
     try {
-      await api.delete(`/finance/laundry/${id}`);
+      await api.delete(`/finance/laundry/${entry.id}`);
       load();
     } catch (err) {
       setError(extractErrorMessage(err));
@@ -1600,7 +1601,9 @@ function LaundryTab({ setError, setSuccess }: { setError: (e: string | null) => 
                   <td className="px-4 py-2.5 text-slate-500">₹{e.rate_per_item}</td>
                   <td className="px-4 py-2.5 font-medium text-slate-800">₹{e.total_amount.toLocaleString()}</td>
                   <td className="px-4 py-2.5">
-                    <button onClick={() => handleDelete(e.id)} className="text-xs text-red-500 hover:underline">Delete</button>
+                    {isAdmin && (
+                      <button onClick={() => handleDelete(e)} className="text-xs text-red-500 hover:underline">Delete</button>
+                    )}
                   </td>
                 </tr>
               ))}

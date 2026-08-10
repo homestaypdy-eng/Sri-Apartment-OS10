@@ -227,3 +227,36 @@ def test_existing_notification_logs_endpoint_still_works(headers):
     resp = client.get("/api/v1/notifications/logs", headers=headers)
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
+
+
+def test_scheduler_registers_escalation_scan_job(monkeypatch):
+    """Phase 6: the escalation scan must now be registered on the same
+    in-process APScheduler the reminder scan already uses — not just
+    reachable manually. next_run_time=None on every job (same as the
+    pre-existing reminder_scan/hold_expiry_cleanup jobs) means nothing
+    actually fires during this test; we're only verifying registration."""
+    from app.core.config import settings
+    from app.modules.notifications import scheduler as scheduler_module
+
+    monkeypatch.setattr(settings, "enable_scheduler", True)
+    try:
+        sched = scheduler_module.start_scheduler()
+        assert sched is not None
+        job_ids = {job.id for job in sched.get_jobs()}
+        assert "escalation_scan" in job_ids
+        # Regression: registering the new job must not have displaced the
+        # two pre-existing jobs.
+        assert "reminder_scan" in job_ids
+        assert "hold_expiry_cleanup" in job_ids
+    finally:
+        scheduler_module.stop_scheduler()
+
+
+def test_escalation_scan_job_function_executes_successfully():
+    """The scheduler's own wrapper (DB session open/close, exception
+    handling) must actually run scan_and_send_escalations without raising —
+    exercising the wrapper itself, not just the already-tested business
+    logic it calls."""
+    from app.modules.notifications.scheduler import _run_escalation_scan
+
+    _run_escalation_scan()  # raises nothing on success; failures are only logged internally

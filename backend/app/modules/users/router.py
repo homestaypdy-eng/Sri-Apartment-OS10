@@ -2,7 +2,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -31,13 +31,46 @@ def update_user(user_id: uuid.UUID, payload: UserUpdate, db: Session = Depends(g
     if user is None:
         raise HTTPException(404, "User not found")
 
-    changes = []
+    new_role = None
     if payload.role is not None:
-        role = db.scalar(select(Role).where(Role.name == payload.role))
-        if role is None:
+        new_role = db.scalar(select(Role).where(Role.name == payload.role))
+        if new_role is None:
             raise HTTPException(400, f"Unknown role '{payload.role}'")
-        changes.append(f"role -> {payload.role}")
-        user.role_id = role.id
+
+    is_self = user_id == actor.id
+    is_currently_admin = user.role.name == "admin"
+
+    # An admin can never deactivate or demote their own account. This is
+    # unconditional (not just a "you're the last admin" edge case) since the
+    # point is to prevent an accidental self-lockout regardless of how many
+    # other admins currently exist.
+    if is_self:
+        if payload.is_active is False:
+            raise HTTPException(400, "You cannot deactivate your own account.")
+        if new_role is not None and new_role.name != "admin":
+            raise HTTPException(400, "You cannot remove your own admin role.")
+
+    # The system must always retain at least one active admin. Block
+    # demoting or deactivating the last one, whether or not the actor
+    # performing the change is that admin (self-targeting is already,
+    # unconditionally, covered by the block above).
+    would_lose_admin_status = is_currently_admin and user.is_active and (
+        (new_role is not None and new_role.name != "admin") or payload.is_active is False
+    )
+    if would_lose_admin_status:
+        admin_role = db.scalar(select(Role).where(Role.name == "admin"))
+        other_active_admins = db.scalar(
+            select(func.count()).select_from(User).where(
+                User.role_id == admin_role.id, User.is_active.is_(True), User.id != user_id
+            )
+        )
+        if not other_active_admins:
+            raise HTTPException(400, "Cannot remove admin access from the last remaining active administrator.")
+
+    changes = []
+    if new_role is not None:
+        changes.append(f"role -> {new_role.name}")
+        user.role_id = new_role.id
 
     if payload.is_active is not None:
         changes.append(f"is_active -> {payload.is_active}")

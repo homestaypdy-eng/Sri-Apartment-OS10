@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, extractErrorMessage, type NotificationLogOut } from "../lib/api";
-import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge } from "../components/ui";
+import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
 export default function NotificationsPage() {
@@ -75,21 +75,25 @@ export default function NotificationsPage() {
 
       <Card>
         <h2 className="text-sm font-semibold text-slate-900 mb-4">Notification Log</h2>
-        <div className="overflow-x-auto">
-          <Table headers={["Event", "Channel", "Recipient", "Status", "When"]}>
-            {logs.map((l) => (
-              <tr key={l.id}>
-                <td className="px-4 py-2.5 font-medium text-slate-800">{l.event_type.replace("_", " ")}</td>
-                <td className="px-4 py-2.5 text-slate-500">{l.channel}</td>
-                <td className="px-4 py-2.5 text-slate-500">{l.recipient}</td>
-                <td className="px-4 py-2.5">
-                  <Badge tone={l.success ? "green" : "red"}>{l.success ? "sent" : "failed"}</Badge>
-                </td>
-                <td className="px-4 py-2.5 text-slate-500">{new Date(l.created_at).toLocaleString()}</td>
-              </tr>
-            ))}
-          </Table>
-        </div>
+        {logs.length === 0 ? (
+          <EmptyState message="No notifications yet." />
+        ) : (
+          <div className="overflow-x-auto">
+            <Table headers={["Event", "Channel", "Recipient", "Status", "When"]}>
+              {logs.map((l) => (
+                <tr key={l.id}>
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{l.event_type.replace("_", " ")}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{l.channel}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{l.recipient}</td>
+                  <td className="px-4 py-2.5">
+                    <Badge tone={l.success ? "green" : "red"}>{l.success ? "sent" : "failed"}</Badge>
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-500">{new Date(l.created_at).toLocaleString()}</td>
+                </tr>
+              ))}
+            </Table>
+          </div>
+        )}
       </Card>
     </div>
   );

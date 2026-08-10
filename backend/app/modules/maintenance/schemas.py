@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class MaintenanceTicketCreate(BaseModel):
@@ -14,7 +14,7 @@ class MaintenanceTicketUpdate(BaseModel):
     status: str | None = None  # open/in_progress/resolved/closed
     assigned_to: uuid.UUID | None = None
     priority: str | None = None
-    cost: float | None = None
+    cost: float | None = Field(None, ge=0)
 
 
 class MaintenanceTicketOut(BaseModel):

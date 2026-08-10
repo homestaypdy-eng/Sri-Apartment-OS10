@@ -1,0 +1,25 @@
+# Keeps the Docker build context (and therefore the built image) limited
+# to real source. Excluding node_modules matters most: without this, a
+# host-installed node_modules (potentially built for a different OS/arch
+# than the container) gets copied in AFTER `npm install` already ran
+# inside the image, silently overwriting the container's own clean
+# install with the host's — a real, machine-dependent build result, not
+# a reproducible one.
+
+node_modules/
+dist/
+
+.env
+.env.*
+!.env.example
+
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+coverage/
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, extractErrorMessage, type GuestRequestOut, type GuestOut, type UserOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Badge, EmptyState } from "../components/ui";
+import { useAuth } from "../context/AuthContext";
 
 const PRIORITIES = ["low", "medium", "high", "urgent"];
 
@@ -11,6 +12,8 @@ function priorityTone(p: string): "red" | "amber" | "slate" {
 }
 
 export default function GuestRequestsPage() {
+  const { role } = useAuth();
+  const isAdmin = role === "admin";
   const [requests, setRequests] = useState<GuestRequestOut[]>([]);
   const [guests, setGuests] = useState<GuestOut[]>([]);
   const [staff, setStaff] = useState<UserOut[]>([]);
@@ -26,9 +29,16 @@ export default function GuestRequestsPage() {
     try {
       const params: Record<string, string> = {};
       if (statusFilter) params.status = statusFilter;
+      // /users is admin-only server-side — staff are fully authorized for
+      // every Guest Requests endpoint but would 403 the whole Promise.all
+      // (and the page with it) if this call weren't guarded. Same pattern
+      // as HousekeepingPage.tsx's assignee-list fetch: staff sees the page
+      // and can act on requests, just without a full staff-name dropdown
+      // for assignment (an already-assigned request shows "—" instead of
+      // a resolved name for a non-admin viewer, same accepted trade-off).
       const [r, s] = await Promise.all([
         api.get("/guest-requests", { params }),
-        api.get("/users"),
+        isAdmin ? api.get("/users") : Promise.resolve({ data: [] }),
       ]);
       setRequests(r.data);
       setStaff(s.data);

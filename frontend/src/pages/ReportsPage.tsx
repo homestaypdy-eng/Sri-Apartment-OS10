@@ -19,7 +19,7 @@ import {
   type PropertyOut,
   type SalesFunnelReport,
 } from "../lib/api";
-import { Card, PageHeader, ErrorBanner, Button } from "../components/ui";
+import { Card, PageHeader, ErrorBanner, Button, EmptyState } from "../components/ui";
 
 function firstOfMonth(): string {
   const d = new Date();
@@ -404,30 +404,34 @@ export default function ReportsPage() {
 
       <Card>
         <h2 className="text-sm font-semibold text-slate-900 mb-4">Unit Performance Detail</h2>
-        <div className="overflow-x-auto border border-slate-200 rounded-xl">
-          <table className="min-w-full text-sm">
-            <thead className="bg-slate-50 border-b border-slate-200">
-              <tr>
-                {["Unit", "Nights Sold", "Revenue", "Occupancy %", "ADR"].map((h) => (
-                  <th key={h} className="text-left px-4 py-2.5 font-medium text-slate-500">
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {unitPerformance.map((u) => (
-                <tr key={u.unit_id}>
-                  <td className="px-4 py-2.5 font-medium text-slate-800">{u.unit_name}</td>
-                  <td className="px-4 py-2.5 text-slate-500">{u.room_nights_sold}</td>
-                  <td className="px-4 py-2.5 text-slate-500">₹{u.revenue.toLocaleString()}</td>
-                  <td className="px-4 py-2.5 text-slate-500">{u.occupancy_rate_percent}%</td>
-                  <td className="px-4 py-2.5 text-slate-500">₹{u.adr.toLocaleString()}</td>
+        {unitPerformance.length === 0 ? (
+          <EmptyState message="No report data available for this period." />
+        ) : (
+          <div className="overflow-x-auto border border-slate-200 rounded-xl">
+            <table className="min-w-full text-sm">
+              <thead className="bg-slate-50 border-b border-slate-200">
+                <tr>
+                  {["Unit", "Nights Sold", "Revenue", "Occupancy %", "ADR"].map((h) => (
+                    <th key={h} className="text-left px-4 py-2.5 font-medium text-slate-500">
+                      {h}
+                    </th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {unitPerformance.map((u) => (
+                  <tr key={u.unit_id}>
+                    <td className="px-4 py-2.5 font-medium text-slate-800">{u.unit_name}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{u.room_nights_sold}</td>
+                    <td className="px-4 py-2.5 text-slate-500">₹{u.revenue.toLocaleString()}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{u.occupancy_rate_percent}%</td>
+                    <td className="px-4 py-2.5 text-slate-500">₹{u.adr.toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </Card>
     </div>
   );

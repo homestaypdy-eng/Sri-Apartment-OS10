@@ -2,12 +2,28 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type UserOut, type SessionOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge } from "../components/ui";
 
+// Decoded locally (not via AuthContext, which exposes only `role`) so this
+// self-identification stays entirely within this file's approved scope.
+// Mirrors the JWT-payload decode AuthContext.tsx already does for itself.
+function getCurrentUserId(): string | null {
+  const token = localStorage.getItem("access_token");
+  if (!token) return null;
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return payload.sub ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export default function UsersPage() {
   const [users, setUsers] = useState<UserOut[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [form, setForm] = useState({ name: "", email: "", password: "", role: "staff" });
   const [sessions, setSessions] = useState<SessionOut[]>([]);
+  const currentUserId = getCurrentUserId();
+  const activeAdminCount = users.filter((u) => u.role === "admin" && u.is_active).length;
 
   async function loadSessions() {
     try {
@@ -134,30 +150,55 @@ export default function UsersPage() {
       <Card>
         <h2 className="text-sm font-semibold text-slate-900 mb-4">All Users</h2>
         <Table headers={["Name", "Email", "Role", "Status", "Actions"]}>
-          {users.map((u) => (
-            <tr key={u.id}>
-              <td className="px-4 py-2.5 font-medium text-slate-800">{u.name}</td>
-              <td className="px-4 py-2.5 text-slate-500">{u.email}</td>
-              <td className="px-4 py-2.5">
-                <select
-                  value={u.role}
-                  onChange={(e) => changeRole(u, e.target.value)}
-                  className="rounded-md border border-slate-200 text-xs px-2 py-1"
-                >
-                  <option value="staff">staff</option>
-                  <option value="admin">admin</option>
-                </select>
-              </td>
-              <td className="px-4 py-2.5">
-                <Badge tone={u.is_active ? "green" : "red"}>{u.is_active ? "active" : "deactivated"}</Badge>
-              </td>
-              <td className="px-4 py-2.5">
-                <Button variant="secondary" onClick={() => toggleActive(u)}>
-                  {u.is_active ? "Deactivate" : "Reactivate"}
-                </Button>
-              </td>
-            </tr>
-          ))}
+          {users.map((u) => {
+            // UX-only guardrails mirroring the backend's authoritative
+            // self-lockout / last-admin checks in users/router.py — these
+            // just disable the controls with a reason; the server still
+            // rejects the request either way if bypassed.
+            const isSelf = u.id === currentUserId;
+            const isLastActiveAdmin = u.role === "admin" && u.is_active && activeAdminCount === 1;
+            const lockReason = isSelf
+              ? "You cannot change your own role or deactivate your own account."
+              : "At least one active admin must remain — promote another admin first.";
+            const roleLocked = (isSelf || isLastActiveAdmin) && u.role === "admin";
+            const deactivateLocked = u.is_active && (isSelf || isLastActiveAdmin);
+            return (
+              <tr key={u.id}>
+                <td className="px-4 py-2.5 font-medium text-slate-800">
+                  {u.name}
+                  {isSelf && <span className="ml-1.5 text-xs font-normal text-slate-400">(You)</span>}
+                </td>
+                <td className="px-4 py-2.5 text-slate-500">{u.email}</td>
+                <td className="px-4 py-2.5">
+                  <select
+                    value={u.role}
+                    onChange={(e) => changeRole(u, e.target.value)}
+                    disabled={roleLocked}
+                    title={roleLocked ? lockReason : undefined}
+                    className="rounded-md border border-slate-200 text-xs px-2 py-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <option value="staff">staff</option>
+                    <option value="admin">admin</option>
+                  </select>
+                </td>
+                <td className="px-4 py-2.5">
+                  <Badge tone={u.is_active ? "green" : "red"}>{u.is_active ? "active" : "deactivated"}</Badge>
+                  {isLastActiveAdmin && (
+                    <span className="ml-1.5">
+                      <Badge tone="amber">last admin</Badge>
+                    </span>
+                  )}
+                </td>
+                <td className="px-4 py-2.5">
+                  <span title={deactivateLocked ? lockReason : undefined}>
+                    <Button variant="secondary" onClick={() => toggleActive(u)} disabled={deactivateLocked}>
+                      {u.is_active ? "Deactivate" : "Reactivate"}
+                    </Button>
+                  </span>
+                </td>
+              </tr>
+            );
+          })}
         </Table>
       </Card>
 

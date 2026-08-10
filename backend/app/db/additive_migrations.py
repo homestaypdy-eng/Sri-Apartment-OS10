@@ -130,6 +130,13 @@ MIGRATION_STATEMENTS = [
     # in production silently disappears from booking pickers/availability.
     "ALTER TABLE properties ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true",
     "ALTER TABLE units ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true",
+    # Data integrity/concurrency hardening: defense-in-depth CHECK
+    # constraints backstopping the row-locked stock_in/stock_out and
+    # refund_deposit handlers.
+    "ALTER TABLE inventory_items DROP CONSTRAINT IF EXISTS ck_inventory_stock_nonneg",
+    "ALTER TABLE inventory_items ADD CONSTRAINT ck_inventory_stock_nonneg CHECK (current_stock >= 0)",
+    "ALTER TABLE security_deposits DROP CONSTRAINT IF EXISTS ck_deposit_refund_not_exceed_amount",
+    "ALTER TABLE security_deposits ADD CONSTRAINT ck_deposit_refund_not_exceed_amount CHECK (refund_amount <= amount)",
 ]
 
 # Property files (documents/photos) is a genuinely new table, not an

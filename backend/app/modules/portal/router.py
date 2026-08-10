@@ -268,9 +268,16 @@ def approve_extension_request(request_id: uuid.UUID, db: Session = Depends(get_d
     from datetime import datetime, timezone
     from sqlalchemy.exc import IntegrityError
 
-    req = db.get(GuestRequest, request_id)
+    # with_for_update locks this request (and, below, its booking) for the
+    # rest of the transaction — same idiom as Phase 2's InventoryItem/
+    # MaintenanceTicket/SecurityDeposit locks — so two near-simultaneous
+    # approval clicks on the same request can't both pass the
+    # not-already-resolved check below.
+    req = db.get(GuestRequest, request_id, with_for_update=True)
     if req is None:
         raise HTTPException(404, "Request not found")
+    if req.status == "resolved":
+        raise HTTPException(409, "This extension request has already been resolved.")
     if req.request_type != "extend_stay":
         raise HTTPException(400, "This endpoint only applies to extend_stay requests")
     if req.requested_check_out_date is None:
@@ -278,9 +285,15 @@ def approve_extension_request(request_id: uuid.UUID, db: Session = Depends(get_d
     if req.booking_id is None:
         raise HTTPException(400, "This request isn't linked to a booking")
 
-    booking = db.get(Booking, req.booking_id)
+    booking = db.get(Booking, req.booking_id, with_for_update=True)
     if booking is None:
         raise HTTPException(404, "Linked booking not found")
+    if booking.status not in ("confirmed", "checked_in"):
+        # Same terminal/active distinction bookings/router.py's
+        # ALLOWED_TRANSITIONS already encodes (checked_out/cancelled/no_show
+        # are all terminal) — extending a stay only makes sense while it's
+        # still active or upcoming.
+        raise HTTPException(409, f"Cannot extend a booking with status '{booking.status}'.")
     if req.requested_check_out_date <= booking.check_out:
         raise HTTPException(400, "Requested check-out date must be after the current check-out date")
 

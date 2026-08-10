@@ -200,7 +200,10 @@ class SecurityDeposit(Base):
     """
 
     __tablename__ = "security_deposits"
-    __table_args__ = (CheckConstraint(f"status IN {DEPOSIT_STATUSES}", name="ck_deposit_status"),)
+    __table_args__ = (
+        CheckConstraint(f"status IN {DEPOSIT_STATUSES}", name="ck_deposit_status"),
+        CheckConstraint("refund_amount <= amount", name="ck_deposit_refund_not_exceed_amount"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     booking_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("bookings.id"), nullable=False)

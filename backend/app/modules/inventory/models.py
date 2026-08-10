@@ -28,7 +28,13 @@ class Supplier(Base):
 
 class InventoryItem(Base):
     __tablename__ = "inventory_items"
-    __table_args__ = (CheckConstraint(f"category IN {ITEM_CATEGORIES}", name="ck_inventory_category"),)
+    __table_args__ = (
+        CheckConstraint(f"category IN {ITEM_CATEGORIES}", name="ck_inventory_category"),
+        # Defense-in-depth backstop for the row-locked stock_in/stock_out
+        # handlers in the router — belt-and-suspenders against current_stock
+        # ever going negative, not the primary guard (that's the lock).
+        CheckConstraint("current_stock >= 0", name="ck_inventory_stock_nonneg"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(150), nullable=False)

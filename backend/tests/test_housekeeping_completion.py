@@ -140,3 +140,31 @@ def test_full_task_lifecycle_still_works(headers):
     unit_after = client.get("/api/v1/units", headers=headers).json()
     match = next(u for u in unit_after if u["id"] == unit_id)
     assert match["housekeeping_status"] == "clean"
+
+
+# --- Phase 9: assigned_to FK validation ---
+
+def test_create_task_with_nonexistent_assignee_rejected(headers):
+    unit_id = _make_unit(headers)
+    resp = client.post("/api/v1/housekeeping-tasks", headers=headers, json={"unit_id": unit_id, "assigned_to": str(uuid.uuid4())})
+    assert resp.status_code == 404
+
+
+def test_update_task_with_nonexistent_assignee_rejected(headers):
+    unit_id = _make_unit(headers)
+    task = client.post("/api/v1/housekeeping-tasks", headers=headers, json={"unit_id": unit_id}).json()
+    resp = client.patch(f"/api/v1/housekeeping-tasks/{task['id']}", headers=headers, json={"assigned_to": str(uuid.uuid4())})
+    assert resp.status_code == 404
+
+    unchanged = client.get("/api/v1/housekeeping-tasks", headers=headers, params={"unit_id": unit_id}).json()
+    assert next(t for t in unchanged if t["id"] == task["id"])["assigned_to"] is None
+
+
+def test_assigning_real_user_to_task_still_works(headers):
+    unit_id = _make_unit(headers)
+    users = client.get("/api/v1/users", headers=headers).json()
+    admin_user_id = next(u["id"] for u in users if u["email"] == ADMIN_EMAIL)
+
+    resp = client.post("/api/v1/housekeeping-tasks", headers=headers, json={"unit_id": unit_id, "assigned_to": admin_user_id})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["assigned_to"] == admin_user_id

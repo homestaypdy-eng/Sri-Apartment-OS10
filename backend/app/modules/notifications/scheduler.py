@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.core.config import settings
 from app.db.session import SessionLocal
-from app.modules.notifications.service import scan_and_send_due_reminders
+from app.modules.notifications.service import scan_and_send_due_reminders, scan_and_send_escalations
 
 logger = logging.getLogger("notifications.scheduler")
 
@@ -25,6 +25,24 @@ def _run_reminder_scan():
         logger.info("Reminder scan complete: %s", results)
     except Exception:
         logger.exception("Reminder scan failed")
+    finally:
+        db.close()
+
+
+def _run_escalation_scan():
+    """scan_and_send_escalations already existed with full dedup/idempotency
+    via NotificationLog, and was only reachable manually via
+    POST /notifications/scan-escalations. Its own docstring already says
+    it's "reusing the same scan-and-dedupe infrastructure as the reminder
+    scan rather than building a separate scheduling path" — so it runs on
+    the same existing reminder_scan_interval_minutes cadence rather than
+    introducing a new interval setting."""
+    db = SessionLocal()
+    try:
+        results = scan_and_send_escalations(db)
+        logger.info("Escalation scan complete: %s", results)
+    except Exception:
+        logger.exception("Escalation scan failed")
     finally:
         db.close()
 
@@ -75,6 +93,13 @@ def start_scheduler() -> BackgroundScheduler | None:
         "interval",
         minutes=5,
         id="hold_expiry_cleanup",
+        next_run_time=None,
+    )
+    _scheduler.add_job(
+        _run_escalation_scan,
+        "interval",
+        minutes=settings.reminder_scan_interval_minutes,
+        id="escalation_scan",
         next_run_time=None,
     )
     _scheduler.start()

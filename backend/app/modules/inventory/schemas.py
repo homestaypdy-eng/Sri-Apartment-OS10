@@ -24,10 +24,10 @@ class InventoryItemCreate(BaseModel):
     name: str
     category: str = "other"
     unit_of_measure: str = "pcs"
-    minimum_stock: int = 0
+    minimum_stock: int = Field(0, ge=0)
     barcode: str | None = None
     qr_code_value: str | None = None
-    unit_cost: float | None = None
+    unit_cost: float | None = Field(None, ge=0)
     notes: str | None = None
     brand: str | None = None
     expiry_date: date | None = None
@@ -51,10 +51,10 @@ class InventoryItemUpdate(BaseModel):
     name: str | None = None
     category: str | None = None
     unit_of_measure: str | None = None
-    minimum_stock: int | None = None
+    minimum_stock: int | None = Field(None, ge=0)
     barcode: str | None = None
     qr_code_value: str | None = None
-    unit_cost: float | None = None
+    unit_cost: float | None = Field(None, ge=0)
     notes: str | None = None
     brand: str | None = None
     expiry_date: date | None = None
@@ -66,7 +66,7 @@ class StockMovementCreate(BaseModel):
     quantity: int = Field(gt=0)
     reason: str | None = None
     supplier_id: uuid.UUID | None = None
-    unit_cost: float | None = None
+    unit_cost: float | None = Field(None, ge=0)
     unit_id: uuid.UUID | None = None
     housekeeping_task_id: uuid.UUID | None = None
     maintenance_ticket_id: uuid.UUID | None = None

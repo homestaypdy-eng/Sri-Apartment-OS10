@@ -194,3 +194,60 @@ def test_full_finance_chain_matches_hand_calculation(headers):
     assert pnl["revenue"] == 12000.0
     assert pnl["total_expenses"] == 1000.0
     assert pnl["net_profit"] == 11000.0
+
+
+# --- Phase 9: non-negative validation + pagination ---
+
+def _make_booking(headers, unit_id, days_offset):
+    guest = client.post("/api/v1/guests", headers=headers, json={"name": "Phase9 Guest", "phone": f"97{uuid.uuid4().int % 10**8:08d}"}).json()
+    check_in = date.today() + timedelta(days=days_offset)
+    booking = client.post("/api/v1/bookings", headers=headers, json={
+        "unit_id": unit_id, "guest_id": guest["id"], "check_in": check_in.isoformat(), "check_out": (check_in + timedelta(days=2)).isoformat(),
+    }).json()
+    return booking["id"]
+
+
+def test_negative_opening_balance_rejected(headers):
+    closing_date = (date.today() + timedelta(days=9000 + uuid.uuid4().int % 500)).isoformat()
+    resp = client.post("/api/v1/finance/daily-closing", headers=headers, json={"closing_date": closing_date, "opening_balance": -100})
+    assert resp.status_code == 422
+
+
+def test_zero_opening_balance_still_accepted(headers):
+    closing_date = (date.today() + timedelta(days=9500 + uuid.uuid4().int % 500)).isoformat()
+    resp = client.post("/api/v1/finance/daily-closing", headers=headers, json={"closing_date": closing_date, "opening_balance": 0})
+    assert resp.status_code == 201, resp.text
+
+
+def test_deposits_pagination_limit_respected(headers):
+    unit_id = _make_unit(headers, name_prefix="DepPagUnit")
+    for i in range(3):
+        booking_id = _make_booking(headers, unit_id, days_offset=10000 + i * 5)
+        client.post("/api/v1/finance/deposits", headers=headers, json={"booking_id": booking_id, "amount": 500})
+
+    resp = client.get("/api/v1/finance/deposits", headers=headers, params={"limit": 2})
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+    default_resp = client.get("/api/v1/finance/deposits", headers=headers)
+    assert default_resp.status_code == 200  # default cap (200) still returns a normal, unbroken listing
+
+
+def test_owner_withdrawals_pagination_limit_respected(headers):
+    for _ in range(3):
+        client.post("/api/v1/finance/owner-withdrawals", headers=headers, json={"amount": 100, "withdrawal_date": date.today().isoformat()})
+
+    resp = client.get("/api/v1/finance/owner-withdrawals", headers=headers, params={"limit": 2})
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+
+def test_ota_commissions_pagination_limit_respected(headers):
+    unit_id = _make_unit(headers, name_prefix="CommPagUnit")
+    for i in range(3):
+        booking_id = _make_booking(headers, unit_id, days_offset=11000 + i * 5)
+        client.post("/api/v1/finance/ota-commissions", headers=headers, json={"booking_id": booking_id, "channel": "airbnb", "commission_percent": 15})
+
+    resp = client.get("/api/v1/finance/ota-commissions", headers=headers, params={"limit": 2})
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2

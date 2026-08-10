@@ -1,8 +1,9 @@
 import uuid
 from collections import defaultdict
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -59,7 +60,15 @@ def create_item(payload: InventoryItemCreate, db: Session = Depends(get_db), use
             raise HTTPException(400, f"Barcode '{payload.barcode}' is already used by another item")
     item = InventoryItem(**payload.model_dump())
     db.add(item)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # Belt-and-suspenders for the SKU/barcode pre-checks above: those
+        # protect the common case, but a second request racing in between
+        # the check and this flush would otherwise hit a raw, unhandled
+        # uniqueness violation here instead of the same clean message.
+        db.rollback()
+        raise HTTPException(400, "SKU or barcode is already used by another item")
     record_audit_log(db, user.id, "inventory.item.create", entity_type="inventory_item", entity_id=str(item.id), details=payload.name)
     db.commit()
     db.refresh(item)
@@ -86,6 +95,12 @@ def update_item(item_id: uuid.UUID, payload: InventoryItemUpdate, db: Session = 
             raise HTTPException(400, f"Barcode '{changes['barcode']}' is already used by another item")
     for field, value in changes.items():
         setattr(item, field, value)
+    try:
+        db.flush()
+    except IntegrityError:
+        # Same race-window backstop as create_item — see comment there.
+        db.rollback()
+        raise HTTPException(400, "SKU or barcode is already used by another item")
     record_audit_log(db, user.id, "inventory.item.update", entity_type="inventory_item", entity_id=str(item.id), details=f"Updated: {', '.join(changes.keys())}")
     db.commit()
     db.refresh(item)
@@ -109,7 +124,11 @@ def list_items(category: str | None = None, low_stock_only: bool = False, db: Se
     "/stock-in", response_model=StockMovementOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))]
 )
 def stock_in(payload: StockMovementCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    item = db.get(InventoryItem, payload.item_id)
+    # with_for_update locks the row for the rest of this transaction — the
+    # same idiom already used for InvoiceCounter — so a concurrent stock
+    # movement on the same item can't read a stale current_stock and
+    # silently lose an update.
+    item = db.get(InventoryItem, payload.item_id, with_for_update=True)
     if item is None:
         raise HTTPException(404, "Item not found")
 
@@ -165,7 +184,8 @@ def stock_in(payload: StockMovementCreate, db: Session = Depends(get_db), user: 
     "/stock-out", response_model=StockMovementOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))]
 )
 def stock_out(payload: StockMovementCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    item = db.get(InventoryItem, payload.item_id)
+    # Same row-lock rationale as stock_in — see comment there.
+    item = db.get(InventoryItem, payload.item_id, with_for_update=True)
     if item is None:
         raise HTTPException(404, "Item not found")
     if payload.quantity > item.current_stock:
@@ -203,9 +223,15 @@ def stock_out(payload: StockMovementCreate, db: Session = Depends(get_db), user:
     response_model=list[StockMovementOut],
     dependencies=[Depends(require_role("admin", "staff"))],
 )
-def list_movements(item_id: uuid.UUID, db: Session = Depends(get_db)):
+def list_movements(
+    item_id: uuid.UUID,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
     return db.scalars(
-        select(StockMovement).where(StockMovement.item_id == item_id).order_by(StockMovement.created_at.desc())
+        select(StockMovement).where(StockMovement.item_id == item_id)
+        .order_by(StockMovement.created_at.desc()).offset(offset).limit(limit)
     ).all()
 
 

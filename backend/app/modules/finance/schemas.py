@@ -144,7 +144,7 @@ class PurchaseRecordOut(BaseModel):
 
 class DailyClosingCreate(BaseModel):
     closing_date: date
-    opening_balance: float
+    opening_balance: float = Field(ge=0)
     notes: str | None = None
 
 

@@ -170,3 +170,40 @@ def test_full_ticket_lifecycle_still_works(headers):
     actions = [e["action"] for e in timeline["events"]]
     assert "maintenance.create" in actions
     assert "maintenance.update" in actions
+
+
+# --- Phase 9: non-negative cost validation + assigned_to FK handling ---
+
+def test_negative_cost_rejected(headers):
+    unit_id = _make_unit(headers)
+    ticket = client.post("/api/v1/maintenance-tickets", headers=headers, json={"unit_id": unit_id, "description": "Negative cost test"}).json()
+    resp = client.patch(f"/api/v1/maintenance-tickets/{ticket['id']}", headers=headers, json={"cost": -50})
+    assert resp.status_code == 422
+
+
+def test_zero_cost_still_accepted(headers):
+    unit_id = _make_unit(headers)
+    ticket = client.post("/api/v1/maintenance-tickets", headers=headers, json={"unit_id": unit_id, "description": "Zero cost test"}).json()
+    resp = client.patch(f"/api/v1/maintenance-tickets/{ticket['id']}", headers=headers, json={"cost": 0})
+    assert resp.status_code == 200, resp.text
+
+
+def test_assigning_nonexistent_user_rejected(headers):
+    unit_id = _make_unit(headers)
+    ticket = client.post("/api/v1/maintenance-tickets", headers=headers, json={"unit_id": unit_id, "description": "Bad assignment test"}).json()
+    resp = client.patch(f"/api/v1/maintenance-tickets/{ticket['id']}", headers=headers, json={"assigned_to": str(uuid.uuid4())})
+    assert resp.status_code == 404
+
+    unchanged = client.get("/api/v1/maintenance-tickets", headers=headers, params={"unit_id": unit_id}).json()
+    assert next(t for t in unchanged if t["id"] == ticket["id"])["assigned_to"] is None
+
+
+def test_assigning_real_user_still_works(headers):
+    unit_id = _make_unit(headers)
+    ticket = client.post("/api/v1/maintenance-tickets", headers=headers, json={"unit_id": unit_id, "description": "Good assignment test"}).json()
+    users = client.get("/api/v1/users", headers=headers).json()
+    admin_user_id = next(u["id"] for u in users if u["email"] == ADMIN_EMAIL)
+
+    resp = client.patch(f"/api/v1/maintenance-tickets/{ticket['id']}", headers=headers, json={"assigned_to": admin_user_id})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["assigned_to"] == admin_user_id

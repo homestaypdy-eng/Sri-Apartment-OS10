@@ -170,3 +170,70 @@ def test_full_item_lifecycle_still_works(headers):
 
     low_stock = client.get("/api/v1/inventory/items", headers=headers, params={"low_stock_only": True}).json()
     assert all(i["is_low_stock"] for i in low_stock)
+
+
+# --- Phase 9: non-negative validation + IntegrityError handling + pagination ---
+
+def test_negative_minimum_stock_rejected(headers):
+    resp = client.post("/api/v1/inventory/items", headers=headers, json={"name": "Bad Item", "minimum_stock": -1})
+    assert resp.status_code == 422
+
+
+def test_negative_unit_cost_rejected_on_create(headers):
+    resp = client.post("/api/v1/inventory/items", headers=headers, json={"name": "Bad Item", "unit_cost": -5})
+    assert resp.status_code == 422
+
+
+def test_negative_minimum_stock_rejected_on_update(headers):
+    item = _make_item(headers)
+    resp = client.patch(f"/api/v1/inventory/items/{item['id']}", headers=headers, json={"minimum_stock": -1})
+    assert resp.status_code == 422
+
+
+def test_zero_minimum_stock_and_unit_cost_still_accepted(headers):
+    """Regression: ge=0 must allow zero, not just reject negatives."""
+    resp = client.post("/api/v1/inventory/items", headers=headers, json={"name": "Zero Item", "minimum_stock": 0, "unit_cost": 0})
+    assert resp.status_code == 201, resp.text
+
+
+def test_negative_stock_movement_unit_cost_rejected(headers):
+    item = _make_item(headers)
+    resp = client.post("/api/v1/inventory/stock-in", headers=headers, json={"item_id": item["id"], "quantity": 5, "unit_cost": -10})
+    assert resp.status_code == 422
+
+
+def test_create_item_duplicate_sku_race_handled_cleanly(headers):
+    """The pre-check for SKU uniqueness has a TOCTOU window under real
+    concurrency; this proves the flush()-level IntegrityError backstop
+    behind it also produces the same clean 400, not a raw 500, by
+    forcing the race directly against the DB below the pre-check."""
+    import threading
+
+    sku = f"RACE-{uuid.uuid4().hex[:8]}"
+    results = []
+
+    def do_create():
+        results.append(client.post("/api/v1/inventory/items", headers=headers, json={"name": "Race Item", "sku": sku}))
+
+    threads = [threading.Thread(target=do_create), threading.Thread(target=do_create)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    statuses = sorted(r.status_code for r in results)
+    assert statuses == [201, 400], [r.text for r in results]
+
+
+def test_movements_pagination_limit_respected(headers):
+    item = _make_item(headers)
+    client.post("/api/v1/inventory/stock-in", headers=headers, json={"item_id": item["id"], "quantity": 100})
+    for _ in range(3):
+        client.post("/api/v1/inventory/stock-out", headers=headers, json={"item_id": item["id"], "quantity": 1})
+
+    resp = client.get(f"/api/v1/inventory/items/{item['id']}/movements", headers=headers, params={"limit": 2})
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+    full = client.get(f"/api/v1/inventory/items/{item['id']}/movements", headers=headers).json()
+    assert len(full) == 4  # 1 stock-in + 3 stock-out, well under the default 200 cap

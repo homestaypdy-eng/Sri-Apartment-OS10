@@ -155,6 +155,93 @@ def test_approve_extension_requires_staff_role():
     assert resp.status_code == 401
 
 
+# --- Phase 7: approval state safety ---
+
+def test_approve_extension_rejects_already_resolved_request(headers):
+    """The core Phase 7 gap: approving the same request twice must not
+    silently re-run the extension a second time."""
+    booking, guest, unit = _make_booking(headers, days_offset=4500)
+    new_check_out = (date.fromisoformat(booking["check_out"]) + timedelta(days=2)).isoformat()
+    request_id = _make_extend_request(guest["id"], booking["id"], date.fromisoformat(new_check_out))
+
+    first = client.post(f"/api/v1/guest-requests/{request_id}/approve-extension", headers=headers)
+    assert first.status_code == 200, first.text
+
+    second = client.post(f"/api/v1/guest-requests/{request_id}/approve-extension", headers=headers)
+    assert second.status_code == 409, second.text
+
+    still_extended_once = next(b for b in client.get("/api/v1/bookings", headers=headers, params={"unit_id": unit["id"]}).json() if b["id"] == booking["id"])
+    assert still_extended_once["check_out"] == new_check_out
+
+
+def test_approve_extension_rejects_cancelled_booking(headers):
+    booking, guest, unit = _make_booking(headers, days_offset=4600)
+    cancel = client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "cancelled"})
+    assert cancel.status_code == 200, cancel.text
+
+    new_check_out = date.fromisoformat(booking["check_out"]) + timedelta(days=2)
+    request_id = _make_extend_request(guest["id"], booking["id"], new_check_out)
+
+    resp = client.post(f"/api/v1/guest-requests/{request_id}/approve-extension", headers=headers)
+    assert resp.status_code == 409, resp.text
+
+    still_cancelled = next(b for b in client.get("/api/v1/bookings", headers=headers, params={"unit_id": unit["id"]}).json() if b["id"] == booking["id"])
+    assert still_cancelled["status"] == "cancelled"
+    assert still_cancelled["check_out"] == booking["check_out"]
+
+
+def test_rejected_extension_approval_does_not_create_audit_entries(headers):
+    """A rejected (already-resolved) approval attempt must not add any new
+    booking.edit or guest_request.update audit entries — same "no
+    misleading successful-mutation log" rule as Phase 4's user checks."""
+    booking, guest, unit = _make_booking(headers, days_offset=4700)
+    new_check_out = date.fromisoformat(booking["check_out"]) + timedelta(days=2)
+    request_id = _make_extend_request(guest["id"], booking["id"], new_check_out)
+
+    first = client.post(f"/api/v1/guest-requests/{request_id}/approve-extension", headers=headers)
+    assert first.status_code == 200
+
+    before = client.get("/api/v1/audit/logs", headers=headers, params={"entity_type": "guest_request", "entity_id": request_id}).json()
+
+    second = client.post(f"/api/v1/guest-requests/{request_id}/approve-extension", headers=headers)
+    assert second.status_code == 409
+
+    after = client.get("/api/v1/audit/logs", headers=headers, params={"entity_type": "guest_request", "entity_id": request_id}).json()
+    assert len(after) == len(before)
+
+
+def test_approve_extension_concurrent_requests_only_one_succeeds(headers):
+    """Two near-simultaneous approval clicks on the same request must
+    result in exactly one successful extension, not two applied in
+    sequence and not a lost/duplicated update."""
+    import threading
+
+    booking, guest, unit = _make_booking(headers, days_offset=4800)
+    new_check_out = (date.fromisoformat(booking["check_out"]) + timedelta(days=2)).isoformat()
+    request_id = _make_extend_request(guest["id"], booking["id"], date.fromisoformat(new_check_out))
+
+    results = []
+
+    def do_approve():
+        results.append(client.post(f"/api/v1/guest-requests/{request_id}/approve-extension", headers=headers))
+
+    threads = [threading.Thread(target=do_approve), threading.Thread(target=do_approve)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    statuses = sorted(r.status_code for r in results)
+    assert statuses == [200, 409], [r.text for r in results]
+
+    final_booking = next(b for b in client.get("/api/v1/bookings", headers=headers, params={"unit_id": unit["id"]}).json() if b["id"] == booking["id"])
+    assert final_booking["check_out"] == new_check_out
+
+    booking_logs = client.get("/api/v1/audit/logs", headers=headers, params={"action": "booking.edit"}).json()
+    matching = [l for l in booking_logs if l["entity_id"] == booking["id"] and "guest request" in (l["details"] or "")]
+    assert len(matching) == 1
+
+
 def test_resolving_request_attempts_notification(headers):
     """
     SMTP isn't configured in this test environment, so the actual email

@@ -249,3 +249,148 @@ def test_staff_cannot_access_user_management():
 
     resp = client.get("/api/v1/users", headers=staff_headers)
     assert resp.status_code == 403
+
+
+# --- Phase 4: User Self-Lockout Protection ---
+#
+# `require_role`/`get_current_user` (app/shared/rbac.py) re-check the actor's
+# is_active + role live from the DB on every request — a deactivated user
+# can never authenticate at all. That means the "last remaining active
+# admin" guard in update_user() can only ever be triggered by an admin
+# acting on THEIR OWN account (the acting admin is always, by construction,
+# one of the currently-active admins, so removing someone else's admin
+# status can never alone reach zero). These tests build an isolated group
+# of freshly-registered admins so they never touch the seed admin the
+# `headers` fixture depends on, and drive each account down to "last admin"
+# through legitimate sequential API calls before proving the final
+# self-action is blocked.
+
+def _register_admin(headers, label):
+    email = f"{label}_{uuid.uuid4().hex[:6]}@sriapartmenthomestay.com"
+    resp = client.post(
+        "/api/v1/auth/register",
+        headers=headers,
+        json={"name": label, "email": email, "password": "Pass12345!", "role": "admin"},
+    )
+    assert resp.status_code == 201, resp.text
+    user_id = resp.json()["id"]
+    login = client.post("/api/v1/auth/login", json={"email": email, "password": "Pass12345!"})
+    assert login.status_code == 200
+    admin_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    return user_id, admin_headers
+
+
+def test_admin_cannot_deactivate_own_account(headers):
+    user_id, own_headers = _register_admin(headers, "SelfDeactivate")
+
+    resp = client.patch(f"/api/v1/users/{user_id}", headers=own_headers, json={"is_active": False})
+    assert resp.status_code == 400
+
+    listing = {u["id"]: u for u in client.get("/api/v1/users", headers=headers).json()}
+    assert listing[user_id]["is_active"] is True
+
+
+def test_admin_cannot_demote_own_role(headers):
+    user_id, own_headers = _register_admin(headers, "SelfDemote")
+
+    resp = client.patch(f"/api/v1/users/{user_id}", headers=own_headers, json={"role": "staff"})
+    assert resp.status_code == 400
+
+    listing = {u["id"]: u for u in client.get("/api/v1/users", headers=headers).json()}
+    assert listing[user_id]["role"] == "admin"
+
+
+def test_last_remaining_admin_cannot_deactivate_self(headers):
+    """Two freshly-created admins, isolated from the seed account: one
+    deactivates the other (allowed — a second admin still remains), leaving
+    exactly one active admin standing, who must then be unable to
+    deactivate themselves."""
+    survivor_id, survivor_headers = _register_admin(headers, "LastAdminDeactA")
+    other_id, _ = _register_admin(headers, "LastAdminDeactB")
+
+    deact_other = client.patch(f"/api/v1/users/{other_id}", headers=survivor_headers, json={"is_active": False})
+    assert deact_other.status_code == 200
+
+    resp = client.patch(f"/api/v1/users/{survivor_id}", headers=survivor_headers, json={"is_active": False})
+    assert resp.status_code == 400
+
+    listing = {u["id"]: u for u in client.get("/api/v1/users", headers=headers).json()}
+    assert listing[survivor_id]["is_active"] is True
+
+
+def test_last_remaining_admin_cannot_demote_self(headers):
+    survivor_id, survivor_headers = _register_admin(headers, "LastAdminDemoteA")
+    other_id, _ = _register_admin(headers, "LastAdminDemoteB")
+
+    deact_other = client.patch(f"/api/v1/users/{other_id}", headers=survivor_headers, json={"is_active": False})
+    assert deact_other.status_code == 200
+
+    resp = client.patch(f"/api/v1/users/{survivor_id}", headers=survivor_headers, json={"role": "staff"})
+    assert resp.status_code == 400
+
+    listing = {u["id"]: u for u in client.get("/api/v1/users", headers=headers).json()}
+    assert listing[survivor_id]["role"] == "admin"
+
+
+def test_admin_can_deactivate_other_admin_when_multiple_active_admins_remain(headers):
+    """Regression: managing a DIFFERENT admin must still work normally as
+    long as at least one active admin remains afterward."""
+    actor_id, actor_headers = _register_admin(headers, "MultiAdminActor")
+    target_id, _ = _register_admin(headers, "MultiAdminTarget")
+
+    resp = client.patch(f"/api/v1/users/{target_id}", headers=actor_headers, json={"is_active": False})
+    assert resp.status_code == 200
+    assert resp.json()["is_active"] is False
+
+
+def test_admin_can_demote_other_admin_when_multiple_active_admins_remain(headers):
+    actor_id, actor_headers = _register_admin(headers, "MultiDemoteActor")
+    target_id, _ = _register_admin(headers, "MultiDemoteTarget")
+
+    resp = client.patch(f"/api/v1/users/{target_id}", headers=actor_headers, json={"role": "staff"})
+    assert resp.status_code == 200
+    assert resp.json()["role"] == "staff"
+
+
+def test_admin_can_still_manage_staff_users_normally(headers):
+    """Regression: the new self/last-admin checks must not affect ordinary
+    staff-user management at all."""
+    email = f"staffmgmt_{uuid.uuid4().hex[:6]}@sriapartmenthomestay.com"
+    reg = client.post(
+        "/api/v1/auth/register",
+        headers=headers,
+        json={"name": "Staff Managed", "email": email, "password": "Pass12345!", "role": "staff"},
+    )
+    user_id = reg.json()["id"]
+
+    promote = client.patch(f"/api/v1/users/{user_id}", headers=headers, json={"role": "admin"})
+    assert promote.status_code == 200
+
+    deact = client.patch(f"/api/v1/users/{user_id}", headers=headers, json={"is_active": False})
+    assert deact.status_code == 200
+    assert deact.json()["is_active"] is False
+
+
+def test_rejected_self_lockout_attempt_does_not_create_audit_log_entry(headers):
+    user_id, own_headers = _register_admin(headers, "AuditNoLog")
+
+    before = client.get("/api/v1/audit/logs", headers=headers, params={"entity_type": "user", "entity_id": user_id, "action": "user.update"})
+    assert before.status_code == 200
+    before_count = len(before.json())
+
+    resp = client.patch(f"/api/v1/users/{user_id}", headers=own_headers, json={"is_active": False})
+    assert resp.status_code == 400
+
+    after = client.get("/api/v1/audit/logs", headers=headers, params={"entity_type": "user", "entity_id": user_id, "action": "user.update"})
+    assert len(after.json()) == before_count
+
+
+def test_unrelated_self_update_still_allowed(headers):
+    """Precision check: self-editing your OWN account with a harmless,
+    non-lockout-causing payload (re-affirming the admin role you already
+    hold) must not be blocked — only actual deactivation/demotion is."""
+    user_id, own_headers = _register_admin(headers, "SelfHarmless")
+
+    resp = client.patch(f"/api/v1/users/{user_id}", headers=own_headers, json={"role": "admin"})
+    assert resp.status_code == 200
+    assert resp.json()["role"] == "admin"

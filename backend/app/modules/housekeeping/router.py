@@ -30,6 +30,8 @@ def create_task(payload: HousekeepingTaskCreate, db: Session = Depends(get_db), 
         raise HTTPException(404, "Unit not found")
     if payload.task_type not in TASK_TYPES:
         raise HTTPException(400, f"Invalid task_type '{payload.task_type}'")
+    if payload.assigned_to is not None and db.get(User, payload.assigned_to) is None:
+        raise HTTPException(404, "Assigned user not found")
 
     task = HousekeepingTask(
         unit_id=payload.unit_id,
@@ -85,6 +87,8 @@ def update_task(task_id: uuid.UUID, payload: HousekeepingTaskUpdate, db: Session
             unit.housekeeping_status = "clean"
 
     if payload.assigned_to is not None:
+        if db.get(User, payload.assigned_to) is None:
+            raise HTTPException(404, "Assigned user not found")
         changes.append(f"assigned_to: {task.assigned_to} -> {payload.assigned_to}")
         task.assigned_to = payload.assigned_to
     if payload.notes is not None:

@@ -66,7 +66,11 @@ def list_tickets(
 
 @router.patch("/{ticket_id}", response_model=MaintenanceTicketOut, dependencies=[Depends(require_role("admin", "staff"))])
 def update_ticket(ticket_id: uuid.UUID, payload: MaintenanceTicketUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    ticket = db.get(MaintenanceTicket, ticket_id)
+    # with_for_update locks the row for the rest of this transaction, so two
+    # near-simultaneous PATCHes on the same ticket (e.g. a double-clicked
+    # "Resolve") can't both read linked_expense_id as unset and each create
+    # their own Expense.
+    ticket = db.get(MaintenanceTicket, ticket_id, with_for_update=True)
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
 
@@ -81,6 +85,8 @@ def update_ticket(ticket_id: uuid.UUID, payload: MaintenanceTicketUpdate, db: Se
             ticket.resolved_at = datetime.now(timezone.utc)
 
     if payload.assigned_to is not None:
+        if db.get(User, payload.assigned_to) is None:
+            raise HTTPException(404, "Assigned user not found")
         changes.append(f"assigned_to: {ticket.assigned_to} -> {payload.assigned_to}")
         ticket.assigned_to = payload.assigned_to
     if payload.priority is not None:
@@ -88,6 +94,7 @@ def update_ticket(ticket_id: uuid.UUID, payload: MaintenanceTicketUpdate, db: Se
             raise HTTPException(400, f"Invalid priority '{payload.priority}'")
         changes.append(f"priority: {ticket.priority} -> {payload.priority}")
         ticket.priority = payload.priority
+    cost_changed_this_request = payload.cost is not None
     if payload.cost is not None:
         changes.append(f"cost: {ticket.cost} -> {payload.cost}")
         ticket.cost = payload.cost
@@ -99,8 +106,16 @@ def update_ticket(ticket_id: uuid.UUID, payload: MaintenanceTicketUpdate, db: Se
     # the ticket as a number nothing else in Finance ever sees.
     # linked_expense_id makes repeated saves update the same expense
     # rather than creating a new one every time.
+    #
+    # Only re-enter this sync on the request that actually resolves the
+    # ticket for the first time, or one that explicitly changes cost — not
+    # on every subsequent unrelated PATCH (e.g. just changing priority) —
+    # otherwise an unrelated edit on an already-resolved ticket would
+    # silently re-sync (and could overwrite) an Expense amount someone had
+    # since corrected directly in Finance.
     is_resolved_now = ticket.status in ("resolved", "closed")
-    if is_resolved_now and ticket.cost and float(ticket.cost) > 0:
+    just_resolved_this_request = is_resolved_now and not was_resolved_before
+    if is_resolved_now and ticket.cost and float(ticket.cost) > 0 and (just_resolved_this_request or cost_changed_this_request):
         if ticket.linked_expense_id:
             expense = db.get(Expense, ticket.linked_expense_id)
             if expense and float(expense.amount) != float(ticket.cost):

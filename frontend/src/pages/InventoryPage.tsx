@@ -161,6 +161,10 @@ export default function InventoryPage() {
     }
   }
 
+  const filteredItems = items
+    .filter((item) => !categoryFilter || item.category === categoryFilter)
+    .filter((item) => !search || item.name.toLowerCase().includes(search.toLowerCase()) || (item.brand ?? "").toLowerCase().includes(search.toLowerCase()) || (item.sku ?? "").toLowerCase().includes(search.toLowerCase()));
+
   return (
     <div>
       <PageHeader title="Inventory" />
@@ -357,34 +361,35 @@ export default function InventoryPage() {
             </label>
           </div>
         </div>
-        <div className="overflow-x-auto">
-          <Table headers={["Name", "SKU", "Brand", "Category", "Stock", "Min", "Unit Cost", "Expiry", "Status", "Actions"]}>
-            {items
-              .filter((item) => !categoryFilter || item.category === categoryFilter)
-              .filter((item) => !search || item.name.toLowerCase().includes(search.toLowerCase()) || (item.brand ?? "").toLowerCase().includes(search.toLowerCase()) || (item.sku ?? "").toLowerCase().includes(search.toLowerCase()))
-              .map((item) => (
-              <tr key={item.id}>
-                <td className="px-4 py-2.5 font-medium text-slate-800">{item.name}</td>
-                <td className="px-4 py-2.5 text-slate-500">{item.sku ?? "—"}</td>
-                <td className="px-4 py-2.5 text-slate-500">{item.brand ?? "—"}</td>
-                <td className="px-4 py-2.5 text-slate-500">{item.category.replace("_", " ")}</td>
-                <td className="px-4 py-2.5 text-slate-500">
-                  {item.current_stock} {item.unit_of_measure}
-                </td>
-                <td className="px-4 py-2.5 text-slate-500">{item.minimum_stock}</td>
-                <td className="px-4 py-2.5 text-slate-500">{item.unit_cost ? `₹${item.unit_cost}` : "—"}</td>
-                <td className="px-4 py-2.5 text-slate-500">{item.expiry_date ?? "—"}</td>
-                <td className="px-4 py-2.5">
-                  <Badge tone={item.is_low_stock ? "red" : "green"}>{item.is_low_stock ? "low stock" : "ok"}</Badge>
-                </td>
-                <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
-                  <button onClick={() => openEdit(item)} className="text-xs text-slate-600 hover:underline">Edit</button>
-                  <button onClick={() => openHistory(item)} className="text-xs text-slate-600 hover:underline">History</button>
-                </td>
-              </tr>
-            ))}
-          </Table>
-        </div>
+        {filteredItems.length === 0 ? (
+          <EmptyState message={items.length === 0 ? "No inventory items yet." : "No items match these filters."} />
+        ) : (
+          <div className="overflow-x-auto">
+            <Table headers={["Name", "SKU", "Brand", "Category", "Stock", "Min", "Unit Cost", "Expiry", "Status", "Actions"]}>
+              {filteredItems.map((item) => (
+                <tr key={item.id}>
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{item.name}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{item.sku ?? "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{item.brand ?? "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{item.category.replace("_", " ")}</td>
+                  <td className="px-4 py-2.5 text-slate-500">
+                    {item.current_stock} {item.unit_of_measure}
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-500">{item.minimum_stock}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{item.unit_cost ? `₹${item.unit_cost}` : "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{item.expiry_date ?? "—"}</td>
+                  <td className="px-4 py-2.5">
+                    <Badge tone={item.is_low_stock ? "red" : "green"}>{item.is_low_stock ? "low stock" : "ok"}</Badge>
+                  </td>
+                  <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
+                    <button onClick={() => openEdit(item)} className="text-xs text-slate-600 hover:underline">Edit</button>
+                    <button onClick={() => openHistory(item)} className="text-xs text-slate-600 hover:underline">History</button>
+                  </td>
+                </tr>
+              ))}
+            </Table>
+          </div>
+        )}
       </Card>
 
       {historyItem && (

@@ -1,0 +1,24 @@
+# Keeps the Docker build context (and therefore the built image) limited
+# to real source — without this, a local checkout with test/venv/IDE
+# artifacts sitting around produces a different build than a clean
+# checkout, which is exactly the reproducibility gap this closes.
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+ENV/
+*.egg-info/
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -265,11 +265,16 @@ def create_deposit(payload: SecurityDepositCreate, db: Session = Depends(get_db)
 
 
 @router.get("/deposits", response_model=list[SecurityDepositOut], dependencies=[Depends(require_role("admin", "staff"))])
-def list_deposits(status: str | None = None, db: Session = Depends(get_db)):
+def list_deposits(
+    status: str | None = None,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
     query = select(SecurityDeposit).order_by(SecurityDeposit.received_at.desc())
     if status:
         query = query.where(SecurityDeposit.status == status)
-    return db.scalars(query).all()
+    return db.scalars(query.offset(offset).limit(limit)).all()
 
 
 @router.get("/deposits/pending-refund", response_model=list[SecurityDepositOut], dependencies=[Depends(require_role("admin", "staff"))])
@@ -279,7 +284,10 @@ def list_pending_refunds(db: Session = Depends(get_db)):
 
 @router.post("/deposits/{deposit_id}/refund", response_model=SecurityDepositOut, dependencies=[Depends(require_role("admin", "staff"))])
 def refund_deposit(deposit_id: uuid.UUID, payload: SecurityDepositRefund, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    deposit = db.get(SecurityDeposit, deposit_id)
+    # with_for_update locks the row for the rest of this transaction, so two
+    # near-simultaneous partial-refund requests on the same deposit can't
+    # both read a stale refund_amount and lose one of the updates.
+    deposit = db.get(SecurityDeposit, deposit_id, with_for_update=True)
     if deposit is None:
         raise HTTPException(404, "Deposit not found")
 
@@ -311,13 +319,19 @@ def create_withdrawal(payload: OwnerWithdrawalCreate, db: Session = Depends(get_
 
 
 @router.get("/owner-withdrawals", response_model=list[OwnerWithdrawalOut], dependencies=[Depends(require_role("admin"))])
-def list_withdrawals(date_from: date | None = None, date_to: date | None = None, db: Session = Depends(get_db)):
+def list_withdrawals(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
     query = select(OwnerWithdrawal).order_by(OwnerWithdrawal.withdrawal_date.desc())
     if date_from:
         query = query.where(OwnerWithdrawal.withdrawal_date >= date_from)
     if date_to:
         query = query.where(OwnerWithdrawal.withdrawal_date <= date_to)
-    return db.scalars(query).all()
+    return db.scalars(query.offset(offset).limit(limit)).all()
 
 
 @router.post("/ota-commissions", response_model=OTACommissionOut, status_code=201, dependencies=[Depends(require_role("admin"))])
@@ -342,11 +356,16 @@ def create_commission(payload: OTACommissionCreate, db: Session = Depends(get_db
 
 
 @router.get("/ota-commissions", response_model=list[OTACommissionOut], dependencies=[Depends(require_role("admin", "staff"))])
-def list_commissions(channel: str | None = None, db: Session = Depends(get_db)):
+def list_commissions(
+    channel: str | None = None,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
     query = select(OTACommission)
     if channel:
         query = query.where(OTACommission.channel == channel)
-    return db.scalars(query).all()
+    return db.scalars(query.offset(offset).limit(limit)).all()
 
 
 @router.get("/ota-commissions/report", response_model=OTACommissionReport, dependencies=[Depends(require_role("admin", "staff"))])
