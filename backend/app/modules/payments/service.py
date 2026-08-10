@@ -351,32 +351,7 @@ def generate_invoice_pdf(
     pdf.cell(95, 7, f"Balance Due: Rs. {balance_value:.2f}", border=1, ln=True)
     pdf.ln(3)
 
-    pdf.set_font("Helvetica", "B", 8.5)
-    pdf.set_text_color(*navy)
     col3 = 63
-    y0 = pdf.get_y()
-    for i, title in enumerate(["BANK DETAILS", "AUTHORISED SIGNATORY", "SCAN & PAY"]):
-        pdf.set_xy(10 + i * col3, y0)
-        pdf.cell(col3, 5, title)
-    pdf.ln(6)
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "", 7)
-    y1 = pdf.get_y()
-    for i, items in enumerate([[
-        f"Bank Name: {bank_details.get('bank_name', '') if bank_details else ''}",
-        f"A/C Name: {bank_details.get('bank_account_name', '') if bank_details else ''}",
-        f"A/C Number: {bank_details.get('bank_account_number', '') if bank_details else ''}",
-        f"IFSC Code: {bank_details.get('bank_ifsc', '') if bank_details else ''}",
-        f"Branch: {bank_details.get('bank_branch', '') if bank_details else ''}",
-    ], [f"For {property_name}", "", "", "", ""], [
-        f"UPI ID: {bank_details.get('bank_ifsc', '') if bank_details else ''}",
-    ]]):
-        pdf.set_xy(10 + i * col3, y1)
-        text = "\n".join(items)
-        pdf.multi_cell(col3 - 2, 3.6, text)
-    pdf.set_y(max(pdf.get_y(), y1 + 22))
-    pdf.ln(2)
-
     y2 = pdf.get_y()
     pdf.set_font("Helvetica", "B", 8.5)
     pdf.set_text_color(*navy)
@@ -399,8 +374,10 @@ def generate_invoice_pdf(
     pdf.set_xy(10, y2 + 6)
     pdf.multi_cell(col3 - 2, 4, "\n".join(bank_lines))
 
+    signatory_name = bank_details.get("signatory_name", "") if bank_details else ""
+    signatory_title = bank_details.get("signatory_title", "") if bank_details else ""
     pdf.set_xy(10 + col3, y2 + 6)
-    pdf.multi_cell(col3 - 2, 4, f"For {property_name}\n\n\nS. Sundaramurthy\nProprietor")
+    pdf.multi_cell(col3 - 2, 4, f"For {property_name}\n\n\n{signatory_name}\n{signatory_title}")
 
     if os.path.exists(qr_image_path):
         try:
@@ -409,7 +386,7 @@ def generate_invoice_pdf(
             pass
     pdf.set_xy(10 + 2 * col3, y2 + 40)
     pdf.set_font("Helvetica", "", 7)
-    pdf.multi_cell(col3 - 2, 4, f"UPI ID: {bank_details.get('bank_ifsc', '') if bank_details else ''}")
+    pdf.multi_cell(col3 - 2, 4, f"UPI ID: {bank_details.get('upi_id', '') if bank_details else ''}")
 
     pdf.set_y(max(pdf.get_y(), y2 + 46))
     pdf.ln(3)

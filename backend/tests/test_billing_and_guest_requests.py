@@ -113,7 +113,7 @@ def test_invoice_pdf_includes_bank_details_and_qr(headers):
         f.write(pdf_resp.content)
         f.flush()
         text = subprocess.run(["pdftotext", f.name, "-"], capture_output=True, text=True).stdout
-    assert "Payment Details" in text
+    assert "BANK DETAILS" in text
     assert "IFSC" in text
 
 
