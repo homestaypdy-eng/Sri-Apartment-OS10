@@ -1,5 +1,7 @@
 import hashlib
+import logging
 import secrets
+import smtplib
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -7,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.security import (
     TokenError,
     create_access_token,
@@ -32,6 +35,8 @@ from app.modules.auth.schemas import (
 from app.modules.notifications.service import send_email, EmailNotConfiguredError
 from app.shared.rate_limit import is_rate_limited, record_attempt, reset
 from app.shared.rbac import get_current_user, require_role
+
+logger = logging.getLogger("sri_apartment_os")
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -143,7 +148,23 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
     registered" is itself a real information leak (confirms who has an
     account), so the response can't distinguish the two cases even
     though the real logic behind it obviously differs.
+
+    The one exception is SMTP being globally unconfigured: that's a
+    server-side state, identical for every caller regardless of which
+    email was submitted, so surfacing it up front (before the user
+    lookup) tells the caller nothing about any specific account —
+    it's checked first specifically so it can never depend on whether
+    the submitted email exists. A per-request delivery failure (SMTP
+    configured but this one send failed) stays silent to the caller,
+    same as before, since that outcome IS conditioned on a real
+    account existing and would otherwise leak enumeration.
     """
+    if not settings.smtp_host:
+        raise HTTPException(
+            status_code=501,
+            detail="Password reset email delivery is not configured. Contact your administrator.",
+        )
+
     generic_response = ForgotPasswordResponse(message="If that email is registered, a password reset link has been sent.")
     user = db.scalar(select(User).where(User.email == payload.email))
     if user is None or not user.is_active:
@@ -164,8 +185,11 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
             f"Hi {user.name},\n\nUse this code to reset your password (valid for {PASSWORD_RESET_TOKEN_EXPIRE_MINUTES} minutes): {raw_token}\n\n"
             f"If you didn't request this, you can safely ignore this email.",
         )
-    except EmailNotConfiguredError:
-        pass  # best-effort — the token still exists and works if the admin shares it another way
+    except (EmailNotConfiguredError, smtplib.SMTPException, OSError, TimeoutError) as e:
+        # Best-effort — the token still exists in the database and works
+        # if delivered another way. Never log the raw token/hash/any
+        # credential, only enough to diagnose that delivery failed and why.
+        logger.error(f"Password reset email delivery failed for user_id={user.id}: {type(e).__name__}: {e}")
 
     return generic_response
 

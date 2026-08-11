@@ -5,9 +5,12 @@ stateless JWTs into real, revocable sessions).
 Run with: pytest tests/test_users_completion.py -v
 """
 import hashlib
+import logging
 import secrets
+import smtplib
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -49,15 +52,40 @@ def _make_reset_token(user_id, minutes=30):
     return raw_token
 
 
-def test_forgot_password_always_returns_generic_message_for_unknown_email(headers):
-    resp = client.post("/api/v1/auth/forgot-password", json={"email": f"doesnotexist{uuid.uuid4().hex[:8]}@test.com"})
+# --- forgot-password: SMTP mocked as configured (this environment has no
+# real SMTP access) — matches the established pattern in
+# test_lead_management.py::test_email_send_succeeds_with_mocked_smtp ---
+
+@patch("smtplib.SMTP")
+def test_forgot_password_always_returns_generic_message_for_unknown_email(mock_smtp_class, headers):
+    from app.modules.auth import router as auth_router
+
+    mock_server = MagicMock()
+    mock_smtp_class.return_value.__enter__.return_value = mock_server
+
+    with patch.object(auth_router.settings, "smtp_host", "smtp.example.com"), \
+         patch.object(auth_router.settings, "smtp_user", "test@example.com"), \
+         patch.object(auth_router.settings, "smtp_password", "fake"), \
+         patch.object(auth_router.settings, "smtp_use_tls", True):
+        resp = client.post("/api/v1/auth/forgot-password", json={"email": f"doesnotexist{uuid.uuid4().hex[:8]}@test.com"})
     assert resp.status_code == 200
     assert "if that email is registered" in resp.json()["message"].lower()
 
 
-def test_forgot_password_creates_a_real_token_for_known_email(headers):
+@patch("smtplib.SMTP")
+def test_forgot_password_creates_a_real_token_for_known_email(mock_smtp_class, headers):
+    from app.modules.auth import router as auth_router
+
     email, user = _make_test_user(headers)
-    resp = client.post("/api/v1/auth/forgot-password", json={"email": email})
+
+    mock_server = MagicMock()
+    mock_smtp_class.return_value.__enter__.return_value = mock_server
+
+    with patch.object(auth_router.settings, "smtp_host", "smtp.example.com"), \
+         patch.object(auth_router.settings, "smtp_user", "test@example.com"), \
+         patch.object(auth_router.settings, "smtp_password", "fake"), \
+         patch.object(auth_router.settings, "smtp_use_tls", True):
+        resp = client.post("/api/v1/auth/forgot-password", json={"email": email})
     assert resp.status_code == 200
 
     from app.db.session import SessionLocal
@@ -69,6 +97,95 @@ def test_forgot_password_creates_a_real_token_for_known_email(headers):
         assert token_row.consumed_at is None
     finally:
         db.close()
+
+
+# --- forgot-password: SMTP globally unconfigured ---
+
+def test_forgot_password_smtp_unconfigured_known_email(headers):
+    from app.modules.auth import router as auth_router
+
+    email, user = _make_test_user(headers)
+    with patch.object(auth_router.settings, "smtp_host", ""):
+        resp = client.post("/api/v1/auth/forgot-password", json={"email": email})
+
+    assert resp.status_code == 501
+    assert resp.json() == {"detail": "Password reset email delivery is not configured. Contact your administrator."}
+
+    from app.db.session import SessionLocal
+    from app.modules.auth.models import PasswordResetToken
+    db = SessionLocal()
+    try:
+        token_row = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == uuid.UUID(user["id"])).first()
+        assert token_row is None, "no token should be created when SMTP is globally unconfigured"
+    finally:
+        db.close()
+
+
+def test_forgot_password_smtp_unconfigured_unknown_email_matches_known_email_response(headers):
+    """
+    Proves enumeration protection for the new 501 path: a known and an
+    unknown email must produce byte-identical responses when SMTP is
+    globally unconfigured — the check happens before the user lookup,
+    so it cannot depend on whether the submitted email exists.
+    """
+    from app.modules.auth import router as auth_router
+
+    known_email, _user = _make_test_user(headers)
+    unknown_email = f"doesnotexist{uuid.uuid4().hex[:8]}@test.com"
+
+    with patch.object(auth_router.settings, "smtp_host", ""):
+        known_resp = client.post("/api/v1/auth/forgot-password", json={"email": known_email})
+        unknown_resp = client.post("/api/v1/auth/forgot-password", json={"email": unknown_email})
+
+    assert known_resp.status_code == unknown_resp.status_code == 501
+    assert known_resp.json() == unknown_resp.json()
+
+
+@patch("smtplib.SMTP")
+def test_forgot_password_logs_delivery_failure_without_exposing_token(mock_smtp_class, headers, caplog):
+    """
+    SMTP is configured, but the actual send raises smtplib.SMTPException —
+    the caller must still see the ordinary generic success response (never
+    exposing the per-request delivery failure, which would otherwise leak
+    enumeration), the token must still exist (it was created before the
+    send attempt), the failure must be logged, and neither the raw token
+    nor its hash may appear anywhere in the logged message.
+    """
+    from app.modules.auth import router as auth_router
+
+    email, user = _make_test_user(headers)
+
+    mock_server = MagicMock()
+    mock_server.send_message.side_effect = smtplib.SMTPException("relay refused")
+    mock_smtp_class.return_value.__enter__.return_value = mock_server
+
+    with patch.object(auth_router.settings, "smtp_host", "smtp.example.com"), \
+         patch.object(auth_router.settings, "smtp_user", "test@example.com"), \
+         patch.object(auth_router.settings, "smtp_password", "fake"), \
+         patch.object(auth_router.settings, "smtp_use_tls", True), \
+         caplog.at_level(logging.ERROR, logger="sri_apartment_os"):
+        resp = client.post("/api/v1/auth/forgot-password", json={"email": email})
+
+    assert resp.status_code == 200
+    assert "if that email is registered" in resp.json()["message"].lower()
+
+    from app.db.session import SessionLocal
+    from app.modules.auth.models import PasswordResetToken
+    db = SessionLocal()
+    try:
+        token_row = db.query(PasswordResetToken).filter(PasswordResetToken.user_id == uuid.UUID(user["id"])).first()
+        assert token_row is not None, "token must still be created before the send attempt"
+        token_hash = token_row.token_hash
+    finally:
+        db.close()
+
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR and "delivery failed" in r.getMessage()]
+    assert len(error_records) == 1, "the delivery failure must be logged exactly once"
+    log_message = error_records[0].getMessage()
+    assert f"user_id={user['id']}" in log_message
+    assert "SMTPException" in log_message
+    assert "relay refused" in log_message
+    assert token_hash not in log_message
 
 
 def test_reset_password_with_valid_token_actually_changes_password(headers):
