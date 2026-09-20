@@ -11,8 +11,7 @@ from app.main import app
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 
 @pytest.fixture(scope="module")
@@ -32,7 +31,10 @@ def test_get_settings_returns_valid_structure(headers):
     assert resp.status_code == 200
     data = resp.json()
     assert isinstance(data["company_name"], str) and len(data["company_name"]) > 0
-    assert data["bank_account_number"] == "925020053638481"  # never touched by any test or manual run so far
+    # bank_account_number moved to the admin-only /settings/bank endpoint
+    # (RBAC Phase A) and is no longer part of this response at all — see
+    # test_rbac_phase_a_foundation.py for the BankSettings-specific coverage.
+    assert "bank_account_number" not in data
     assert data["state_code"] == "34"
 
 

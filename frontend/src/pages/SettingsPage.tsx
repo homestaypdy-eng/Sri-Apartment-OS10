@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, extractErrorMessage, type BusinessSettingsOut, type SystemInfoOut, type RolesPermissionsOut } from "../lib/api";
+import { api, extractErrorMessage, type BankSettingsOut, type BusinessSettingsOut, type SystemInfoOut, type RolesPermissionsOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Badge } from "../components/ui";
 
 export default function SettingsPage() {
@@ -12,6 +12,15 @@ export default function SettingsPage() {
   const [qrFile, setQrFile] = useState<File | null>(null);
   const [systemInfo, setSystemInfo] = useState<SystemInfoOut | null>(null);
   const [rolesInfo, setRolesInfo] = useState<RolesPermissionsOut | null>(null);
+  // RBAC Phase A: bank/UPI details are Admin-only (see BankSettings) — kept
+  // as their own state/form/save flow, entirely separate from the general
+  // settings form above, since they're a different backend resource with
+  // their own endpoint and their own access boundary. Staying null (the
+  // GET below 403ing) is what keeps this section hidden from Staff/Manager,
+  // the same pattern already used for systemInfo above.
+  const [bankSettings, setBankSettings] = useState<BankSettingsOut | null>(null);
+  const [bankForm, setBankForm] = useState<Partial<BankSettingsOut>>({});
+  const [savingBank, setSavingBank] = useState(false);
 
   async function load() {
     try {
@@ -20,6 +29,13 @@ export default function SettingsPage() {
       setForm(data);
     } catch (err) {
       setError(extractErrorMessage(err));
+    }
+    try {
+      const { data } = await api.get("/settings/bank");
+      setBankSettings(data);
+      setBankForm(data);
+    } catch {
+      // admin-only; staff/manager simply won't see this section
     }
     try {
       const { data } = await api.get("/settings/system-info");
@@ -41,6 +57,10 @@ export default function SettingsPage() {
 
   function set<K extends keyof BusinessSettingsOut>(key: K, value: BusinessSettingsOut[K]) {
     setForm({ ...form, [key]: value });
+  }
+
+  function setBank<K extends keyof BankSettingsOut>(key: K, value: BankSettingsOut[K]) {
+    setBankForm({ ...bankForm, [key]: value });
   }
 
   async function handleUploadLogo() {
@@ -105,6 +125,22 @@ export default function SettingsPage() {
       setError(extractErrorMessage(err));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleSaveBank() {
+    setError(null);
+    setSuccess(null);
+    setSavingBank(true);
+    try {
+      const { data } = await api.put("/settings/bank", bankForm);
+      setBankSettings(data);
+      setBankForm(data);
+      setSuccess("Bank details saved.");
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    } finally {
+      setSavingBank(false);
     }
   }
 
@@ -190,18 +226,6 @@ export default function SettingsPage() {
         </Card>
 
         <Card>
-          <h2 className="text-sm font-semibold text-slate-900 mb-4">Bank &amp; UPI Details</h2>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <Field label="Bank Name" value={form.bank_name} onChange={(v) => set("bank_name", v)} />
-            <Field label="Account Name" value={form.bank_account_name} onChange={(v) => set("bank_account_name", v)} />
-            <Field label="Account Number" value={form.bank_account_number} onChange={(v) => set("bank_account_number", v)} />
-            <Field label="IFSC Code" value={form.bank_ifsc} onChange={(v) => set("bank_ifsc", v)} />
-            <Field label="Branch" value={form.bank_branch} onChange={(v) => set("bank_branch", v)} />
-            <Field label="UPI ID" value={form.upi_id} onChange={(v) => set("upi_id", v)} />
-          </div>
-        </Card>
-
-        <Card>
           <h2 className="text-sm font-semibold text-slate-900 mb-4">Signatory</h2>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <Field label="Signatory Name" value={form.signatory_name} onChange={(v) => set("signatory_name", v)} />
@@ -223,6 +247,31 @@ export default function SettingsPage() {
           {saving ? "Saving..." : "Save Settings"}
         </Button>
       </form>
+
+      {/* RBAC Phase A: Admin-only, deliberately separate from the form
+          above — this saves to /settings/bank, a different endpoint with
+          a stricter access boundary than general settings. Rendering only
+          when bankSettings is non-null (i.e. the GET above succeeded) is
+          what keeps this section invisible to Staff/Manager, exactly like
+          the System Status section below already does for systemInfo. */}
+      {bankSettings && (
+        <Card className="mt-6">
+          <h2 className="text-sm font-semibold text-slate-900 mb-4">Bank &amp; UPI Details</h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Field label="Bank Name" value={bankForm.bank_name} onChange={(v) => setBank("bank_name", v)} />
+            <Field label="Account Name" value={bankForm.bank_account_name} onChange={(v) => setBank("bank_account_name", v)} />
+            <Field label="Account Number" value={bankForm.bank_account_number} onChange={(v) => setBank("bank_account_number", v)} />
+            <Field label="IFSC Code" value={bankForm.bank_ifsc} onChange={(v) => setBank("bank_ifsc", v)} />
+            <Field label="Branch" value={bankForm.bank_branch} onChange={(v) => setBank("bank_branch", v)} />
+            <Field label="UPI ID" value={bankForm.upi_id} onChange={(v) => setBank("upi_id", v)} />
+          </div>
+          <div className="mt-4">
+            <Button type="button" onClick={handleSaveBank} disabled={savingBank}>
+              {savingBank ? "Saving..." : "Save Bank Details"}
+            </Button>
+          </div>
+        </Card>
+      )}
 
       {systemInfo && (
         <Card className="mt-6">

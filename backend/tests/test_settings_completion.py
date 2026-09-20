@@ -15,8 +15,7 @@ from app.main import app
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 
 @pytest.fixture(scope="module")
@@ -123,11 +122,15 @@ def test_system_info_requires_admin_not_just_staff(headers):
     assert resp.status_code == 403
 
 
-def test_roles_permissions_reflects_real_two_role_model(headers):
+def test_roles_permissions_reflects_real_role_model(headers):
+    # RBAC Phase B documentation fix (finding I-4): this reference now
+    # covers all three roles, not just the two that existed when this test
+    # was written — see test_rbac_phase_b.py's dedicated roles-permissions
+    # section for full content coverage of the new "manager" entry.
     resp = client.get("/api/v1/settings/roles-permissions", headers=headers)
     assert resp.status_code == 200
     roles = {r["role"] for r in resp.json()["roles"]}
-    assert roles == {"admin", "staff"}
+    assert roles == {"admin", "staff", "manager"}
 
 
 def test_roles_permissions_accessible_to_staff_too(headers):

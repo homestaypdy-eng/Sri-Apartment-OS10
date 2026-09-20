@@ -1,16 +1,24 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, extractErrorMessage, type MaintenanceTicketOut, type MaintenancePhotoOut, type UnitOut, type TimelineEvent } from "../lib/api";
+import { api, extractErrorMessage, MAINTENANCE_TICKET_CATEGORIES, type MaintenanceTicketOut, type MaintenancePhotoOut, type UnitOut, type UserOut, type TimelineEvent } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner } from "../components/ui";
+import { useAuth } from "../context/AuthContext";
 
 const PRIORITIES = ["low", "medium", "high", "urgent"];
+const CATEGORY_LABELS: Record<string, string> = {
+  ac: "AC", electrical: "Electrical", plumbing: "Plumbing", water: "Water",
+  appliance: "Appliance", furniture: "Furniture", internet: "Internet", other: "Other",
+};
 
 export default function MaintenancePage() {
+  const { role } = useAuth();
+  const isAdmin = role === "admin";
   const [tickets, setTickets] = useState<MaintenanceTicketOut[]>([]);
   const [units, setUnits] = useState<UnitOut[]>([]);
+  const [staff, setStaff] = useState<UserOut[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [success, setSuccess] = useState<string | null>(null);
-  const [form, setForm] = useState({ unit_id: "", description: "", priority: "medium" });
+  const [form, setForm] = useState({ unit_id: "", description: "", priority: "medium", category: "", assigned_to: "" });
   const [costInputs, setCostInputs] = useState<Record<string, string>>({});
 
   const [detailsTicketId, setDetailsTicketId] = useState<string | null>(null);
@@ -22,9 +30,18 @@ export default function MaintenancePage() {
   async function loadAll() {
     setLoading(true);
     try {
-      const [t, u] = await Promise.all([api.get("/maintenance-tickets"), api.get("/units")]);
+      // /users is admin-only server-side — same guarded-fetch pattern
+      // HousekeepingPage.tsx and GuestRequestsPage.tsx already use, so
+      // staff still get the full ticket list, just without a named-staff
+      // assignment dropdown at creation time.
+      const [t, u, s] = await Promise.all([
+        api.get("/maintenance-tickets"),
+        api.get("/units"),
+        isAdmin ? api.get("/users") : Promise.resolve({ data: [] }),
+      ]);
       setTickets(t.data);
       setUnits(u.data);
+      setStaff(s.data);
     } catch (err) {
       setError(extractErrorMessage(err));
     } finally {
@@ -34,16 +51,17 @@ export default function MaintenancePage() {
 
   useEffect(() => {
     loadAll();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
     setError(null);
     setSuccess(null);
     try {
-      await api.post("/maintenance-tickets", form);
+      await api.post("/maintenance-tickets", { ...form, category: form.category || undefined, assigned_to: form.assigned_to || undefined });
       setSuccess("Ticket raised.");
-      setForm({ unit_id: "", description: "", priority: "medium" });
+      setForm({ unit_id: "", description: "", priority: "medium", category: "", assigned_to: "" });
       loadAll();
     } catch (err) {
       setError(extractErrorMessage(err));
@@ -67,6 +85,11 @@ export default function MaintenancePage() {
 
   function unitName(id: string) {
     return units.find((u) => u.id === id)?.name ?? "—";
+  }
+
+  function staffName(id: string | null) {
+    if (!id) return "Unassigned";
+    return staff.find((u) => u.id === id)?.name ?? "—";
   }
 
   function priorityTone(p: string): "red" | "amber" | "slate" {
@@ -163,6 +186,14 @@ export default function MaintenancePage() {
           <select value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
             {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
+          <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+            <option value="">Category (optional)...</option>
+            {MAINTENANCE_TICKET_CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABELS[c]}</option>)}
+          </select>
+          <select value={form.assigned_to} onChange={(e) => setForm({ ...form, assigned_to: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+            <option value="">Assign to staff (optional)...</option>
+            {staff.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
           <Button type="submit">Raise Ticket</Button>
         </form>
       </Card>
@@ -174,11 +205,12 @@ export default function MaintenancePage() {
         ) : tickets.length === 0 ? (
           <EmptyState message="No maintenance tickets yet — raise one above to get started." />
         ) : (
-          <Table headers={["Unit", "Issue", "Priority", "Status", "Cost", "Actions"]}>
+          <Table headers={["Unit", "Issue", "Category", "Priority", "Status", "Assigned To", "Cost", "Actions"]}>
             {tickets.map((t) => (
               <tr key={t.id}>
                 <td className="px-4 py-2.5 font-medium text-slate-800">{unitName(t.unit_id)}</td>
                 <td className="px-4 py-2.5 text-slate-500 max-w-xs">{t.description}</td>
+                <td className="px-4 py-2.5 text-slate-500">{t.category ? CATEGORY_LABELS[t.category] ?? t.category : "—"}</td>
                 <td className="px-4 py-2.5">
                   <Badge tone={priorityTone(t.priority)}>{t.priority}</Badge>
                 </td>
@@ -187,6 +219,7 @@ export default function MaintenancePage() {
                     {t.status.replace("_", " ")}
                   </Badge>
                 </td>
+                <td className="px-4 py-2.5 text-slate-500">{staffName(t.assigned_to)}</td>
                 <td className="px-4 py-2.5 text-slate-500">{t.cost != null ? `₹${t.cost}` : "—"}</td>
                 <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
                   {t.status === "open" && (

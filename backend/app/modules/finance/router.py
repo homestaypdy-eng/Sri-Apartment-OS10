@@ -21,14 +21,20 @@ EXPENSE_ATTACHMENT_STORAGE_DIR = os.environ.get("EXPENSE_ATTACHMENT_STORAGE_DIR"
 os.makedirs(EXPENSE_ATTACHMENT_STORAGE_DIR, exist_ok=True)
 from app.modules.finance import service
 from app.modules.finance.models import (
+    DEFAULT_LOAN_TYPES,
     EXPENSE_CATEGORIES,
+    LOAN_STATUSES,
     OTA_CHANNELS_FOR_COMMISSION,
+    OTA_RECONCILIATION_STATUSES,
     Budget,
     DailyClosing,
     Expense,
     ExpenseAttachment,
     LaundryEntry,
+    Loan,
+    LoanEmiPayment,
     OTACommission,
+    OTAPayoutReceipt,
     OwnerWithdrawal,
     PurchaseRecord,
     SecurityDeposit,
@@ -56,9 +62,20 @@ from app.modules.finance.schemas import (
     LaundryEntryCreate,
     LaundryEntryOut,
     LaundryMonthlySummary,
+    LoanCreate,
+    LoanEmiMarkPaid,
+    LoanEmiPaymentCreate,
+    LoanEmiPaymentOut,
+    LoanOut,
+    LoanSummary,
+    LoanUpdate,
     OTACommissionCreate,
     OTACommissionOut,
     OTACommissionReport,
+    OTAMissingCommissionLine,
+    OTAPayoutReceiptOut,
+    OTAPayoutReceiptRecord,
+    OTAReconciliationLine,
     OutstandingPaymentLine,
     OwnerWithdrawalCreate,
     OwnerWithdrawalOut,
@@ -96,7 +113,7 @@ def create_expense(payload: ExpenseCreate, db: Session = Depends(get_db), user: 
     return expense
 
 
-@router.get("/expense-categories", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/expense-categories", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_expense_categories(db: Session = Depends(get_db)):
     """Suggested categories for the UI's dropdown: the default set plus any
     custom category that's actually been used, so a typed-in custom
@@ -156,7 +173,7 @@ def bulk_approve_or_reject_expenses(payload: BulkExpenseApprovalAction, db: Sess
     }
 
 
-@router.post("/expenses/{expense_id}/attachments", response_model=ExpenseAttachmentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/expenses/{expense_id}/attachments", response_model=ExpenseAttachmentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 async def upload_expense_attachment(expense_id: uuid.UUID, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     expense = db.get(Expense, expense_id)
     if expense is None:
@@ -183,12 +200,12 @@ async def upload_expense_attachment(expense_id: uuid.UUID, file: UploadFile = Fi
     return attachment
 
 
-@router.get("/expenses/{expense_id}/attachments", response_model=list[ExpenseAttachmentOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/expenses/{expense_id}/attachments", response_model=list[ExpenseAttachmentOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_expense_attachments(expense_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(ExpenseAttachment).where(ExpenseAttachment.expense_id == expense_id)).all()
 
 
-@router.get("/expenses/{expense_id}/attachments/{attachment_id}/download", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/expenses/{expense_id}/attachments/{attachment_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_expense_attachment(expense_id: uuid.UUID, attachment_id: uuid.UUID, db: Session = Depends(get_db)):
     attachment = db.get(ExpenseAttachment, attachment_id)
     if attachment is None or attachment.expense_id != expense_id:
@@ -198,7 +215,7 @@ def download_expense_attachment(expense_id: uuid.UUID, attachment_id: uuid.UUID,
     return FileResponse(attachment.file_path, media_type=attachment.content_type, filename=attachment.filename)
 
 
-@router.get("/expenses", response_model=list[ExpenseOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/expenses", response_model=list[ExpenseOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_expenses(
     category: str | None = None,
     date_from: date | None = None,
@@ -235,7 +252,7 @@ def create_budget(payload: BudgetCreate, db: Session = Depends(get_db), user: Us
     return budget
 
 
-@router.get("/budgets", response_model=list[BudgetOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/budgets", response_model=list[BudgetOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_budgets(period_year: int | None = None, period_month: int | None = None, db: Session = Depends(get_db)):
     query = select(Budget)
     if period_year:
@@ -245,12 +262,12 @@ def list_budgets(period_year: int | None = None, period_month: int | None = None
     return db.scalars(query).all()
 
 
-@router.get("/budget-vs-actual", response_model=BudgetVsActualReport, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/budget-vs-actual", response_model=BudgetVsActualReport, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_budget_vs_actual(period_year: int = Query(...), period_month: int = Query(..., ge=1, le=12), db: Session = Depends(get_db)):
     return service.budget_vs_actual(db, period_year, period_month)
 
 
-@router.post("/deposits", response_model=SecurityDepositOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/deposits", response_model=SecurityDepositOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_deposit(payload: SecurityDepositCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     booking = db.get(Booking, payload.booking_id)
     if booking is None:
@@ -264,7 +281,7 @@ def create_deposit(payload: SecurityDepositCreate, db: Session = Depends(get_db)
     return deposit
 
 
-@router.get("/deposits", response_model=list[SecurityDepositOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/deposits", response_model=list[SecurityDepositOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_deposits(
     status: str | None = None,
     limit: int = Query(200, ge=1, le=500),
@@ -277,12 +294,23 @@ def list_deposits(
     return db.scalars(query.offset(offset).limit(limit)).all()
 
 
-@router.get("/deposits/pending-refund", response_model=list[SecurityDepositOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/deposits/pending-refund", response_model=list[SecurityDepositOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_pending_refunds(db: Session = Depends(get_db)):
     return db.scalars(select(SecurityDeposit).where(SecurityDeposit.status.in_(("held", "partially_refunded"))).order_by(SecurityDeposit.received_at)).all()
 
 
-@router.post("/deposits/{deposit_id}/refund", response_model=SecurityDepositOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post(
+    "/deposits/{deposit_id}/refund",
+    response_model=SecurityDepositOut,
+    # RBAC Phase B security fix (finding I-1): this endpoint was mechanically
+    # swept into the blanket "admin, staff" -> "admin, staff, manager" edit
+    # made across this router during Phase B, but issuing a refund is
+    # explicitly out of scope for Manager (same as /payments/{id}/refund and
+    # /payment-gateway/refunds, both of which stayed admin-only). Restored to
+    # its exact pre-Phase-B authorization — Manager excluded, Admin/Staff
+    # unchanged.
+    dependencies=[Depends(require_role("admin", "staff"))],
+)
 def refund_deposit(deposit_id: uuid.UUID, payload: SecurityDepositRefund, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # with_for_update locks the row for the rest of this transaction, so two
     # near-simultaneous partial-refund requests on the same deposit can't
@@ -295,13 +323,25 @@ def refund_deposit(deposit_id: uuid.UUID, payload: SecurityDepositRefund, db: Se
     if new_total_refunded > float(deposit.amount):
         raise HTTPException(400, f"Refund would exceed the original deposit amount ({deposit.amount}); already refunded {deposit.refund_amount}")
 
+    previous_refund_amount, previous_status = deposit.refund_amount, deposit.status
+
     deposit.refund_amount = new_total_refunded
     deposit.refunded_at = datetime.now(timezone.utc)
     deposit.status = "refunded" if new_total_refunded == float(deposit.amount) else "partially_refunded"
     if payload.notes:
         deposit.notes = f"{deposit.notes or ''}\n[Refund] {payload.notes}".strip()
 
-    record_audit_log(db, user.id, "finance.deposit.refund", entity_type="security_deposit", entity_id=str(deposit.id), details=f"Refunded Rs.{payload.refund_amount}, new status: {deposit.status}")
+    # RBAC Phase B: audit logging already existed here (action
+    # "finance.deposit.refund") — this only adds structured before/after
+    # financial values via previous_value/new_value (Phase A's columns for
+    # exactly this), on top of the existing human-readable details string.
+    # No change to the refund business logic above.
+    record_audit_log(
+        db, user.id, "finance.deposit.refund", entity_type="security_deposit", entity_id=str(deposit.id),
+        details=f"Refunded Rs.{payload.refund_amount}, new status: {deposit.status}",
+        previous_value=f"refund_amount={previous_refund_amount}, status={previous_status}",
+        new_value=f"refund_amount={deposit.refund_amount}, status={deposit.status}",
+    )
     db.commit()
     db.refresh(deposit)
     return deposit
@@ -355,7 +395,7 @@ def create_commission(payload: OTACommissionCreate, db: Session = Depends(get_db
     return commission
 
 
-@router.get("/ota-commissions", response_model=list[OTACommissionOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/ota-commissions", response_model=list[OTACommissionOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_commissions(
     channel: str | None = None,
     limit: int = Query(200, ge=1, le=500),
@@ -368,13 +408,77 @@ def list_commissions(
     return db.scalars(query.offset(offset).limit(limit)).all()
 
 
-@router.get("/ota-commissions/report", response_model=OTACommissionReport, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/ota-commissions/report", response_model=OTACommissionReport, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_ota_commission_report(date_from: date | None = Query(None), date_to: date | None = Query(None), db: Session = Depends(get_db)):
     d_from, d_to = _default_range(date_from, date_to)
     return service.ota_commission_report(db, d_from, d_to)
 
 
-@router.get("/outstanding-payments", response_model=list[OutstandingPaymentLine], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/ota-commissions/reconciliation", response_model=list[OTAReconciliationLine], dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def get_ota_reconciliation(date_from: date | None = Query(None), date_to: date | None = Query(None), channel: str | None = None, db: Session = Depends(get_db)):
+    d_from, d_to = _default_range(date_from, date_to)
+    return service.ota_reconciliation_lines(db, d_from, d_to, channel)
+
+
+@router.get("/ota-missing-commissions", response_model=list[OTAMissingCommissionLine], dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def get_ota_missing_commissions(date_from: date | None = Query(None), date_to: date | None = Query(None), db: Session = Depends(get_db)):
+    d_from, d_to = _default_range(date_from, date_to)
+    return service.ota_missing_commissions(db, d_from, d_to)
+
+
+@router.patch("/ota-commissions/{commission_id}/receipt", response_model=OTAPayoutReceiptOut, dependencies=[Depends(require_role("admin"))])
+def record_ota_payout_receipt(commission_id: uuid.UUID, payload: OTAPayoutReceiptRecord, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Get-or-create + update in one endpoint, mirroring mark_loan_emi_paid's
+    locking pattern: the parent OTACommission row is locked (rather than
+    the receipt, which may not exist yet on the first call) so two
+    near-simultaneous record-receipt requests for the same commission
+    serialize instead of racing — the unique constraint on
+    ota_commission_id is the hard backstop if they somehow still race past
+    this. Repeating the same submission after it already applied updates
+    the same row in place rather than creating a second one, so there is
+    never more than one effective receipt per commission.
+    """
+    if payload.status not in OTA_RECONCILIATION_STATUSES:
+        raise HTTPException(400, f"Invalid status '{payload.status}'. Must be one of {OTA_RECONCILIATION_STATUSES}")
+
+    commission = db.get(OTACommission, commission_id, with_for_update=True)
+    if commission is None:
+        raise HTTPException(404, "OTA commission record not found")
+
+    receipt = db.scalar(select(OTAPayoutReceipt).where(OTAPayoutReceipt.ota_commission_id == commission_id))
+
+    if receipt is not None and payload.expected_updated_at is not None and receipt.updated_at != payload.expected_updated_at:
+        raise HTTPException(409, "This receipt was changed by someone else since you opened it. Reload it and try again.")
+
+    is_new = receipt is None
+    if is_new:
+        receipt = OTAPayoutReceipt(ota_commission_id=commission_id, created_by=user.id)
+        db.add(receipt)
+
+    receipt.actual_received_amount = payload.actual_received_amount
+    receipt.receipt_date = payload.receipt_date
+    receipt.status = payload.status
+    receipt.reference_number = payload.reference_number
+    receipt.notes = payload.notes
+
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "A receipt for this commission was just recorded by another request. Reload and try again.")
+
+    record_audit_log(
+        db, user.id, f"finance.ota_payout_receipt.{'create' if is_new else 'update'}",
+        entity_type="ota_payout_receipt", entity_id=str(receipt.id),
+        details=f"{commission.channel} booking {commission.booking_id}: Rs.{receipt.actual_received_amount} received {receipt.receipt_date}, status={receipt.status}",
+    )
+    db.commit()
+    db.refresh(receipt)
+    return receipt
+
+
+@router.get("/outstanding-payments", response_model=list[OutstandingPaymentLine], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_outstanding_payments(limit: int = Query(200, ge=1, le=5000), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
     """
     Pending-balance filtering happens after computing each booking's
@@ -390,7 +494,7 @@ def get_outstanding_payments(limit: int = Query(200, ge=1, le=5000), offset: int
     return all_lines[offset:offset + limit]
 
 
-@router.patch("/bookings/{booking_id}/due-date", dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/bookings/{booking_id}/due-date", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def set_booking_due_date(booking_id: uuid.UUID, due_date: date = Query(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     booking = db.get(Booking, booking_id)
     if booking is None:
@@ -401,13 +505,13 @@ def set_booking_due_date(booking_id: uuid.UUID, due_date: date = Query(...), db:
     return {"booking_id": booking.id, "due_date": booking.due_date}
 
 
-@router.get("/cash-flow", response_model=CashFlowReport, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/cash-flow", response_model=CashFlowReport, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_cash_flow(date_from: date | None = Query(None), date_to: date | None = Query(None), db: Session = Depends(get_db)):
     d_from, d_to = _default_range(date_from, date_to)
     return service.cash_flow(db, d_from, d_to)
 
 
-@router.get("/gst-dashboard", response_model=GstDashboardReport, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/gst-dashboard", response_model=GstDashboardReport, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_gst_dashboard(date_from: date | None = Query(None), date_to: date | None = Query(None), db: Session = Depends(get_db)):
     d_from, d_to = _default_range(date_from, date_to)
     return service.gst_dashboard(db, d_from, d_to)
@@ -415,7 +519,7 @@ def get_gst_dashboard(date_from: date | None = Query(None), date_to: date | None
 
 # --- Utility Readings (electricity, etc, per unit) ---
 
-@router.post("/utility-readings", response_model=UtilityReadingOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/utility-readings", response_model=UtilityReadingOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_utility_reading(payload: UtilityReadingCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     split_options_given = sum([bool(payload.unit_id), bool(payload.shared_unit_ids), bool(payload.manual_allocations)])
     if split_options_given == 0:
@@ -476,7 +580,7 @@ def _utility_reading_out(db: Session, reading: UtilityReading) -> dict:
     }
 
 
-@router.get("/utility-readings", response_model=list[UtilityReadingOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/utility-readings", response_model=list[UtilityReadingOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_utility_readings(unit_id: uuid.UUID | None = None, limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
     query = select(UtilityReading).order_by(UtilityReading.reading_date.desc(), UtilityReading.id)
     if unit_id:
@@ -492,7 +596,7 @@ def list_utility_readings(unit_id: uuid.UUID | None = None, limit: int = Query(2
 
 # --- Purchase Register ---
 
-@router.post("/purchases", response_model=PurchaseRecordOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/purchases", response_model=PurchaseRecordOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_purchase(payload: PurchaseRecordCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     data = payload.model_dump()
     if data["amount"] is None:
@@ -506,7 +610,7 @@ def create_purchase(payload: PurchaseRecordCreate, db: Session = Depends(get_db)
     return purchase
 
 
-@router.get("/purchases", response_model=list[PurchaseRecordOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/purchases", response_model=list[PurchaseRecordOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_purchases(
     date_from: date | None = None,
     date_to: date | None = None,
@@ -525,12 +629,12 @@ def list_purchases(
 
 # --- Daily Cashbook & Closing ---
 
-@router.get("/cashbook", response_model=DailyCashbook, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/cashbook", response_model=DailyCashbook, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_daily_cashbook(cashbook_date: date | None = Query(None), db: Session = Depends(get_db)):
     return service.daily_cashbook(db, cashbook_date or date.today())
 
 
-@router.post("/daily-closing", response_model=DailyClosingOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/daily-closing", response_model=DailyClosingOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_daily_closing(payload: DailyClosingCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     existing = db.scalar(select(DailyClosing).where(DailyClosing.closing_date == payload.closing_date))
     if existing:
@@ -555,7 +659,7 @@ def create_daily_closing(payload: DailyClosingCreate, db: Session = Depends(get_
     return closing
 
 
-@router.get("/daily-closing", response_model=list[DailyClosingOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/daily-closing", response_model=list[DailyClosingOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_daily_closings(date_from: date | None = None, date_to: date | None = None, db: Session = Depends(get_db)):
     query = select(DailyClosing).order_by(DailyClosing.closing_date.desc())
     if date_from:
@@ -567,7 +671,7 @@ def list_daily_closings(date_from: date | None = None, date_to: date | None = No
 
 # --- Apartment-wise P&L ---
 
-@router.get("/apartment-pnl/{unit_id}", response_model=ApartmentPnL, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/apartment-pnl/{unit_id}", response_model=ApartmentPnL, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_apartment_pnl(unit_id: uuid.UUID, period_year: int = Query(...), period_month: int = Query(..., ge=1, le=12), db: Session = Depends(get_db)):
     try:
         return service.apartment_pnl(db, unit_id, period_year, period_month)
@@ -575,7 +679,7 @@ def get_apartment_pnl(unit_id: uuid.UUID, period_year: int = Query(...), period_
         raise HTTPException(404, str(e))
 
 
-@router.get("/property-pnl/{property_id}", response_model=PropertyPnL, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/property-pnl/{property_id}", response_model=PropertyPnL, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_property_pnl(property_id: uuid.UUID, period_year: int = Query(...), period_month: int = Query(..., ge=1, le=12), db: Session = Depends(get_db)):
     try:
         return service.property_pnl(db, property_id, period_year, period_month)
@@ -585,7 +689,7 @@ def get_property_pnl(property_id: uuid.UUID, period_year: int = Query(...), peri
 
 # --- Advances ---
 
-@router.get("/advances", response_model=list[AdvanceSummaryLine], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/advances", response_model=list[AdvanceSummaryLine], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_advance_summary(limit: int = Query(200, ge=1, le=5000), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
     all_lines = service.advance_summary(db)
     return all_lines[offset:offset + limit]
@@ -597,7 +701,7 @@ VALID_FINANCE_REPORTS = ("cashbook", "apartment_pnl", "property_pnl", "expenses"
 VALID_EXPORT_FORMATS = ("pdf", "xlsx")
 
 
-@router.get("/reports/export", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/reports/export", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def export_finance_report(
     report: str = Query(..., description="cashbook | apartment_pnl | property_pnl | expenses | purchases | utility | salary | income_register"),
     format: str = Query(..., description="pdf | xlsx"),
@@ -649,6 +753,7 @@ def export_finance_report(
         subtitle = f"{period_month}/{period_year} — Total Revenue: Rs.{data['total_revenue']} | Net Profit: Rs.{data['net_profit']}"
         headers = ["Unit", "Revenue", "Expenses", "Net Profit"]
         rows = [[u["unit_name"], u["revenue"], u["total_expenses"], u["net_profit"]] for u in data["units"]]
+        rows.append(["Central Expenses (property-wide, not allocated)", "", data["central_expenses"], ""])
         rows.append(["TOTAL", data["total_revenue"], data["total_expenses"], data["net_profit"]])
 
     elif report == "expenses":
@@ -725,7 +830,7 @@ def export_finance_report(
 
 # --- Laundry Register ---
 
-@router.post("/laundry", response_model=LaundryEntryOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/laundry", response_model=LaundryEntryOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_laundry_entry(payload: LaundryEntryCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from app.modules.finance.models import LAUNDRY_ITEM_TYPES
     if payload.item_type not in LAUNDRY_ITEM_TYPES:
@@ -739,7 +844,7 @@ def create_laundry_entry(payload: LaundryEntryCreate, db: Session = Depends(get_
     return entry
 
 
-@router.get("/laundry", response_model=list[LaundryEntryOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/laundry", response_model=list[LaundryEntryOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_laundry_entries(
     date_from: date | None = None,
     date_to: date | None = None,
@@ -758,7 +863,7 @@ def list_laundry_entries(
     return db.scalars(query.offset(offset).limit(limit)).all()
 
 
-@router.get("/laundry/summary", response_model=LaundryMonthlySummary, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/laundry/summary", response_model=LaundryMonthlySummary, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_laundry_summary(period_year: int = Query(...), period_month: int = Query(..., ge=1, le=12), db: Session = Depends(get_db)):
     return service.laundry_monthly_summary(db, period_year, period_month)
 
@@ -775,6 +880,166 @@ def delete_laundry_entry(entry_id: uuid.UUID, db: Session = Depends(get_db), use
 
 # --- Income Register ---
 
-@router.get("/income-register", response_model=IncomeRegister, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/income-register", response_model=IncomeRegister, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_income_register(period_year: int = Query(...), period_month: int = Query(..., ge=1, le=12), db: Session = Depends(get_db)):
     return service.income_register(db, period_year, period_month)
+
+
+# --- Loans / EMI (Phase 19C) ---
+#
+# Admin-only across every read and write, unlike most of this router
+# (which is admin+staff for reads). This follows the OwnerWithdrawal
+# precedent above, not the Expense/Purchase/Utility precedent: a business
+# loan/EMI obligation is sensitive, property-wide financial information,
+# not something front-line staff need for their daily tasks. Staff
+# Operations existing elsewhere in this app does not extend access here.
+
+@router.get("/loans/summary", response_model=LoanSummary, dependencies=[Depends(require_role("admin"))])
+def get_loan_summary(db: Session = Depends(get_db)):
+    # Registered before /loans/{loan_id} so the literal "summary" path
+    # segment is matched first, not swallowed by the loan_id path param.
+    return service.loan_summary(db)
+
+
+@router.post("/loans", response_model=LoanOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+def create_loan(payload: LoanCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if payload.unit_id is not None and db.get(Unit, payload.unit_id) is None:
+        raise HTTPException(404, "Unit not found")
+    loan = Loan(**payload.model_dump(), status="active", created_by=user.id)
+    db.add(loan)
+    db.flush()
+    record_audit_log(db, user.id, "finance.loan.create", entity_type="loan", entity_id=str(loan.id), details=f"{payload.loan_name} ({payload.lender_name}): EMI Rs.{payload.emi_amount}/month")
+    db.commit()
+    db.refresh(loan)
+    return loan
+
+
+@router.get("/loans", response_model=list[LoanOut], dependencies=[Depends(require_role("admin"))])
+def list_loans(
+    status: str | None = None,
+    unit_id: uuid.UUID | None = None,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    query = select(Loan).order_by(Loan.start_date.desc(), Loan.id)
+    if status:
+        query = query.where(Loan.status == status)
+    if unit_id:
+        query = query.where(Loan.unit_id == unit_id)
+    return db.scalars(query.offset(offset).limit(limit)).all()
+
+
+@router.get("/loans/{loan_id}", response_model=LoanOut, dependencies=[Depends(require_role("admin"))])
+def get_loan(loan_id: uuid.UUID, db: Session = Depends(get_db)):
+    loan = db.get(Loan, loan_id)
+    if loan is None:
+        raise HTTPException(404, "Loan not found")
+    return loan
+
+
+@router.patch("/loans/{loan_id}", response_model=LoanOut, dependencies=[Depends(require_role("admin"))])
+def update_loan(loan_id: uuid.UUID, payload: LoanUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    loan = db.get(Loan, loan_id)
+    if loan is None:
+        raise HTTPException(404, "Loan not found")
+
+    data = payload.model_dump(exclude_unset=True)
+
+    if "status" in data and data["status"] is not None:
+        new_status = data["status"]
+        if new_status not in LOAN_STATUSES:
+            raise HTTPException(400, f"Invalid status '{new_status}'. Must be one of {LOAN_STATUSES}")
+        if loan.status == "closed" and new_status != "closed":
+            # closed is terminal — a closed loan record shouldn't be silently
+            # reopened; if that's genuinely needed, it's a new Loan row.
+            raise HTTPException(400, "Cannot change status of a closed loan")
+
+    if "unit_id" in data and data["unit_id"] is not None and db.get(Unit, data["unit_id"]) is None:
+        raise HTTPException(404, "Unit not found")
+
+    new_start = data.get("start_date", loan.start_date)
+    new_end = data.get("end_date", loan.end_date)
+    if new_end is not None and new_end < new_start:
+        raise HTTPException(400, "end_date cannot be before start_date")
+
+    before = f"status={loan.status}, emi=Rs.{loan.emi_amount}"
+    for field, value in data.items():
+        setattr(loan, field, value)
+
+    record_audit_log(
+        db, user.id, "finance.loan.update", entity_type="loan", entity_id=str(loan.id),
+        details=f"Updated {loan.loan_name}", previous_value=before, new_value=f"status={loan.status}, emi=Rs.{loan.emi_amount}",
+    )
+    db.commit()
+    db.refresh(loan)
+    return loan
+
+
+@router.post("/loans/{loan_id}/emi-payments", response_model=LoanEmiPaymentOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+def create_loan_emi_payment(loan_id: uuid.UUID, payload: LoanEmiPaymentCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    loan = db.get(Loan, loan_id)
+    if loan is None:
+        raise HTTPException(404, "Loan not found")
+
+    emi_row = LoanEmiPayment(
+        loan_id=loan_id,
+        due_date=payload.due_date,
+        emi_amount=payload.emi_amount if payload.emi_amount is not None else loan.emi_amount,
+        notes=payload.notes,
+        status="due",
+        created_by=user.id,
+    )
+    db.add(emi_row)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, f"An EMI record for this loan already exists for due date {payload.due_date}")
+
+    record_audit_log(db, user.id, "finance.loan.emi_payment.create", entity_type="loan_emi_payment", entity_id=str(emi_row.id), details=f"{loan.loan_name}: Rs.{emi_row.emi_amount} due {payload.due_date}")
+    db.commit()
+    db.refresh(emi_row)
+    return emi_row
+
+
+@router.get("/loans/{loan_id}/emi-payments", response_model=list[LoanEmiPaymentOut], dependencies=[Depends(require_role("admin"))])
+def list_loan_emi_payments(loan_id: uuid.UUID, status: str | None = None, db: Session = Depends(get_db)):
+    if db.get(Loan, loan_id) is None:
+        raise HTTPException(404, "Loan not found")
+    query = select(LoanEmiPayment).where(LoanEmiPayment.loan_id == loan_id).order_by(LoanEmiPayment.due_date)
+    if status:
+        query = query.where(LoanEmiPayment.status == status)
+    return db.scalars(query).all()
+
+
+@router.patch("/loans/emi-payments/{emi_id}/mark-paid", response_model=LoanEmiPaymentOut, dependencies=[Depends(require_role("admin"))])
+def mark_loan_emi_paid(emi_id: uuid.UUID, payload: LoanEmiMarkPaid, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    # with_for_update locks the row for the rest of this transaction — same
+    # pattern as refund_deposit above — so two near-simultaneous mark-paid
+    # requests for the same EMI can't both read status="due" and both
+    # "win", which would otherwise be possible between the read and write.
+    emi_row = db.get(LoanEmiPayment, emi_id, with_for_update=True)
+    if emi_row is None:
+        raise HTTPException(404, "EMI record not found")
+
+    if emi_row.status == "paid":
+        # Idempotent no-op: repeating an already-applied mark-paid request
+        # returns the existing paid state unchanged rather than shifting
+        # paid_date/paid_amount or creating a second payment record.
+        return emi_row
+
+    emi_row.status = "paid"
+    emi_row.paid_date = payload.paid_date or date.today()
+    emi_row.paid_amount = payload.paid_amount if payload.paid_amount is not None else float(emi_row.emi_amount)
+    emi_row.reference_number = payload.reference_number
+    if payload.notes:
+        emi_row.notes = f"{emi_row.notes or ''}\n{payload.notes}".strip()
+
+    record_audit_log(
+        db, user.id, "finance.loan.emi_payment.mark_paid", entity_type="loan_emi_payment", entity_id=str(emi_row.id),
+        details=f"Rs.{emi_row.paid_amount} paid on {emi_row.paid_date}",
+    )
+    db.commit()
+    db.refresh(emi_row)
+    return emi_row

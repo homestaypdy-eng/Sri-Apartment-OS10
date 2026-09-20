@@ -1,14 +1,16 @@
-import type { InquiryOut } from "../lib/api";
+import { useEffect, useState } from "react";
+import { api, type BankSettingsOut, type InquiryOut } from "../lib/api";
 import { Button } from "./ui";
 import logo from "../assets/logo.png";
 import qrCode from "../assets/payment_qr.png";
 
 const TERMS = [
-  "This is a pre-booking offer, valid up to the date above.",
-  "Rates are subject to change after the validity date.",
-  "Pre-booking is subject to availability of the room.",
-  "Advance payment is required to confirm booking.",
-  "ID proof is mandatory at the time of check-in.",
+  "This is a pre-booking offer, valid up to the date shown above.",
+  "Rates are subject to validity & availability.",
+  "Booking is confirmed only after receipt of required advance payment.",
+  "Check-in: 12:30 PM  |  Check-out: 11:00 AM.",
+  "Early check-in / late check-out subject to availability & charges.",
+  "Valid government-issued ID proof is mandatory at check-in.",
 ];
 const HOUSE_RULES = [
   "No smoking inside the property.",
@@ -16,9 +18,9 @@ const HOUSE_RULES = [
   "Maintain cleanliness & respect the property.",
 ];
 const CANCELLATION_POLICY = [
-  "Full refund if cancelled 48 hrs before check-in.",
-  "No refund after that window.",
-  "Confirm booking by paying the advance amount.",
+  "Cancellation requests must be submitted through WhatsApp or email.",
+  "Full refund for cancellations received at least 48 hours before check-in.",
+  "No refund for cancellations received within 48 hours before check-in or after check-in.",
 ];
 
 export default function QuotationPopup({
@@ -44,6 +46,20 @@ export default function QuotationPopup({
   onSendEmail: () => void;
   sendingEmail: boolean;
 }) {
+  // RBAC Phase A: bank details are Admin-only (GET /settings/bank) — this
+  // on-screen preview fetches the current, real values instead of the old
+  // hardcoded literals so it can never drift from what's actually
+  // configured. Staying null (the GET 403ing for Staff/Manager) is what
+  // keeps this section hidden from them here, matching the same boundary
+  // already enforced everywhere else BankSettings is read.
+  const [bank, setBank] = useState<BankSettingsOut | null>(null);
+  useEffect(() => {
+    api
+      .get("/settings/bank")
+      .then(({ data }) => setBank(data))
+      .catch(() => setBank(null));
+  }, []);
+
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-xl shadow-xl max-w-3xl w-full max-h-[90vh] overflow-y-auto">
@@ -54,7 +70,7 @@ export default function QuotationPopup({
               <img src={logo} alt="Sri Apartment Homestay" className="w-16 h-16 object-contain" />
               <div>
                 <p className="font-bold text-sm text-slate-900">SRI APARTMENT HOMESTAY</p>
-                <p className="italic text-amber-700 text-[11px]">Luxury 2BHK Family Homestay</p>
+                <p className="italic text-amber-700 text-[11px]">Comfortable Stays in the Heart of Puducherry</p>
                 <p className="text-[10px] text-slate-500 max-w-xs">
                   163, 2nd Cross Street, Ranga Nagar, Moolakulam, Puducherry - 605010
                 </p>
@@ -87,6 +103,10 @@ export default function QuotationPopup({
               </p>
             </div>
           </div>
+
+          <p className="text-center italic text-slate-500 text-[9px] mb-3">
+            This quotation is not a tax invoice. A tax invoice will be issued as applicable.
+          </p>
 
           {/* Client / Stay details */}
           <div className="grid grid-cols-2 gap-6 mb-3">
@@ -186,24 +206,28 @@ export default function QuotationPopup({
 
           {/* Bank / Signatory / QR */}
           <div className="grid grid-cols-3 gap-4 items-start border-t border-amber-600 pt-3">
-            <div>
-              <p className="font-bold text-slate-900 mb-1">BANK DETAILS</p>
-              <p className="text-slate-600 text-[9.5px]">Bank: Axis Bank</p>
-              <p className="text-slate-600 text-[9.5px]">A/C Name: Sri Apartment</p>
-              <p className="text-slate-600 text-[9.5px]">A/C No: 925020053638481</p>
-              <p className="text-slate-600 text-[9.5px]">IFSC: UTIB0003923</p>
-            </div>
+            {bank && (
+              <div>
+                <p className="font-bold text-slate-900 mb-1">BANK DETAILS</p>
+                <p className="text-slate-600 text-[9.5px]">Bank: {bank.bank_name}</p>
+                <p className="text-slate-600 text-[9.5px]">A/C Name: {bank.bank_account_name}</p>
+                <p className="text-slate-600 text-[9.5px]">A/C No: {bank.bank_account_number}</p>
+                <p className="text-slate-600 text-[9.5px]">IFSC: {bank.bank_ifsc}</p>
+              </div>
+            )}
             <div>
               <p className="font-bold text-slate-900 mb-1">AUTHORISED SIGNATORY</p>
               <p className="text-slate-600 text-[9.5px]">For SRI APARTMENT HOMESTAY</p>
               <p className="mt-4 text-slate-800 text-[9.5px] font-medium">S. Sundaramurthy</p>
               <p className="text-slate-500 text-[9px]">Proprietor</p>
             </div>
-            <div className="text-center">
-              <p className="font-bold text-slate-900 mb-1">SCAN &amp; PAY</p>
-              <img src={qrCode} alt="Payment QR code" className="w-20 h-20 object-contain mx-auto" />
-              <p className="text-slate-500 text-[9px] mt-1">UPI: 8870237237@axisbank</p>
-            </div>
+            {bank && (
+              <div className="text-center">
+                <p className="font-bold text-slate-900 mb-1">SCAN &amp; PAY</p>
+                <img src={qrCode} alt="Payment QR code" className="w-20 h-20 object-contain mx-auto" />
+                <p className="text-slate-500 text-[9px] mt-1">UPI: {bank.upi_id}</p>
+              </div>
+            )}
           </div>
 
           <p className="text-center italic text-slate-900 font-semibold text-[10px] mt-4 pt-2 border-t border-amber-600">

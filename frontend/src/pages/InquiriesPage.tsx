@@ -47,6 +47,12 @@ export default function InquiriesPage() {
   const [sendingEmail, setSendingEmail] = useState<string | null>(null);
   const [priceQuote, setPriceQuote] = useState<PriceQuoteOut | null>(null);
   const [loadingQuote, setLoadingQuote] = useState(false);
+  // unit_id -> available, for whatever check_in/check_out are currently
+  // selected. null (not just missing) means "not checked yet for these
+  // dates" — used to tell "no dates picked" apart from "every unit is
+  // actually booked", which render differently below.
+  const [unitAvailability, setUnitAvailability] = useState<Record<string, boolean> | null>(null);
+  const [checkingAvailability, setCheckingAvailability] = useState(false);
   const [manualOverride, setManualOverride] = useState(false);
   const [overrideReason, setOverrideReason] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -113,6 +119,45 @@ export default function InquiriesPage() {
     }, 300);
     return () => clearTimeout(timeout);
   }, [form.unit_id, form.check_in_date, form.check_out_date, manualOverride]);
+
+  // Live availability for every unit, from the same backend check OS10's
+  // booking form and the public website both use (app/shared/availability.py)
+  // — not a separate frontend algorithm. Runs off dates alone (not the
+  // selected unit), so the picker below can grey out/disable whichever
+  // units are actually taken as soon as both dates are known.
+  useEffect(() => {
+    if (!form.check_in_date || !form.check_out_date || form.check_out_date <= form.check_in_date) {
+      setUnitAvailability(null);
+      return;
+    }
+    setCheckingAvailability(true);
+    const timeout = setTimeout(async () => {
+      try {
+        const { data } = await api.get("/units/availability", {
+          params: { check_in: form.check_in_date, check_out: form.check_out_date },
+        });
+        const byId: Record<string, boolean> = {};
+        for (const row of data as { unit_id: string; available: boolean }[]) byId[row.unit_id] = row.available;
+        setUnitAvailability(byId);
+      } catch {
+        setUnitAvailability(null);
+      } finally {
+        setCheckingAvailability(false);
+      }
+    }, 300);
+    return () => clearTimeout(timeout);
+  }, [form.check_in_date, form.check_out_date]);
+
+  // If the currently-selected unit turns out to be unavailable for
+  // whatever dates are now chosen (picked before the dates were set, or
+  // the dates changed afterward), clear the selection instead of silently
+  // letting staff submit a booking that create_booking will reject anyway.
+  useEffect(() => {
+    if (form.unit_id && unitAvailability && unitAvailability[form.unit_id] === false) {
+      setForm((f) => ({ ...f, unit_id: "" }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unitAvailability]);
 
   function handleStartEdit(inq: InquiryOut) {
     setForm({
@@ -425,12 +470,24 @@ export default function InquiriesPage() {
             className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
           >
             <option value="">Link to an existing unit (optional)...</option>
-            {units.map((u) => (
-              <option key={u.id} value={u.id}>
-                {u.name} (₹{u.base_rate}/night)
-              </option>
-            ))}
+            {units.map((u) => {
+              // No dates picked yet -> don't restrict anything. Once dates
+              // are picked, the batch endpoint only returns bookable
+              // (available-status, active) units at all, so a unit that's
+              // simply missing from the response (maintenance/inactive)
+              // must be treated as unavailable, not available-by-default.
+              const available = !unitAvailability ? true : unitAvailability[u.id] === true;
+              return (
+                <option key={u.id} value={u.id} disabled={!available}>
+                  {u.name} (₹{u.base_rate}/night){!available ? " — Unavailable for these dates" : ""}
+                </option>
+              );
+            })}
           </select>
+          {checkingAvailability && <p className="text-xs text-slate-400">Checking availability...</p>}
+          {!checkingAvailability && unitAvailability && Object.keys(unitAvailability).length > 0 && Object.values(unitAvailability).every((v) => v === false) && (
+            <p className="text-xs font-medium text-red-600">No availability for the selected dates.</p>
+          )}
 
           <input
             required

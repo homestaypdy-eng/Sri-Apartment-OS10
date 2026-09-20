@@ -23,23 +23,75 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # OS10-TEST-ISOLATION-01: a fully separate Postgres instance dedicated to
+  # pytest. Different container, different volume, different database name,
+  # different host port — never the same server or database as `db` above.
+  # See backend/tests/conftest.py for the safety guard that refuses to run
+  # any test if this isn't what's actually configured.
+  test-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_TEST_DB:-sri_apartment_os_test}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata_test:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   backend:
     build: ./backend
     depends_on:
       db:
         condition: service_healthy
+      test-db:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@db:5432/${POSTGRES_DB:-sri_apartment_os}
+      # OS10-TEST-ISOLATION-01: the ONLY database pytest is allowed to use
+      # (see backend/tests/conftest.py). Separate service (test-db), never db.
+      TEST_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@test-db:5432/${POSTGRES_TEST_DB:-sri_apartment_os_test}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set in .env}
+      # RBAC Phase A: only consumed once, at first seed, to create the
+      # initial admin account (see backend/app/db/seed.py). Empty is fine
+      # on every run after that first one, since the admin already exists.
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-homestaypdy@gmail.com}
+      # Base URL of the public customer-facing website — password-reset
+      # links and, since Phase 3G, every redirect back to the frontend
+      # after a Google OAuth attempt. Production sets this to
+      # https://sriapartment.in.
+      CUSTOMER_PORTAL_BASE_URL: ${CUSTOMER_PORTAL_BASE_URL:-http://localhost:5175}
+      # Google OAuth (customer-facing "Continue with Google") — blank
+      # keeps the honest "not configured" 501 behavior. Production sets
+      # GOOGLE_REDIRECT_URI to its own public API domain, e.g.
+      # https://api.sriapartment.in/api/v1/customer-auth/oauth/google/callback
+      # — see backend/.env.example and customer_auth/oauth_router.py's
+      # module docstring for the full Google Cloud Console setup.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/v1/customer-auth/oauth/google/callback}
       RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
       RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
       RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      ZOTEL_BASE_URL: ${ZOTEL_BASE_URL:-}
+      ZOTEL_API_KEY: ${ZOTEL_API_KEY:-}
+      ZOTEL_API_SECRET: ${ZOTEL_API_SECRET:-}
+      ZOTEL_HOTEL_ID: ${ZOTEL_HOTEL_ID:-}
+      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:-v19.0}
       ENABLE_SCHEDULER: ${ENABLE_SCHEDULER:-false}
       REMINDER_SCAN_INTERVAL_MINUTES: ${REMINDER_SCAN_INTERVAL_MINUTES:-60}
       ENVIRONMENT: ${ENVIRONMENT:-production}
@@ -94,6 +146,7 @@ services:
 
 volumes:
   pgdata:
+  pgdata_test:
   uploads_reports:
   uploads_attachments:
   uploads_hk_photos:

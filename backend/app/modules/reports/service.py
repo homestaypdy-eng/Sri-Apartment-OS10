@@ -101,15 +101,21 @@ def gst_totals(db: Session, date_from: date, date_to: date, property_id: uuid.UU
 
 
 def _maintenance_cost_total(db: Session, date_from: date, date_to: date, property_id: uuid.UUID | None) -> float:
-    start = datetime.combine(date_from, time.min, tzinfo=timezone.utc)
-    end = datetime.combine(date_to, time.min, tzinfo=timezone.utc)
-
-    query = select(func.coalesce(func.sum(MaintenanceTicket.cost), 0)).where(
-        MaintenanceTicket.resolved_at >= start,
-        MaintenanceTicket.resolved_at < end,
+    """
+    Phase 19D Decision 4: reads the canonical Finance Expense record
+    (category="maintenance", auto-synced on ticket resolution — see
+    maintenance/router.py::update_ticket) instead of MaintenanceTicket.cost
+    directly. Closes the dual-storage divergence risk documented in the
+    Phase 19D-A analysis: a cost corrected directly in Finance after ticket
+    resolution now shows up here too, since both read the same row.
+    """
+    query = select(func.coalesce(func.sum(Expense.amount), 0)).where(
+        Expense.category == "maintenance",
+        Expense.expense_date >= date_from,
+        Expense.expense_date < date_to,
     )
     if property_id:
-        query = query.join(Unit, MaintenanceTicket.unit_id == Unit.id).where(Unit.property_id == property_id)
+        query = query.join(Unit, Expense.unit_id == Unit.id).where(Unit.property_id == property_id)
 
     return float(db.execute(query).scalar())
 
@@ -800,6 +806,262 @@ def build_attention_items(
 
     items.sort(key=lambda i: (_ATTENTION_SEVERITY_RANK[i["severity"]], _ATTENTION_CATEGORY_RANK[i["category"]]))
     return items
+
+
+_AI_STRATEGIST_TOP_N = 5
+
+
+def build_ai_strategist_bundle(db: Session, date_from: date, date_to: date, property_id: uuid.UUID | None = None) -> dict:
+    """
+    Read-only aggregator for the future AI Strategist (Phase 13). Every
+    number here comes from an existing, already-tested calculation —
+    build_summary(), build_cancellation_report(), build_unit_performance(),
+    outstanding_payments(), gst_dashboard(), build_attention_items() — none
+    of it is recomputed with a new formula. The one exception is the
+    guest-segment block below, which mirrors (does not import) the exact
+    formulas in bookings/router.py's list_guest_segments(), to avoid
+    modifying that already-shipped, tested endpoint just to extract a
+    shared helper — a dedicated test cross-checks the two never drift.
+
+    Revenue uses the Reports Center definition (rate_applied x nights +
+    extra_guest_charge) — the SAME definition Apartment P&L/Income
+    Register do NOT use (room-rate only, no extra_guest_charge). This is
+    labeled explicitly in the response so a future AI consumer never
+    conflates the two, per the still-unreconciled 10C-2 finding.
+
+    Query cost: ~25 fixed, bounded queries across 9 independent data
+    domains — none scale with guest or unit count (no per-row loop issues
+    a query per item; every fetch is either one aggregate query or one
+    IN-query over an already-bounded id set). This is higher than any
+    single existing endpoint because it replaces what would otherwise be
+    7+ separate calls for an AI Strategist to assemble itself — an
+    accepted trade for an admin-only, on-demand endpoint, not something
+    polled on an interval like the Dashboard. Units are independently
+    re-fetched by build_summary() (x2, current+previous), by
+    build_unit_performance(), and once more here for attention items'
+    unit_by_id — three small, bounded "select all units" queries rather
+    than one shared fetch, since none of those existing functions expose
+    a way to inject a pre-fetched unit list without modifying them.
+
+    Phase 19F added a 10th domain, `finance` — delegated entirely to
+    finance/service.py::financial_snapshot(), which is itself built only
+    from existing canonical Finance/Loan/OTA calculations (property_pnl,
+    cash_flow, budget_vs_actual, loan_summary, ota_commission_report,
+    ota_reconciliation_lines, ota_missing_commissions, outstanding_payments).
+    This adds a bounded number of additional queries (one property_pnl per
+    Property row, still not scaling with guest count) but recomputes
+    nothing — see that function's own docstring for the exact source of
+    every figure. The decision engine (decision_engine.py) does not read
+    this key in Phase 19F; it remains pure FACTS with no signal/insight/
+    recommendation generated from it.
+    """
+    from app.modules.bookings.models import Guest
+    from app.modules.finance.service import financial_snapshot as _financial_snapshot
+    from app.modules.finance.service import gst_dashboard as _gst_dashboard
+    from app.modules.inventory.models import InventoryItem
+    from app.modules.portal.models import GuestRequest
+
+    n_days = max((date_to - date_from).days, 1)
+    prev_date_to = date_from
+    prev_date_from = date_from - timedelta(days=n_days)
+
+    def _pct_change(curr: float, prev: float) -> float | None:
+        if prev == 0:
+            return None
+        return round((curr - prev) / prev * 100, 2)
+
+    revenue_definition = (
+        "Reports Center definition: room rate x nights + extra_guest_charge. "
+        "NOT the same as Apartment P&L/Income Register, which exclude extra_guest_charge."
+    )
+
+    # --- Business Health: revenue/occupancy/ADR/RevPAR, current vs previous ---
+    current_summary = build_summary(db, date_from, date_to, property_id)
+    previous_summary = build_summary(db, prev_date_from, prev_date_to, property_id)
+
+    business_health = {
+        "current_period": {"date_from": date_from, "date_to": date_to},
+        "previous_period": {"date_from": prev_date_from, "date_to": prev_date_to},
+        "revenue_current": current_summary["revenue"]["total"],
+        "revenue_previous": previous_summary["revenue"]["total"],
+        "revenue_definition": revenue_definition,
+        "occupancy": {
+            "current": current_summary["occupancy_rate_percent"],
+            "previous": previous_summary["occupancy_rate_percent"],
+            "change_percent": _pct_change(current_summary["occupancy_rate_percent"], previous_summary["occupancy_rate_percent"]),
+            "change_percentage_points": round(current_summary["occupancy_rate_percent"] - previous_summary["occupancy_rate_percent"], 2),
+        },
+        "adr": {
+            "current": current_summary["adr"],
+            "previous": previous_summary["adr"],
+            "change_percent": _pct_change(current_summary["adr"], previous_summary["adr"]),
+        },
+        "revpar": {
+            "current": current_summary["revpar"],
+            "previous": previous_summary["revpar"],
+            "change_percent": _pct_change(current_summary["revpar"], previous_summary["revpar"]),
+        },
+    }
+
+    # --- Needs Attention: reuse build_attention_items() unchanged, no new ranking ---
+    # NOTE: outstanding_payments()/attention items are portfolio-wide only —
+    # the underlying functions take no property_id parameter, matching
+    # their existing behavior in operational_dashboard(); not extended here.
+    today = date.today()
+    units = _get_units(db, property_id)
+    unit_by_id = {u.id: u for u in units}
+    outstanding = outstanding_payments(db)
+    open_guest_requests = db.scalars(select(GuestRequest).where(GuestRequest.status != "resolved")).all()
+    open_maintenance_tickets = db.scalars(select(MaintenanceTicket).where(MaintenanceTicket.status.in_(("open", "in_progress")))).all()
+    low_stock_items = db.scalars(select(InventoryItem).where(InventoryItem.current_stock <= InventoryItem.minimum_stock)).all()
+
+    attention_items = build_attention_items(
+        db, today, outstanding=outstanding,
+        open_guest_requests=open_guest_requests, open_maintenance_tickets=open_maintenance_tickets,
+        low_stock_items=low_stock_items, unit_by_id=unit_by_id,
+    )
+
+    # --- Cancellations: reuse build_cancellation_report() unchanged ---
+    cancellation_report = build_cancellation_report(db, date_from, date_to, property_id)
+    cancellations = {
+        "current_period": cancellation_report["current_period"],
+        "previous_period": cancellation_report["previous_period"],
+        "total_bookings_in_period": cancellation_report["total_bookings_in_period"],
+        "cancelled_count": cancellation_report["cancelled_count"],
+        "cancellation_rate_percent": cancellation_report["cancellation_rate_percent"],
+        "no_show_count": cancellation_report["no_show_count"],
+        "no_show_rate_percent": cancellation_report["no_show_rate_percent"],
+    }
+
+    # --- Outstanding Payments: reuses the SAME fetch already made for attention items, zero extra queries ---
+    total_pending_balance = round(sum(o["pending_balance"] for o in outstanding), 2)
+    overdue = [o for o in outstanding if o["is_overdue"]]
+    outstanding_summary = {
+        "total_pending_balance": total_pending_balance,
+        "pending_count": len(outstanding),
+        "overdue_count": len(overdue),
+        "overdue_amount": round(sum(o["pending_balance"] for o in overdue), 2),
+    }
+
+    # --- Unit Performance: top/bottom N by revenue, reusing build_unit_performance() unchanged ---
+    unit_perf = build_unit_performance(db, date_from, date_to, property_id)  # already sorted by revenue desc
+    days_in_range = max((date_to - date_from).days, 1)
+
+    def _with_revpar(rows):
+        # RevPAR = revenue / days_in_range — the same identity build_summary()
+        # already uses at portfolio scale (available_room_nights reduces to
+        # days_in_range for a single unit), applied per-unit exactly as
+        # ReportsPage.tsx already does client-side (10C-1) — not a new formula.
+        return [{
+            "unit_id": r["unit_id"], "unit_name": r["unit_name"], "revenue": r["revenue"],
+            "occupancy_rate_percent": r["occupancy_rate_percent"], "adr": r["adr"],
+            "revpar": round(r["revenue"] / days_in_range, 2),
+        } for r in rows]
+
+    if len(unit_perf) > _AI_STRATEGIST_TOP_N:
+        top_units = _with_revpar(unit_perf[:_AI_STRATEGIST_TOP_N])
+        bottom_units = _with_revpar(list(reversed(unit_perf[-_AI_STRATEGIST_TOP_N:])))
+    else:
+        # Too few units for a meaningful top/bottom split — avoid showing
+        # the same units twice under two different labels.
+        top_units = _with_revpar(unit_perf)
+        bottom_units = []
+
+    unit_performance = {
+        "current_period": {"date_from": date_from, "date_to": date_to},
+        "top_units": top_units,
+        "bottom_units": bottom_units,
+    }
+
+    # --- Booking Sources: reuses revenue_by_source already computed by build_summary() above, zero extra queries ---
+    booking_sources = {
+        "current_period": {"date_from": date_from, "date_to": date_to},
+        "revenue_by_source": current_summary["revenue"]["by_source"],
+        "revenue_definition": revenue_definition,
+    }
+
+    # --- Guest Intelligence: top-N by total_spent, mirroring list_guest_segments()'s exact formulas ---
+    guests = db.scalars(select(Guest).where(Guest.merged_into_guest_id.is_(None))).all()
+    guest_ids = [g.id for g in guests]
+    bookings_by_guest: dict = defaultdict(list)
+    if guest_ids:
+        for b in db.scalars(select(Booking).where(Booking.guest_id.in_(guest_ids))).all():
+            bookings_by_guest[b.guest_id].append(b)
+    booking_ids = [b.id for blist in bookings_by_guest.values() for b in blist]
+    spend_by_booking: dict = defaultdict(float)
+    if booking_ids:
+        for p in db.scalars(select(Payment).where(Payment.booking_id.in_(booking_ids))).all():
+            spend_by_booking[p.booking_id] += float(p.amount)
+
+    guest_rows = []
+    for g in guests:
+        g_bookings = bookings_by_guest.get(g.id, [])
+        total_bookings_g = len(g_bookings)
+        is_repeat = total_bookings_g > 1  # same rule as list_guest_segments()/GuestHistory.is_repeat_guest
+        total_spent = round(sum(spend_by_booking.get(b.id, 0.0) for b in g_bookings), 2)
+        latest = max(g_bookings, key=lambda b: b.check_in) if g_bookings else None
+        guest_rows.append({
+            "guest_id": str(g.id), "name": g.name, "is_repeat_guest": is_repeat,
+            "total_bookings": total_bookings_g, "total_spent": total_spent,
+            "latest_source": latest.source if latest else None,
+            "last_stay": latest.check_in if latest else None,
+        })
+    guest_rows.sort(key=lambda r: r["total_spent"], reverse=True)
+    top_guests = guest_rows[:_AI_STRATEGIST_TOP_N]
+
+    # --- Maintenance: reuses build_summary()'s own already-computed total, zero extra queries ---
+    maintenance = {
+        "current_period": {"date_from": date_from, "date_to": date_to},
+        "maintenance_cost_total": current_summary["maintenance_cost_total"],
+    }
+
+    # --- GST: existing Finance "GST Dashboard" figures specifically (gst_payable/ITC split),
+    # NOT reports' narrower gst_totals() — the two are genuinely different calculations. ---
+    gst_dash = _gst_dashboard(db, date_from, date_to)
+    gst = {
+        "current_period": {"date_from": date_from, "date_to": date_to},
+        "gst_collected": gst_dash["gst_collected"],
+        "gst_input_credit_eligible": gst_dash["gst_input_credit_eligible"],
+        "gst_payable": gst_dash["gst_payable"],
+    }
+
+    # --- Deterministic "This Week" facts: facts/derived metrics only, zero
+    # extra queries (everything below is already computed above), and
+    # deliberately no narrative or causal claims. ---
+    weekly_facts = [
+        {"label": "Total bookings this period", "value": str(current_summary["total_bookings"]), "category": "fact"},
+        {"label": "Cancellation rate this period", "value": f"{cancellations['cancellation_rate_percent']}%", "category": "derived_metric"},
+        {"label": "Outstanding balance right now", "value": f"₹{total_pending_balance:,.2f} across {len(outstanding)} booking(s)", "category": "fact"},
+        {"label": "Items needing attention today", "value": str(len(attention_items)), "category": "fact"},
+    ]
+    if top_units:
+        weekly_facts.append({
+            "label": "Highest-revenue unit this period",
+            "value": f"{top_units[0]['unit_name']} (₹{top_units[0]['revenue']:,.2f})",
+            "category": "fact",
+        })
+
+    # --- Phase 19F: Finance/P&L/Cash Flow/Loan-EMI/OTA reconciliation
+    # context — entirely delegated to finance/service.py::financial_snapshot,
+    # which itself only reuses already-existing canonical Finance
+    # calculations. See that function's docstring for the exact source of
+    # every figure. FACTS only — the decision engine does not read this key.
+    finance = _financial_snapshot(db, date_from, date_to, revenue_total=current_summary["revenue"]["total"], property_id=property_id)
+
+    return {
+        "generated_at": datetime.now(timezone.utc),
+        "business_health": business_health,
+        "needs_attention": attention_items,
+        "cancellations": cancellations,
+        "outstanding_payments": outstanding_summary,
+        "unit_performance": unit_performance,
+        "booking_sources": booking_sources,
+        "top_guests": top_guests,
+        "maintenance": maintenance,
+        "gst": gst,
+        "weekly_facts": weekly_facts,
+        "finance": finance,
+    }
 
 
 def _pdf_safe(text) -> str:

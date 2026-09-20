@@ -22,12 +22,17 @@ MAX_ATTEMPTS = 5
 WINDOW_SECONDS = 300  # 5 minutes
 
 
-def is_rate_limited(key: str) -> bool:
+def is_rate_limited(key: str, max_attempts: int = MAX_ATTEMPTS, window_seconds: int = WINDOW_SECONDS) -> bool:
+    """max_attempts/window_seconds are optional overrides — every existing
+    caller (staff login) omits them and keeps today's exact 5/5min
+    behavior. Added so the phone-OTP endpoints can apply their own
+    distinct thresholds (per-IP vs per-phone) through this same proven
+    mechanism instead of a second, parallel rate-limiting module."""
     now = time.time()
     with _lock:
-        attempts = [t for t in _attempts[key] if now - t < WINDOW_SECONDS]
+        attempts = [t for t in _attempts[key] if now - t < window_seconds]
         _attempts[key] = attempts
-        return len(attempts) >= MAX_ATTEMPTS
+        return len(attempts) >= max_attempts
 
 
 def record_attempt(key: str) -> None:

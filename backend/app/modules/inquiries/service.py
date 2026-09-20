@@ -38,7 +38,7 @@ _DEFAULT_QR_PATH = os.path.join(ASSETS_DIR, "payment_qr.png")
 
 _DEFAULT_COMPANY = {
     "name": "SRI APARTMENT HOMESTAY",
-    "tagline": "Luxury 2BHK Family Homestay",
+    "tagline": "Comfortable Stays in the Heart of Puducherry",
     "address": "163, 2nd Cross Street, Ranga Nagar, Moolakulam, Puducherry - 605010",
     "contact": "+91 88702 37237   |   homestaypdy@gmail.com",
     "gstin": "34PACPS5159H1Z5",
@@ -48,22 +48,32 @@ _DEFAULT_COMPANY = {
 }
 
 _DEFAULT_BANK = {
-    "bank_name": "Axis Bank",
-    "ac_name": "Sri Apartment",
-    "ac_number": "925020053638481",
-    "ifsc": "UTIB0003923",
-    "branch": "Puducherry Branch",
-    "upi_id": "8870237237@axisbank",
+    # Bank Account Migration: this fallback is only ever reached when
+    # generate_quotation_pdf() is called with bank_settings=None — real
+    # request-handling call sites in inquiries/router.py always pass a real
+    # BankSettings row via get_or_create_bank_settings(db), which never
+    # returns None, so this path is unreachable in normal operation (only
+    # a narrow test that constructs a PDF with no DB session at all hits
+    # it). Left intentionally blank rather than any real bank's details —
+    # BankSettings (see settings/models.py) is the one place real bank
+    # data belongs now.
+    "bank_name": "",
+    "ac_name": "",
+    "ac_number": "",
+    "ifsc": "",
+    "branch": "",
+    "upi_id": "",
     "signatory": "S. Sundaramurthy",
     "signatory_title": "Proprietor",
 }
 
 _DEFAULT_TERMS = [
-    "This is a pre-booking offer, valid up to the date above.",
-    "Rates are subject to change after the validity date.",
-    "Pre-booking is subject to availability of the room.",
-    "Advance payment is required to confirm booking.",
-    "ID proof is mandatory at the time of check-in.",
+    "This is a pre-booking offer, valid up to the date shown above.",
+    "Rates are subject to validity & availability.",
+    "Booking is confirmed only after receipt of required advance payment.",
+    "Check-in: 12:30 PM  |  Check-out: 11:00 AM.",
+    "Early check-in / late check-out subject to availability & charges.",
+    "Valid government-issued ID proof is mandatory at check-in.",
 ]
 _DEFAULT_HOUSE_RULES = [
     "No smoking inside the property.",
@@ -71,35 +81,61 @@ _DEFAULT_HOUSE_RULES = [
     "Maintain cleanliness & respect the property.",
 ]
 _DEFAULT_CANCELLATION_POLICY = [
-    "Full refund if cancelled 48 hrs before check-in.",
-    "No refund after that window.",
-    "Confirm booking by paying the advance amount.",
+    "Cancellation requests must be submitted through WhatsApp or email.",
+    "Full refund for cancellations received at least 48 hours before check-in.",
+    "No refund for cancellations received within 48 hours before check-in or after check-in.",
 ]
 
+# Real, self-declared data only (Unit.unit_type — see properties/models.py's
+# UNIT_TYPES) — mirrors the label vocabulary already used on the public
+# website (src/lib/accommodationTypes.ts) so "Apartment" etc. reads the same
+# everywhere. Falls back to a title-cased version of the raw value for any
+# type not in this list, exactly like the website does, rather than
+# inventing bedroom-count/description text no field on Unit actually stores.
+_UNIT_TYPE_LABELS = {
+    "apartment": "Apartment",
+    "villa": "Villa",
+    "suite": "Suite",
+    "room": "Room",
+    "cottage": "Cottage",
+    "resort": "Resort Unit",
+    "other": "Other",
+}
 
-def _pdf_context(business_settings=None) -> dict:
+
+def _apartment_display(inquiry) -> str:
+    unit = getattr(inquiry, "unit", None)
+    if unit is not None and getattr(unit, "unit_type", None):
+        label = _UNIT_TYPE_LABELS.get(unit.unit_type, unit.unit_type.replace("_", " ").title())
+        # Plain ASCII hyphen, not an en-dash: FPDF's core "Helvetica" font
+        # is Latin-1 only and raises FPDFUnicodeEncodingException on "–".
+        return f"{label} - {inquiry.flat_room_label}"
+    return inquiry.flat_room_label
+
+
+def _pdf_context(business_settings=None, bank_settings=None) -> dict:
     """
     Builds the company/bank/document-text values a quotation PDF needs,
-    from BusinessSettings if a row is provided, falling back to the
-    original hardcoded defaults above otherwise (e.g. if called without a
-    DB session, as some tests do). This is the single place PDF generation
-    reads business info from — Settings is the source of truth once a
-    settings row exists, per the "no hardcoded values" requirement.
-    """
-    if business_settings is None:
-        return {
-            "company": _DEFAULT_COMPANY,
-            "bank": _DEFAULT_BANK,
-            "terms": _DEFAULT_TERMS,
-            "house_rules": _DEFAULT_HOUSE_RULES,
-            "cancellation_policy": _DEFAULT_CANCELLATION_POLICY,
-            "logo_path": _DEFAULT_LOGO_PATH,
-            "qr_path": _DEFAULT_QR_PATH,
-        }
+    from BusinessSettings/BankSettings if rows are provided, falling back
+    to the original hardcoded defaults above otherwise (e.g. if called
+    without a DB session, as some tests do). This is the single place PDF
+    generation reads business info from — Settings is the source of truth
+    once settings rows exist, per the "no hardcoded values" requirement.
 
-    s = business_settings
-    return {
-        "company": {
+    RBAC Phase A: bank/UPI fields moved out of BusinessSettings into their
+    own admin-only BankSettings table — bank_settings is now a second,
+    independent optional argument rather than a sub-object of
+    business_settings. Passing business_settings without bank_settings
+    (or vice versa) is valid; each falls back to its own defaults
+    independently.
+    """
+    company = _DEFAULT_COMPANY
+    terms, house_rules, cancellation_policy = _DEFAULT_TERMS, _DEFAULT_HOUSE_RULES, _DEFAULT_CANCELLATION_POLICY
+    logo_path, qr_path = _DEFAULT_LOGO_PATH, _DEFAULT_QR_PATH
+
+    if business_settings is not None:
+        s = business_settings
+        company = {
             "name": s.company_name,
             "tagline": s.tagline,
             "address": s.address,
@@ -108,22 +144,46 @@ def _pdf_context(business_settings=None) -> dict:
             "udyam": s.udyam_number,
             "sac_line": f"SAC Code: 996311 (Accommodation)  |  State Code: {s.state_code} (Puducherry)",
             "place_of_supply": f"Puducherry ({s.state_code})",
-        },
-        "bank": {
-            "bank_name": s.bank_name,
-            "ac_name": s.bank_account_name,
-            "ac_number": s.bank_account_number,
-            "ifsc": s.bank_ifsc,
-            "branch": s.bank_branch,
-            "upi_id": s.upi_id,
-            "signatory": s.signatory_name,
-            "signatory_title": s.signatory_title,
-        },
-        "terms": [line for line in s.quotation_terms.split("\n") if line.strip()] or _DEFAULT_TERMS,
-        "house_rules": [line for line in s.house_rules.split("\n") if line.strip()] or _DEFAULT_HOUSE_RULES,
-        "cancellation_policy": [line for line in s.cancellation_policy.split("\n") if line.strip()] or _DEFAULT_CANCELLATION_POLICY,
-        "logo_path": s.logo_path or _DEFAULT_LOGO_PATH,
-        "qr_path": s.qr_code_path or _DEFAULT_QR_PATH,
+        }
+        terms = [line for line in s.quotation_terms.split("\n") if line.strip()] or _DEFAULT_TERMS
+        house_rules = [line for line in s.house_rules.split("\n") if line.strip()] or _DEFAULT_HOUSE_RULES
+        cancellation_policy = [line for line in s.cancellation_policy.split("\n") if line.strip()] or _DEFAULT_CANCELLATION_POLICY
+        logo_path = s.logo_path or _DEFAULT_LOGO_PATH
+        qr_path = s.qr_code_path or _DEFAULT_QR_PATH
+
+    bank = _DEFAULT_BANK
+    # Signatory stays on BusinessSettings (it's not a bank field), so it's
+    # layered onto whichever bank dict is used, from business_settings if
+    # available — same value it always was, just sourced independently of
+    # the bank split.
+    signatory = _DEFAULT_BANK["signatory"]
+    signatory_title = _DEFAULT_BANK["signatory_title"]
+    if business_settings is not None:
+        signatory = business_settings.signatory_name
+        signatory_title = business_settings.signatory_title
+    if bank_settings is not None:
+        b = bank_settings
+        bank = {
+            "bank_name": b.bank_name,
+            "ac_name": b.bank_account_name,
+            "ac_number": b.bank_account_number,
+            "ifsc": b.bank_ifsc,
+            "branch": b.bank_branch,
+            "upi_id": b.upi_id,
+            "signatory": signatory,
+            "signatory_title": signatory_title,
+        }
+    elif business_settings is not None:
+        bank = {**_DEFAULT_BANK, "signatory": signatory, "signatory_title": signatory_title}
+
+    return {
+        "company": company,
+        "bank": bank,
+        "terms": terms,
+        "house_rules": house_rules,
+        "cancellation_policy": cancellation_policy,
+        "logo_path": logo_path,
+        "qr_path": qr_path,
     }
 
 
@@ -232,8 +292,8 @@ def _amount_in_words(amount: float) -> str:
     return " ".join(parts) + " Rupees Only"
 
 
-def generate_quotation_pdf(inquiry, business_settings=None) -> str:
-    ctx = _pdf_context(business_settings)
+def generate_quotation_pdf(inquiry, business_settings=None, bank_settings=None) -> str:
+    ctx = _pdf_context(business_settings, bank_settings)
     company, bank = ctx["company"], ctx["bank"]
     terms, house_rules, cancellation_policy = ctx["terms"], ctx["house_rules"], ctx["cancellation_policy"]
     logo_path, qr_path = ctx["logo_path"], ctx["qr_path"]
@@ -241,6 +301,12 @@ def generate_quotation_pdf(inquiry, business_settings=None) -> str:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_margins(10, 10, 10)
+    # FPDF's auto-page-break bottom margin defaults to 20mm regardless of
+    # set_margins() above — left uninitialized, that silently gave this
+    # one-page document only 277mm of usable height instead of 287mm,
+    # which is what was actually forcing the last section onto a spurious
+    # second page. Match it to the same 10mm used on every other edge.
+    pdf.set_auto_page_break(True, margin=10)
     navy = (15, 23, 60)
     gold = (176, 141, 62)
 
@@ -277,6 +343,7 @@ def generate_quotation_pdf(inquiry, business_settings=None) -> str:
     pdf.cell(110, 4, f"UDYAM (MSME): {company['udyam']}", ln=True)
     pdf.set_x(42)
     pdf.cell(110, 4, company["sac_line"], ln=True)
+    left_col_bottom = pdf.get_y()
 
     # Offer details box, right side
     box_x = 152
@@ -293,16 +360,38 @@ def generate_quotation_pdf(inquiry, business_settings=None) -> str:
         ("Valid Upto", inquiry.valid_upto.isoformat()),
         ("Place of Supply", company["place_of_supply"]),
         ("Reverse Charge", "No"),
-        ("Payment Mode", inquiry.payment_mode),
     ]:
         pdf.set_x(box_x)
         pdf.cell(24, 5, label, align="L")
         pdf.cell(24, 5, str(value), align="R", ln=True)
 
-    pdf.set_y(46)
+    # Payment Mode gets its own full-width row (label above, value below)
+    # rather than squeezing into the same 24mm/24mm label|value columns as
+    # the fields above — "Online / Bank Transfer" (or any longer configured
+    # value) doesn't fit a 24mm right-aligned cell and was overlapping the
+    # label. multi_cell here wraps instead of overlapping if it's ever
+    # longer still.
+    pdf.set_x(box_x)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.cell(48, 4, "Payment Mode", ln=True)
+    pdf.set_x(box_x)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.multi_cell(48, 4, str(inquiry.payment_mode))
+    right_col_bottom = pdf.get_y()
+
+    # Divider sits below whichever column (company info vs. offer-details
+    # box) ended up taller — was a fixed y=46 that assumed a short,
+    # single-line Payment Mode value and got drawn straight through the
+    # value whenever it wrapped to 2 lines.
+    pdf.set_y(max(left_col_bottom, right_col_bottom) + 1)
     pdf.set_draw_color(*gold)
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(3)
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "I", 7.5)
+    pdf.set_text_color(90, 90, 90)
+    pdf.cell(0, 4, "This quotation is not a tax invoice. A tax invoice will be issued as applicable.", align="C", ln=True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(1)
 
     # --- Client Details | Stay Details ---
     col_w = 95
@@ -323,7 +412,7 @@ def generate_quotation_pdf(inquiry, business_settings=None) -> str:
         ("Address", inquiry.client_address or "-"),
     ]
     right_rows = [
-        ("Flat / Room", inquiry.flat_room_label),
+        ("Flat / Room", _apartment_display(inquiry)),
         ("No. of Guests", str(inquiry.num_guests)),
         ("Check-in", f"{inquiry.check_in_date.isoformat()}  {inquiry.check_in_time}"),
         ("Check-out", f"{inquiry.check_out_date.isoformat()}  {inquiry.check_out_time}"),
@@ -424,15 +513,23 @@ def generate_quotation_pdf(inquiry, business_settings=None) -> str:
     for i, title in enumerate(["TERMS & CONDITIONS", "HOUSE RULES", "CANCELLATION POLICY"]):
         pdf.set_xy(10 + i * col3, y0)
         pdf.cell(col3, 5, title)
-    pdf.ln(6)
+    pdf.ln(5)
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Helvetica", "", 7)
     y1 = pdf.get_y()
+    # Each column can wrap to a different number of lines (Terms is
+    # typically the longest) — multi_cell only leaves pdf.get_y() at
+    # whichever column was drawn LAST, so the true row height is the max
+    # across all three, tracked explicitly here rather than assumed to be
+    # a fixed 22mm (which overlapped the section below once Terms grew
+    # past 6-7 lines).
+    col_bottoms = []
     for i, items in enumerate([terms, house_rules, cancellation_policy]):
         pdf.set_xy(10 + i * col3, y1)
         text = "\n".join(f"- {t}" for t in items)
-        pdf.multi_cell(col3 - 2, 3.6, text)
-    pdf.set_y(max(pdf.get_y(), y1 + 22))
+        pdf.multi_cell(col3 - 2, 3.4, text)
+        col_bottoms.append(pdf.get_y())
+    pdf.set_y(max(col_bottoms))
     pdf.ln(2)
 
     # --- Bank Details | Signatory | Scan & Pay ---
@@ -463,21 +560,21 @@ def generate_quotation_pdf(inquiry, business_settings=None) -> str:
 
     if os.path.exists(qr_path):
         try:
-            pdf.image(qr_path, x=10 + 2 * col3, y=y2 + 6, w=32)
+            pdf.image(qr_path, x=10 + 2 * col3, y=y2 + 6, w=30)
         except Exception:
             pass
-    pdf.set_xy(10 + 2 * col3, y2 + 40)
+    pdf.set_xy(10 + 2 * col3, y2 + 38)
     pdf.set_font("Helvetica", "", 7)
     pdf.multi_cell(col3 - 2, 4, f"UPI ID: {bank['upi_id']}")
 
-    pdf.set_y(max(pdf.get_y(), y2 + 46))
-    pdf.ln(3)
+    pdf.set_y(max(pdf.get_y(), y2 + 44))
+    pdf.ln(1.5)
     pdf.set_draw_color(*gold)
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(2)
+    pdf.ln(1.5)
     pdf.set_font("Helvetica", "BI", 8)
     pdf.set_text_color(*navy)
-    pdf.cell(0, 5, "THANK YOU FOR CHOOSING SRI APARTMENT HOMESTAY  -  Feel at Home, Away from Home", align="C")
+    pdf.cell(0, 4, "THANK YOU FOR CHOOSING SRI APARTMENT HOMESTAY  -  Feel at Home, Away from Home", align="C")
 
     filename = f"{inquiry.offer_no.replace('/', '_')}_{uuid.uuid4().hex[:8]}.pdf"
     filepath = os.path.join(INQUIRY_STORAGE_DIR, filename)

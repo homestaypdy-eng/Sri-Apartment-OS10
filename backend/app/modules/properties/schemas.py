@@ -116,7 +116,21 @@ class UnitPhotoOut(BaseModel):
     filename: str
     content_type: str
     caption: str | None
+    sort_order: int
+    is_primary: bool
     uploaded_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class UnitPhotoUpdate(BaseModel):
+    """Partial update for one photo's caption (doubles as website alt
+    text), sort_order (lower first), and is_primary (cover photo). Setting
+    is_primary=True on one photo unsets it on every other photo for the
+    same unit — see update_unit_photo — so at most one photo per unit is
+    ever primary."""
+
+    caption: str | None = None
+    sort_order: int | None = None
+    is_primary: bool | None = None

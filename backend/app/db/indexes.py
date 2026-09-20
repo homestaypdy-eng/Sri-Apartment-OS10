@@ -42,6 +42,12 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_leave_requests_user_id ON leave_requests (user_id)",
     "CREATE INDEX IF NOT EXISTS ix_payroll_user_id ON payroll (user_id)",
     "CREATE INDEX IF NOT EXISTS ix_shifts_user_id ON shifts (user_id)",
+    # NOTE: ix_staff_profiles_designation_id is NOT here — it's in
+    # additive_migrations.py instead, because seed.py runs apply_indexes()
+    # BEFORE apply_additive_migrations(), and designation_id is itself
+    # added by an additive migration. Indexing it here would fail on any
+    # database upgraded from before this column existed (column doesn't
+    # exist yet when apply_indexes runs). See additive_migrations.py.
     # Audit/login history, filtered by user on every "view this user's activity" query
     "CREATE INDEX IF NOT EXISTS ix_audit_logs_user_id ON audit_logs (user_id)",
     "CREATE INDEX IF NOT EXISTS ix_login_events_user_id ON login_events (user_id)",

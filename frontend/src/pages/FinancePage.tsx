@@ -2,9 +2,11 @@ import { useEffect, useState, type FormEvent } from "react";
 import {
   api,
   extractErrorMessage,
+  DEFAULT_LOAN_TYPES,
   EXPENSE_CATEGORIES,
   LAUNDRY_ITEM_TYPES,
   OTA_CHANNELS,
+  OTA_RECONCILIATION_STATUSES,
   type ApartmentPnL,
   type BudgetVsActualReport,
   type CashFlowReport,
@@ -15,7 +17,12 @@ import {
   type IncomeRegister,
   type LaundryEntryOut,
   type LaundryMonthlySummary,
+  type LoanEmiPaymentOut,
+  type LoanOut,
+  type LoanSummary,
   type OTACommissionReport,
+  type OTAReconciliationLine,
+  type OTAMissingCommissionLine,
   type OutstandingPaymentLine,
   type OwnerWithdrawalOut,
   type PurchaseRecordOut,
@@ -27,7 +34,7 @@ import {
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
-type Tab = "gst" | "deposits" | "withdrawals" | "commissions" | "outstanding" | "cashflow" | "budget" | "pnl" | "utility" | "purchases" | "cashbook" | "closing" | "advances" | "expenses" | "laundry" | "income_register";
+type Tab = "gst" | "deposits" | "withdrawals" | "commissions" | "outstanding" | "cashflow" | "budget" | "pnl" | "utility" | "purchases" | "cashbook" | "closing" | "advances" | "expenses" | "laundry" | "income_register" | "loans";
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const monthStartStr = () => {
@@ -38,6 +45,12 @@ const monthStartStr = () => {
 export default function FinancePage() {
   const { role } = useAuth();
   const isAdmin = role === "admin";
+  // RBAC Phase B security fix (finding I-1): security-deposit refunds are
+  // admin+staff only on the backend (POST /finance/deposits/{id}/refund) —
+  // Manager was mistakenly swept into that route's role list during Phase B
+  // and has since been excluded again. This mirrors that exactly (not
+  // `isAdmin`, which would also hide the control from Staff).
+  const isManager = role === "manager";
   const [tab, setTab] = useState<Tab>("gst");
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -51,6 +64,7 @@ export default function FinancePage() {
     { key: "advances", label: "Advances" },
     { key: "deposits", label: "Security Deposits" },
     { key: "withdrawals", label: "Owner Withdrawals" },
+    { key: "loans", label: "Loans / EMI" },
     { key: "commissions", label: "OTA Commission" },
     { key: "outstanding", label: "Outstanding Payments" },
     { key: "cashflow", label: "Cash Flow" },
@@ -87,8 +101,9 @@ export default function FinancePage() {
       {tab === "cashbook" && <CashbookTab setError={setError} />}
       {tab === "closing" && <ClosingTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "advances" && <AdvancesTab setError={setError} />}
-      {tab === "deposits" && <DepositsTab setError={setError} setSuccess={setSuccess} />}
+      {tab === "deposits" && <DepositsTab isManager={isManager} setError={setError} setSuccess={setSuccess} />}
       {tab === "withdrawals" && <WithdrawalsTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
+      {tab === "loans" && <LoansTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "commissions" && <CommissionsTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "outstanding" && <OutstandingTab setError={setError} setSuccess={setSuccess} />}
       {tab === "cashflow" && <CashFlowTab setError={setError} />}
@@ -182,7 +197,7 @@ function GstDashboardTab({ setError }: { setError: (e: string | null) => void })
 }
 
 // --- Security Deposits ---
-function DepositsTab({ setError, setSuccess }: { setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+function DepositsTab({ isManager, setError, setSuccess }: { isManager: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [deposits, setDeposits] = useState<SecurityDepositOut[]>([]);
   const [form, setForm] = useState({ booking_id: "", amount: "", notes: "" });
   const [refundDrafts, setRefundDrafts] = useState<Record<string, string>>({});
@@ -258,7 +273,10 @@ function DepositsTab({ setError, setSuccess }: { setError: (e: string | null) =>
                 </td>
                 <td className="px-4 py-2.5 text-slate-500">₹{d.pending_refund_amount.toLocaleString()}</td>
                 <td className="px-4 py-2.5">
-                  {d.pending_refund_amount > 0 && (
+                  {/* RBAC Phase B security fix (finding I-1): refunding is
+                      admin+staff only on the backend — Manager gets no
+                      refund control here, matching that exactly. */}
+                  {d.pending_refund_amount > 0 && !isManager && (
                     <div className="flex gap-2">
                       <input
                         type="number"
@@ -346,17 +364,266 @@ function WithdrawalsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; s
   );
 }
 
-// --- OTA Commission ---
-function CommissionsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
-  const [report, setReport] = useState<OTACommissionReport | null>(null);
-  const [from, setFrom] = useState(monthStartStr());
-  const [to, setTo] = useState(todayStr());
-  const [form, setForm] = useState({ booking_id: "", channel: "booking_com", commission_percent: "", commission_amount: "", ota_gst_amount: "" });
+// --- Loans / EMI (Phase 19C) ---
+function LoansTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [loans, setLoans] = useState<LoanOut[]>([]);
+  const [summary, setSummary] = useState<LoanSummary | null>(null);
+  const [units, setUnits] = useState<UnitOut[]>([]);
+  const [statusFilter, setStatusFilter] = useState<string>("");
+  const [expandedLoanId, setExpandedLoanId] = useState<string | null>(null);
+  const [schedule, setSchedule] = useState<LoanEmiPaymentOut[]>([]);
+  const [emiDueDate, setEmiDueDate] = useState(todayStr());
+
+  const [form, setForm] = useState({
+    loan_name: "", lender_name: "", loan_type: "home_loan", principal_amount: "", interest_rate: "",
+    emi_amount: "", start_date: todayStr(), end_date: "", unit_id: "", notes: "",
+  });
 
   async function load() {
     try {
-      const { data } = await api.get("/finance/ota-commissions/report", { params: { date_from: from, date_to: to } });
-      setReport(data);
+      const params = statusFilter ? { status: statusFilter } : {};
+      const [l, s, u] = await Promise.all([
+        api.get("/finance/loans", { params }),
+        api.get("/finance/loans/summary"),
+        api.get("/units"),
+      ]);
+      setLoans(l.data);
+      setSummary(s.data);
+      setUnits(u.data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+  useEffect(() => {
+    if (isAdmin) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin, statusFilter]);
+
+  async function loadSchedule(loanId: string) {
+    try {
+      const { data } = await api.get(`/finance/loans/${loanId}/emi-payments`);
+      setSchedule(data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  function toggleExpand(loanId: string) {
+    if (expandedLoanId === loanId) {
+      setExpandedLoanId(null);
+      setSchedule([]);
+    } else {
+      setExpandedLoanId(loanId);
+      loadSchedule(loanId);
+    }
+  }
+
+  async function handleCreate(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post("/finance/loans", {
+        loan_name: form.loan_name,
+        lender_name: form.lender_name,
+        loan_type: form.loan_type,
+        principal_amount: form.principal_amount ? Number(form.principal_amount) : undefined,
+        interest_rate: form.interest_rate ? Number(form.interest_rate) : undefined,
+        emi_amount: Number(form.emi_amount),
+        start_date: form.start_date,
+        end_date: form.end_date || undefined,
+        unit_id: form.unit_id || undefined,
+        notes: form.notes || undefined,
+      });
+      setSuccess("Loan recorded.");
+      setForm({ loan_name: "", lender_name: "", loan_type: "home_loan", principal_amount: "", interest_rate: "", emi_amount: "", start_date: todayStr(), end_date: "", unit_id: "", notes: "" });
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleStatusChange(loanId: string, status: string) {
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.patch(`/finance/loans/${loanId}`, { status });
+      setSuccess("Loan status updated.");
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleAddEmiDue(loanId: string) {
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post(`/finance/loans/${loanId}/emi-payments`, { due_date: emiDueDate });
+      setSuccess("EMI due date recorded.");
+      loadSchedule(loanId);
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleMarkPaid(emiId: string, loanId: string) {
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.patch(`/finance/loans/emi-payments/${emiId}/mark-paid`, {});
+      setSuccess("EMI marked paid.");
+      loadSchedule(loanId);
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  if (!isAdmin) {
+    return <Card><p className="text-sm text-slate-400">Loans / EMI is admin-only.</p></Card>;
+  }
+
+  return (
+    <div>
+      {summary && (
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+          {[
+            { label: "Active Loans", value: summary.total_active_loans },
+            { label: "Monthly EMI Obligation", value: `₹${summary.total_monthly_emi_obligation.toLocaleString()}` },
+            { label: "Upcoming EMI", value: `${summary.upcoming_emi_count} · ₹${summary.upcoming_emi_amount.toLocaleString()}` },
+            { label: "Overdue EMI", value: `${summary.overdue_emi_count} · ₹${summary.overdue_emi_amount.toLocaleString()}` },
+            { label: "Paid This Month", value: `${summary.paid_this_month_count} · ₹${summary.paid_this_month_amount.toLocaleString()}` },
+            { label: "Outstanding This Month", value: `${summary.outstanding_this_month_count} · ₹${summary.outstanding_this_month_amount.toLocaleString()}` },
+          ].map((s) => (
+            <Card key={s.label} className="p-3">
+              <p className="text-xs text-slate-400 mb-1">{s.label}</p>
+              <p className="text-sm font-semibold text-slate-900">{s.value}</p>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      <Card className="mb-6 max-w-2xl">
+        <h2 className="text-sm font-semibold text-slate-900 mb-1">Record a Loan</h2>
+        <p className="text-xs text-slate-400 mb-4">Principal and interest rate are optional — record them only if actually known. Leave the apartment field unset for a property-wide loan.</p>
+        <form onSubmit={handleCreate} className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <input required placeholder="Loan Name (e.g. Home Loan)" value={form.loan_name} onChange={(e) => setForm({ ...form, loan_name: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <input required placeholder="Lender / Bank" value={form.lender_name} onChange={(e) => setForm({ ...form, lender_name: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <select value={form.loan_type} onChange={(e) => setForm({ ...form, loan_type: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">
+            {DEFAULT_LOAN_TYPES.map((t) => <option key={t} value={t}>{t.replace("_", " ")}</option>)}
+          </select>
+          <select value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">
+            <option value="">Property-wide (no specific apartment)</option>
+            {units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+          <input type="number" step="0.01" placeholder="Principal Amount (optional)" value={form.principal_amount} onChange={(e) => setForm({ ...form, principal_amount: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <input type="number" step="0.01" placeholder="Interest Rate % (optional)" value={form.interest_rate} onChange={(e) => setForm({ ...form, interest_rate: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <input required type="number" step="0.01" placeholder="EMI Amount / month" value={form.emi_amount} onChange={(e) => setForm({ ...form, emi_amount: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <div className="grid grid-cols-2 gap-2">
+            <input required type="date" value={form.start_date} onChange={(e) => setForm({ ...form, start_date: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <input type="date" placeholder="End date" value={form.end_date} onChange={(e) => setForm({ ...form, end_date: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          </div>
+          <input placeholder="Notes (optional)" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm md:col-span-2" />
+          <Button type="submit" className="md:col-span-2">Record Loan</Button>
+        </form>
+      </Card>
+
+      <Card>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-sm font-semibold text-slate-900">Loans</h2>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="rounded-lg border border-slate-300 px-2 py-1 text-xs">
+            <option value="">All statuses</option>
+            <option value="active">Active</option>
+            <option value="paid_off">Paid Off</option>
+            <option value="closed">Closed</option>
+          </select>
+        </div>
+        {loans.length === 0 ? (
+          <EmptyState message="No loans recorded yet." />
+        ) : (
+          <div className="space-y-3">
+            {loans.map((loan) => {
+              const unitName = units.find((u) => u.id === loan.unit_id)?.name ?? "Property-wide";
+              return (
+                <div key={loan.id} className="border border-slate-200 rounded-lg">
+                  <button onClick={() => toggleExpand(loan.id)} className="w-full flex items-center justify-between px-4 py-3 text-left">
+                    <div>
+                      <p className="text-sm font-medium text-slate-900">{loan.loan_name} <span className="text-slate-400 font-normal">— {loan.lender_name}</span></p>
+                      <p className="text-xs text-slate-400 mt-0.5">{unitName} · EMI ₹{loan.emi_amount.toLocaleString()}/month · {loan.start_date} to {loan.end_date ?? "—"}</p>
+                    </div>
+                    <Badge tone={loan.status === "active" ? "green" : loan.status === "closed" ? "slate" : "amber"}>{loan.status.replace("_", " ")}</Badge>
+                  </button>
+                  {expandedLoanId === loan.id && (
+                    <div className="border-t border-slate-100 px-4 py-3">
+                      <div className="flex items-center gap-3 mb-3">
+                        <label className="text-xs text-slate-500">Change status:</label>
+                        <select
+                          value={loan.status}
+                          onChange={(e) => handleStatusChange(loan.id, e.target.value)}
+                          disabled={loan.status === "closed"}
+                          className="rounded-lg border border-slate-300 px-2 py-1 text-xs"
+                        >
+                          <option value="active">Active</option>
+                          <option value="paid_off">Paid Off</option>
+                          <option value="closed">Closed</option>
+                        </select>
+                        {loan.status === "closed" && <span className="text-xs text-slate-400">Closed loans cannot be reopened.</span>}
+                      </div>
+
+                      <div className="flex items-center gap-2 mb-3">
+                        <input type="date" value={emiDueDate} onChange={(e) => setEmiDueDate(e.target.value)} className="rounded-lg border border-slate-300 px-2 py-1 text-xs" />
+                        <Button variant="secondary" onClick={() => handleAddEmiDue(loan.id)}>Add EMI Due</Button>
+                      </div>
+
+                      <Table headers={["Due Date", "Amount", "Status", "Paid Date", ""]}>
+                        {schedule.map((e) => (
+                          <tr key={e.id}>
+                            <td className="px-4 py-2.5 text-slate-500">{e.due_date}</td>
+                            <td className="px-4 py-2.5 font-medium text-slate-800">₹{e.emi_amount.toLocaleString()}</td>
+                            <td className="px-4 py-2.5"><Badge tone={e.status === "paid" ? "green" : "amber"}>{e.status}</Badge></td>
+                            <td className="px-4 py-2.5 text-slate-500">{e.paid_date ?? "—"}</td>
+                            <td className="px-4 py-2.5">
+                              {e.status === "due" && <Button variant="secondary" onClick={() => handleMarkPaid(e.id, loan.id)}>Mark Paid</Button>}
+                            </td>
+                          </tr>
+                        ))}
+                      </Table>
+                      {schedule.length === 0 && <p className="text-xs text-slate-400 mt-2">No EMI due dates recorded yet for this loan.</p>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+// --- OTA Commission & Reconciliation ---
+function CommissionsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [report, setReport] = useState<OTACommissionReport | null>(null);
+  const [reconciliation, setReconciliation] = useState<OTAReconciliationLine[]>([]);
+  const [missing, setMissing] = useState<OTAMissingCommissionLine[]>([]);
+  const [from, setFrom] = useState(monthStartStr());
+  const [to, setTo] = useState(todayStr());
+  const [form, setForm] = useState({ booking_id: "", channel: "booking_com", commission_percent: "", commission_amount: "", ota_gst_amount: "" });
+  const [recordingId, setRecordingId] = useState<string | null>(null);
+  const [receiptForm, setReceiptForm] = useState({ actual_received_amount: "", receipt_date: todayStr(), status: "matched", reference_number: "", notes: "" });
+
+  async function load() {
+    try {
+      const [reportRes, reconRes, missingRes] = await Promise.all([
+        api.get("/finance/ota-commissions/report", { params: { date_from: from, date_to: to } }),
+        api.get("/finance/ota-commissions/reconciliation", { params: { date_from: from, date_to: to } }),
+        api.get("/finance/ota-missing-commissions", { params: { date_from: from, date_to: to } }),
+      ]);
+      setReport(reportRes.data);
+      setReconciliation(reconRes.data);
+      setMissing(missingRes.data);
     } catch (err) {
       setError(extractErrorMessage(err));
     }
@@ -386,6 +653,44 @@ function CommissionsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; s
     }
   }
 
+  function startRecording(line: OTAReconciliationLine) {
+    setRecordingId(line.ota_commission_id);
+    setReceiptForm({
+      actual_received_amount: line.actual_received_amount != null ? String(line.actual_received_amount) : String(line.expected_payout),
+      receipt_date: line.receipt_date ?? todayStr(),
+      status: line.reconciliation_status === "unreconciled" ? "matched" : line.reconciliation_status,
+      reference_number: line.reference_number ?? "",
+      notes: "",
+    });
+  }
+
+  async function handleRecordReceipt(line: OTAReconciliationLine) {
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.patch(`/finance/ota-commissions/${line.ota_commission_id}/receipt`, {
+        actual_received_amount: Number(receiptForm.actual_received_amount || 0),
+        receipt_date: receiptForm.receipt_date,
+        status: receiptForm.status,
+        reference_number: receiptForm.reference_number || null,
+        notes: receiptForm.notes || null,
+        expected_updated_at: line.receipt_updated_at,
+      });
+      setSuccess("OTA payout receipt recorded.");
+      setRecordingId(null);
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  const statusTone: Record<string, "slate" | "green" | "red" | "amber"> = {
+    unreconciled: "slate",
+    matched: "green",
+    partial: "amber",
+    discrepancy: "red",
+  };
+
   return (
     <div>
       {isAdmin && (
@@ -407,7 +712,7 @@ function CommissionsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; s
       )}
 
       <DateRangeBar from={from} to={to} setFrom={setFrom} setTo={setTo} />
-      <Card>
+      <Card className="mb-6">
         <h2 className="text-sm font-semibold text-slate-900 mb-4">Commission by Channel</h2>
         <div className="overflow-x-auto">
           <Table headers={["Channel", "Bookings", "Revenue", "Commission", "OTA GST"]}>
@@ -423,6 +728,96 @@ function CommissionsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; s
           </Table>
         </div>
       </Card>
+
+      <Card className="mb-6">
+        <h2 className="text-sm font-semibold text-slate-900 mb-1">OTA Payout Reconciliation</h2>
+        <p className="text-xs text-slate-500 mb-4">Expected payout = Gross − Commission − OTA GST. Only an actually-recorded receipt counts as cash received — the expected figure never does.</p>
+        <div className="overflow-x-auto">
+          <Table headers={["Channel", "Booking", "Gross", "Commission", "OTA GST", "Expected Payout", "Actual Received", "Difference", "Receipt Date", "Status", ""]}>
+            {reconciliation.length === 0 && (
+              <tr><td colSpan={11}><EmptyState message="No OTA commission records in this period." /></td></tr>
+            )}
+            {reconciliation.map((line) => (
+              <>
+                <tr key={line.ota_commission_id}>
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{line.channel.replace("_", ".")}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{line.guest_name} — {line.unit_name}<br /><span className="text-xs text-slate-400">{line.check_in} → {line.check_out}</span></td>
+                  <td className="px-4 py-2.5 text-slate-500">₹{line.gross_amount.toLocaleString()}</td>
+                  <td className="px-4 py-2.5 text-slate-500">₹{line.commission_amount.toLocaleString()}</td>
+                  <td className="px-4 py-2.5 text-slate-500">₹{line.ota_gst_amount.toLocaleString()}</td>
+                  <td className="px-4 py-2.5 text-slate-500">₹{line.expected_payout.toLocaleString()}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{line.actual_received_amount != null ? `₹${line.actual_received_amount.toLocaleString()}` : "—"}</td>
+                  <td className={`px-4 py-2.5 ${line.difference != null && line.difference !== 0 ? "text-red-600 font-medium" : "text-slate-500"}`}>{line.difference != null ? `₹${line.difference.toLocaleString()}` : "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{line.receipt_date ?? "—"}</td>
+                  <td className="px-4 py-2.5"><Badge tone={statusTone[line.reconciliation_status]}>{line.reconciliation_status}</Badge></td>
+                  <td className="px-4 py-2.5">
+                    {isAdmin && (
+                      <Button variant="secondary" onClick={() => (recordingId === line.ota_commission_id ? setRecordingId(null) : startRecording(line))}>
+                        {line.actual_received_amount != null ? "Update Receipt" : "Record Receipt"}
+                      </Button>
+                    )}
+                  </td>
+                </tr>
+                {recordingId === line.ota_commission_id && (
+                  <tr key={`${line.ota_commission_id}-form`}>
+                    <td colSpan={11} className="px-4 py-4 bg-slate-50">
+                      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 items-end">
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">Actual Received ₹</label>
+                          <input type="number" value={receiptForm.actual_received_amount} onChange={(e) => setReceiptForm({ ...receiptForm, actual_received_amount: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">Receipt Date</label>
+                          <input type="date" value={receiptForm.receipt_date} onChange={(e) => setReceiptForm({ ...receiptForm, receipt_date: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">Status</label>
+                          <select value={receiptForm.status} onChange={(e) => setReceiptForm({ ...receiptForm, status: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+                            {OTA_RECONCILIATION_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs text-slate-500 mb-1">Reference No.</label>
+                          <input value={receiptForm.reference_number} onChange={(e) => setReceiptForm({ ...receiptForm, reference_number: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                        </div>
+                        <div className="flex gap-2">
+                          <Button onClick={() => handleRecordReceipt(line)}>Save</Button>
+                          <Button variant="secondary" onClick={() => setRecordingId(null)}>Cancel</Button>
+                        </div>
+                        <div className="col-span-2 md:col-span-5">
+                          <label className="block text-xs text-slate-500 mb-1">Notes</label>
+                          <input value={receiptForm.notes} onChange={(e) => setReceiptForm({ ...receiptForm, notes: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </>
+            ))}
+          </Table>
+        </div>
+      </Card>
+
+      {missing.length > 0 && (
+        <Card>
+          <h2 className="text-sm font-semibold text-slate-900 mb-1">Missing OTA Commission</h2>
+          <p className="text-xs text-slate-500 mb-4">These bookings look OTA-sourced but have no commission record — commission and expected payout are deliberately not invented for them.</p>
+          <div className="overflow-x-auto">
+            <Table headers={["Guest", "Unit", "Stay", "Source", "Gross Amount", "Commission"]}>
+              {missing.map((m) => (
+                <tr key={m.booking_id}>
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{m.guest_name}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{m.unit_name}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{m.check_in} → {m.check_out}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{m.source}</td>
+                  <td className="px-4 py-2.5 text-slate-500">₹{m.gross_amount.toLocaleString()}</td>
+                  <td className="px-4 py-2.5"><Badge tone="red">Missing / Not Recorded</Badge></td>
+                </tr>
+              ))}
+            </Table>
+          </div>
+        </Card>
+      )}
     </div>
   );
 }

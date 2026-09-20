@@ -15,8 +15,7 @@ from app.modules.properties.models import Property, Unit
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 
 @pytest.fixture(scope="module")

@@ -24,15 +24,18 @@ from app.core.security import TokenError, create_guest_magic_token, create_guest
 from app.db.session import get_db
 from app.modules.bookings.models import Booking, Guest
 from app.modules.notifications.service import send_email, EmailNotConfiguredError, trigger_guest_request_created, trigger_guest_request_resolved
-from app.modules.payments.models import Invoice
+from app.modules.payments.models import Invoice, Payment
 from app.modules.payments.service import generate_invoice_pdf
-from app.modules.portal.models import REQUEST_PRIORITIES, REQUEST_STATUSES, GuestRequest
+from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
+from app.modules.portal.auth_service import is_guest_session_active
+from app.modules.portal.models import REQUEST_PRIORITIES, REQUEST_STATUSES, REQUEST_TYPES, GuestRequest
 from app.modules.portal.schemas import (
     GuestBookingOut,
     GuestFeedbackCreate,
     GuestProfileOut,
     GuestRequestCreate,
     GuestRequestOut,
+    GuestRequestStaffCreate,
     GuestRequestStaffUpdate,
     GuestSessionToken,
     RequestLoginRequest,
@@ -58,6 +61,29 @@ def get_current_guest(token: str | None = Depends(_guest_oauth2_scheme), db: Ses
         raise HTTPException(401, "Invalid or expired session")
     if payload.get("role") != "guest":
         raise HTTPException(403, "This endpoint requires a guest session, not a staff/admin token")
+
+    # SESSION REVOCATION ENFORCEMENT (Phase 2A guest auth hardening): a
+    # token WITH a jti must resolve to a real, unrevoked GuestSession row —
+    # mirrors the identical jti-optional/jti-enforced pattern auth/router.py's
+    # /refresh already uses for staff sessions ("a refresh token issued
+    # before session-tracking existed has no jti and is treated as still
+    # valid; a token WITH a jti must point to a real, unrevoked session").
+    # Today only the phone/email OTP flows (auth_router.py/auth_email_
+    # router.py) mint a jti; the magic-link flow below still calls
+    # create_guest_session_token with no jti, exactly as before this
+    # change — so magic-link tokens keep working unmodified and this is
+    # purely additive. Fail closed whenever a jti IS present: a malformed
+    # jti, a deleted session row, or a revoked one are all rejected the
+    # same way, before the 24h JWT expiry would otherwise have allowed it.
+    session_id = payload.get("jti")
+    if session_id:
+        try:
+            session_uuid = uuid.UUID(session_id)
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(401, "Invalid or expired session")
+        if not is_guest_session_active(db, session_uuid):
+            raise HTTPException(401, "Invalid or expired session")
+
     guest = db.get(Guest, uuid.UUID(payload["sub"]))
     if guest is None:
         raise HTTPException(401, "Guest not found")
@@ -81,6 +107,23 @@ def request_login(payload: RequestLoginRequest, db: Session = Depends(get_db)):
     dev_token = magic_token if settings.environment != "production" else None
 
     if guest.email:
+        # CREDENTIAL-INDEPENDENT SAFETY GATE: settings.environment is checked
+        # BEFORE send_email is ever called — not "try sending and see if it
+        # fails". The previous "try it, catch EmailNotConfiguredError" design
+        # was only safe when SMTP credentials happened to be absent; this
+        # endpoint's own real SMTP credentials are routinely configured
+        # (shared with quotations/password-reset), so a local/dev/test run
+        # of THIS test suite genuinely opened an authenticated SMTP session
+        # against Gmail once — see the Phase 1 verification incident write-up.
+        # Outside production, send_email is never invoked at all, regardless
+        # of whether valid SMTP credentials happen to exist; dev_magic_token
+        # (already returned below) is how local/automated testing completes
+        # the flow instead. Mirrors the identical fix already applied to
+        # auth_router.py/auth_email_router.py's OTP endpoints. Production's
+        # email path — including its EmailNotConfiguredError handling — is
+        # completely unchanged.
+        if settings.environment != "production":
+            return RequestLoginResponse(sent=True, channel="email", dev_magic_token=dev_token)
         try:
             send_email(guest.email, "Your Sri Apartment Homestay login link", f"Click to log in: {login_link}\n\nThis link expires in 15 minutes.")
             return RequestLoginResponse(sent=True, channel="email", dev_magic_token=dev_token)
@@ -128,12 +171,36 @@ def download_my_invoice(booking_id: uuid.UUID, guest: Guest = Depends(get_curren
     from app.modules.properties.models import Unit, Property
     unit = db.get(Unit, booking.unit_id)
     property_ = db.get(Property, unit.property_id)
+
+    business_settings = get_or_create_settings(db)
+    bank_settings = get_or_create_bank_settings(db)
+    bank_details = {
+        "bank_name": bank_settings.bank_name,
+        "bank_account_name": bank_settings.bank_account_name,
+        "bank_account_number": bank_settings.bank_account_number,
+        "bank_ifsc": bank_settings.bank_ifsc,
+        "bank_branch": bank_settings.bank_branch,
+        "upi_id": bank_settings.upi_id,
+        "signatory_name": business_settings.signatory_name,
+        "signatory_title": business_settings.signatory_title,
+    }
+
+    payments = db.scalars(select(Payment).where(Payment.booking_id == booking_id)).all()
+    payment_received = round(sum(float(p.amount) for p in payments), 2)
+    balance_due = round(float(invoice.total) - payment_received, 2)
+
     pdf_path = generate_invoice_pdf(
         invoice_no=invoice.invoice_no, property_name=property_.name, property_gst_number=property_.gst_number,
         guest_name=guest.name, guest_gst_number=guest.gst_number, unit_name=unit.name,
         check_in=booking.check_in, check_out=booking.check_out, subtotal=float(invoice.subtotal),
         cgst=float(invoice.cgst), sgst=float(invoice.sgst), igst=float(invoice.igst), total=float(invoice.total),
         hsn_code=invoice.hsn_code, gst_rate_percent=float(invoice.gst_rate_percent), itc_available=invoice.itc_available,
+        bank_details=bank_details, qr_path=business_settings.qr_code_path,
+        payment_received=payment_received, balance_due=balance_due,
+        guest_phone=guest.phone, guest_email=guest.email, guest_address=guest.address,
+        num_guests=booking.adults + booking.children, rate_per_night=float(booking.rate_applied),
+        payment_mode=payments[-1].mode if payments else None,
+        extra_charges=float(booking.extra_guest_charge),
     )
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"{invoice.invoice_no.replace('/', '_')}.pdf")
 
@@ -188,7 +255,44 @@ def my_requests(guest: Guest = Depends(get_current_guest), db: Session = Depends
 staff_router = APIRouter(prefix="/api/v1/guest-requests", tags=["guest-portal"])
 
 
-@staff_router.get("", response_model=list[GuestRequestOut], dependencies=[Depends(require_role("admin", "staff"))])
+@staff_router.post("", response_model=GuestRequestOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def staff_create_request(payload: GuestRequestStaffCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Staff-side counterpart to POST /portal/requests — same GuestRequest
+    table/workflow, but for a need staff notice or a guest reports over
+    phone/in person rather than through their own guest-portal session.
+    guest_id is derived from the booking (not accepted directly), so this
+    can't be used to attach a request to an arbitrary guest_id.
+    """
+    booking = db.get(Booking, payload.booking_id)
+    if booking is None:
+        raise HTTPException(404, "Booking not found")
+    if payload.request_type not in REQUEST_TYPES:
+        raise HTTPException(400, f"Invalid request_type '{payload.request_type}'")
+    if payload.priority not in REQUEST_PRIORITIES:
+        raise HTTPException(400, f"Invalid priority '{payload.priority}'")
+    if payload.assigned_to is not None and db.get(User, payload.assigned_to) is None:
+        raise HTTPException(404, "Assigned user not found")
+
+    req = GuestRequest(
+        guest_id=booking.guest_id,
+        booking_id=booking.id,
+        request_type=payload.request_type,
+        description=payload.description,
+        priority=payload.priority,
+        assigned_to=payload.assigned_to,
+        status="open",
+    )
+    db.add(req)
+    db.flush()
+    record_audit_log(db, user.id, "guest_request.create", entity_type="guest_request", entity_id=str(req.id), details=f"{payload.request_type} logged by staff for booking {booking.id}: {payload.description[:100]}")
+    trigger_guest_request_created(db, req)
+    db.commit()
+    db.refresh(req)
+    return req
+
+
+@staff_router.get("", response_model=list[GuestRequestOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_all_requests(status: str | None = None, request_type: str | None = None, db: Session = Depends(get_db)):
     query = select(GuestRequest).order_by(GuestRequest.created_at.desc())
     if status:
@@ -198,7 +302,7 @@ def list_all_requests(status: str | None = None, request_type: str | None = None
     return db.scalars(query).all()
 
 
-@staff_router.patch("/{request_id}", response_model=GuestRequestOut, dependencies=[Depends(require_role("admin", "staff"))])
+@staff_router.patch("/{request_id}", response_model=GuestRequestOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_request(request_id: uuid.UUID, payload: GuestRequestStaffUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from datetime import datetime, timezone
 
@@ -219,9 +323,17 @@ def update_request(request_id: uuid.UUID, payload: GuestRequestStaffUpdate, db: 
             raise HTTPException(400, f"Invalid priority '{payload.priority}'")
         changes.append(f"priority: {req.priority} -> {payload.priority}")
         req.priority = payload.priority
-    if payload.assigned_to is not None:
-        changes.append(f"assigned_to: {req.assigned_to} -> {payload.assigned_to}")
-        req.assigned_to = payload.assigned_to
+    # model_fields_set (not `is not None`) distinguishes "field omitted"
+    # from an explicit `assigned_to: null` — the latter now clears the
+    # assignment. The existence check prevents the previous unhandled
+    # ForeignKeyViolation/500 on a bad user id, matching the check
+    # housekeeping/maintenance already had.
+    if "assigned_to" in payload.model_fields_set:
+        new_assignee = payload.assigned_to
+        if new_assignee is not None and db.get(User, new_assignee) is None:
+            raise HTTPException(404, "Assigned user not found")
+        changes.append(f"assigned_to: {req.assigned_to} -> {new_assignee}")
+        req.assigned_to = new_assignee
     if payload.staff_notes is not None:
         req.staff_notes = payload.staff_notes
 
@@ -234,7 +346,7 @@ def update_request(request_id: uuid.UUID, payload: GuestRequestStaffUpdate, db: 
     return req
 
 
-@router.post("/guest-requests/{request_id}/feedback", response_model=GuestRequestOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/guest-requests/{request_id}/feedback", response_model=GuestRequestOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def submit_guest_feedback(request_id: uuid.UUID, payload: GuestFeedbackCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
     Feedback submission is staff-facilitated (entered on the guest's
@@ -253,7 +365,7 @@ def submit_guest_feedback(request_id: uuid.UUID, payload: GuestFeedbackCreate, d
     return req
 
 
-@staff_router.post("/{request_id}/approve-extension", response_model=GuestRequestOut, dependencies=[Depends(require_role("admin", "staff"))])
+@staff_router.post("/{request_id}/approve-extension", response_model=GuestRequestOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def approve_extension_request(request_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
     The real business-workflow gap this closes: an extend_stay request

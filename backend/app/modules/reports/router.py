@@ -8,13 +8,33 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.session import get_db
 from app.modules.reports import service
-from app.modules.reports.schemas import SummaryReport, RevenuePoint, UnitPerformance, GstBreakdown, OperationalDashboard, DashboardCalendar, SummaryComparison, CancellationReport
+from app.modules.reports.decision_engine import run_decision_engine
+from app.modules.reports.narrative_provider import NarrativeProvider, NarrativeProviderUnavailable, NullNarrativeProvider
+from app.modules.reports.narrative_service import NarrativeService
+from app.modules.reports.schemas import SummaryReport, RevenuePoint, UnitPerformance, GstBreakdown, OperationalDashboard, DashboardCalendar, SummaryComparison, CancellationReport, AIStrategistBundle, AIStrategistDecisionResult, NarrativeOutput
 from app.modules.inquiries.schemas import SalesFunnelReport
 from app.shared.rbac import require_role
 
 router = APIRouter(prefix="/api/v1/reports", tags=["reports"])
+
+
+def _get_narrative_provider() -> NarrativeProvider:
+    """Phase 13I: disabled by default (narrative_provider_enabled=False),
+    matching Phase 13G's shipped behavior exactly — NullNarrativeProvider,
+    every /narrative request returns the deterministic fallback. If
+    enabled but misconfigured (e.g. no API key), fall back to
+    NullNarrativeProvider rather than raising — a missing/incomplete
+    provider configuration must never break the endpoint (section 16)."""
+    if not settings.narrative_provider_enabled:
+        return NullNarrativeProvider()
+    try:
+        from app.modules.reports.narrative_provider_anthropic import AnthropicNarrativeProvider
+        return AnthropicNarrativeProvider()
+    except NarrativeProviderUnavailable:
+        return NullNarrativeProvider()
 
 
 def _default_range(date_from: date | None, date_to: date | None) -> tuple[date, date]:
@@ -28,17 +48,17 @@ def _default_range(date_from: date | None, date_to: date | None) -> tuple[date, 
     return start, today + timedelta(days=1)
 
 
-@router.get("/dashboard", response_model=OperationalDashboard, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/dashboard", response_model=OperationalDashboard, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_operational_dashboard(db: Session = Depends(get_db)):
     return service.operational_dashboard(db)
 
 
-@router.get("/dashboard/calendar", response_model=DashboardCalendar, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/dashboard/calendar", response_model=DashboardCalendar, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_dashboard_calendar(period_year: int = Query(...), period_month: int = Query(..., ge=1, le=12), db: Session = Depends(get_db)):
     return service.dashboard_calendar(db, period_year, period_month)
 
 
-@router.get("/summary", response_model=SummaryReport, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/summary", response_model=SummaryReport, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_summary(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
@@ -49,7 +69,7 @@ def get_summary(
     return service.build_summary(db, d_from, d_to, property_id)
 
 
-@router.get("/summary-comparison", response_model=SummaryComparison, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/summary-comparison", response_model=SummaryComparison, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_summary_comparison(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
@@ -60,7 +80,7 @@ def get_summary_comparison(
     return service.build_summary_comparison(db, d_from, d_to, property_id)
 
 
-@router.get("/cancellations", response_model=CancellationReport, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/cancellations", response_model=CancellationReport, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_cancellation_report(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
@@ -71,7 +91,92 @@ def get_cancellation_report(
     return service.build_cancellation_report(db, d_from, d_to, property_id)
 
 
-@router.get("/revenue-series", response_model=list[RevenuePoint], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/ai-strategist", response_model=AIStrategistBundle, dependencies=[Depends(require_role("admin"))])
+def get_ai_strategist_bundle(
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    property_id: uuid.UUID | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Deterministic, read-only data bundle for the future AI Strategist
+    (Phase 13B) — admin-only, unlike every other endpoint in this module,
+    since an aggregated cross-domain business-health view is a different
+    risk category from any single existing report. Returns facts and
+    derived metrics only; never management inference, and never anything
+    that could be used to trigger a write.
+    """
+    d_from, d_to = _default_range(date_from, date_to)
+    return service.build_ai_strategist_bundle(db, d_from, d_to, property_id)
+
+
+@router.get(
+    "/ai-strategist/decisions",
+    response_model=AIStrategistDecisionResult,
+    dependencies=[Depends(require_role("admin"))],
+)
+def get_ai_strategist_decisions(
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    property_id: uuid.UUID | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Phase 13E — deterministic signals/insights/recommendations derived
+    from the same bundle as GET /ai-strategist. Builds the bundle exactly
+    once per request (identical query cost to /ai-strategist, ~25 fixed
+    queries — see reports/service.py::build_ai_strategist_bundle), then
+    runs decision_engine.run_decision_engine() as a pure in-memory
+    transform with zero additional queries. Admin-only, same as
+    /ai-strategist. Never auto-executes anything; every recommendation
+    requires human approval.
+    """
+    d_from, d_to = _default_range(date_from, date_to)
+    bundle_dict = service.build_ai_strategist_bundle(db, d_from, d_to, property_id)
+    bundle = AIStrategistBundle.model_validate(bundle_dict)
+    return run_decision_engine(bundle)
+
+
+@router.get(
+    "/ai-strategist/narrative",
+    response_model=NarrativeOutput,
+    dependencies=[Depends(require_role("admin"))],
+)
+def get_ai_strategist_narrative(
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    property_id: uuid.UUID | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Phase 13G/13I — optional narrative explanation of the same decision
+    result as GET /ai-strategist/decisions. Builds the bundle exactly
+    once per request (identical query cost to /ai-strategist and
+    /ai-strategist/decisions — no duplicate bundle construction), runs
+    the Phase 13E decision engine, then the Phase 13G/13I narrative
+    service (zero additional database queries; the only extra network
+    operation is at most one call — plus at most one retry — to the
+    configured provider). Admin-only, same as the other two AI
+    Strategist endpoints.
+
+    Disabled by default (settings.narrative_provider_enabled=False):
+    behaves exactly like Phase 13G — NullNarrativeProvider always raises,
+    so the endpoint always returns source="deterministic_fallback".
+    When explicitly enabled with a real key, the Anthropic adapter
+    (narrative_provider_anthropic.py) is used instead; any provider
+    failure still falls back to the same deterministic path, unchanged.
+    Never returns raw bundle data; only the validated NarrativeOutput
+    shape.
+    """
+    d_from, d_to = _default_range(date_from, date_to)
+    bundle_dict = service.build_ai_strategist_bundle(db, d_from, d_to, property_id)
+    bundle = AIStrategistBundle.model_validate(bundle_dict)
+    decision_result = run_decision_engine(bundle)
+    narrative_service = NarrativeService(provider=_get_narrative_provider())
+    return narrative_service.generate(decision_result)
+
+
+@router.get("/revenue-series", response_model=list[RevenuePoint], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_revenue_series(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
@@ -82,7 +187,7 @@ def get_revenue_series(
     return service.build_revenue_series(db, d_from, d_to, property_id)
 
 
-@router.get("/unit-performance", response_model=list[UnitPerformance], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/unit-performance", response_model=list[UnitPerformance], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_unit_performance(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
@@ -93,7 +198,7 @@ def get_unit_performance(
     return service.build_unit_performance(db, d_from, d_to, property_id)
 
 
-@router.get("/gst", response_model=GstBreakdown, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/gst", response_model=GstBreakdown, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_gst(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
@@ -104,7 +209,7 @@ def get_gst(
     return service.gst_totals(db, d_from, d_to, property_id)
 
 
-@router.get("/sales-funnel", response_model=SalesFunnelReport, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/sales-funnel", response_model=SalesFunnelReport, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_sales_funnel(
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
@@ -118,7 +223,7 @@ VALID_REPORTS = ("summary", "unit_performance", "gst", "guest_requests", "mainte
 VALID_FORMATS = ("pdf", "xlsx")
 
 
-@router.get("/export", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/export", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def export_report(
     report: str = Query(..., description="summary | unit_performance | gst"),
     format: str = Query(..., description="pdf | xlsx"),

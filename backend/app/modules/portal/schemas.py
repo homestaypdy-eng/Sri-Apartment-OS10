@@ -74,6 +74,17 @@ class GuestRequestOut(BaseModel):
         from_attributes = True
 
 
+class GuestRequestStaffCreate(BaseModel):
+    """Staff logging a request on a guest's behalf (phone call, in person)
+    — booking_id is required rather than optional, since staff identify the
+    guest via their current stay, not their own portal session."""
+    booking_id: uuid.UUID
+    request_type: str
+    description: str
+    priority: str = "medium"
+    assigned_to: uuid.UUID | None = None
+
+
 class GuestRequestStaffUpdate(BaseModel):
     status: str | None = None
     priority: str | None = None

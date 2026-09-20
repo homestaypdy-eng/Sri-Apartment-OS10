@@ -37,6 +37,25 @@ TEMPLATES: dict[str, dict[str, str]] = {
             "and still isn't resolved: {description}"
         ),
     },
+    "invoice_delivery": {
+        "subject": "Your Invoice {invoice_no} — {property_name}",
+        "body": (
+            "Hi {guest_name},\n\n"
+            "Thank you for booking with {property_name}. Here are your booking and invoice details:\n\n"
+            "Booking reference: {booking_id}\n"
+            "Property: {property_name}\n"
+            "Accommodation: {unit_name}\n"
+            "Check-in: {check_in}{arrival_time_suffix}\n"
+            "Check-out: {check_out}{departure_time_suffix}\n"
+            "Nights: {nights}\n"
+            "Guests: {guests}\n"
+            "Amount paid: Rs. {amount_paid}\n"
+            "Payment status: {payment_status}\n"
+            "Invoice number: {invoice_no}\n\n"
+            "Your invoice is attached to this email as a PDF.\n\n"
+            "We look forward to hosting you!"
+        ),
+    },
 }
 
 

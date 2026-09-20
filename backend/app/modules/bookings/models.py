@@ -96,6 +96,14 @@ class Booking(Base):
     security_deposit: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    # Bumped on every actual field change via ORM `onupdate` — this is the
+    # optimistic-concurrency token: the edit form sends back the value it
+    # loaded as `expected_updated_at`, and update_booking() 409s if it no
+    # longer matches, instead of silently overwriting a change made by
+    # someone else in the meantime.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
     promo_code_used: Mapped[str | None] = mapped_column(String(30), nullable=True)  # set only by the public booking engine
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)  # for Outstanding Payments tracking; null = no due date set
     internal_notes: Mapped[str | None] = mapped_column(Text, nullable=True)  # staff-only notes, never shown to the guest
@@ -105,6 +113,22 @@ class Booking(Base):
     extra_bed: Mapped[bool] = mapped_column(default=False)
     arrival_time: Mapped[str | None] = mapped_column(String(10), nullable=True)  # free-text "HH:MM", not a strict time column — guests give approximate arrival windows, not exact times
     departure_time: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Archive (soft-delete): an administrative "remove from the active list"
+    # action, distinct from Cancel (a business status transition) and from
+    # the existing hard DELETE (which stays blocked whenever any financial
+    # record references the booking — see delete_booking). Archiving is
+    # always allowed and always reversible, so it's the safe path for
+    # getting a booking with real history out of the active list.
+    is_archived: Mapped[bool] = mapped_column(default=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    archive_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Zotel channel-manager sync identity — Zotel's transaction_id for a
+    # booking imported from Zotel (see app/modules/zotel/service.py).
+    # Null for every direct/walk-in/phone/website booking. Unique when
+    # set (see additive_migrations.py) so the same reservation fetched
+    # on a later sync is found and reconciled, never re-created.
+    external_reservation_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     unit = relationship("Unit")
     guest = relationship("Guest")

@@ -40,10 +40,31 @@ def create_guest_magic_token(guest_id: str) -> str:
     return _create_token(guest_id, "guest_magic", timedelta(minutes=15), "access")
 
 
-def create_guest_session_token(guest_id: str) -> str:
+def create_guest_session_token(guest_id: str, jti: str | None = None) -> str:
     """Longer-lived (24h) token issued after a magic link is verified —
-    a guest browsing their bookings needs more than 15 minutes."""
-    return _create_token(guest_id, "guest", timedelta(hours=24), "access")
+    a guest browsing their bookings needs more than 15 minutes.
+
+    `jti` is optional and unused by any current caller (today's magic-link
+    flow calls this with just guest_id, unchanged). It exists so the guest-
+    auth redesign's Phase 2 can mint a token whose jti matches a
+    GuestSession row's id — the same revocable-session pattern
+    create_refresh_token already uses for staff — without touching this
+    function's existing behavior for existing callers."""
+    return _create_token(guest_id, "guest", timedelta(hours=24), "access", jti=jti)
+
+
+def create_customer_session_token(customer_id: str, jti: str | None = None) -> str:
+    """Phase 3A customer-auth foundation: 24h token for a self-service
+    CustomerAccount session, same shape as create_guest_session_token but
+    with role="customer" — a distinct claim value that ensures this token
+    can never satisfy shared.rbac.get_current_user (which looks its
+    subject up in the `users` table, where no CustomerAccount row exists)
+    or portal.router.get_current_guest (which requires role=="guest"
+    exactly). Unlike create_guest_session_token's optional jti (kept
+    optional there only for the pre-existing magic-link caller), jti here
+    should always be a real CustomerSession id — there is no legacy
+    customer token to stay backward-compatible with."""
+    return _create_token(customer_id, "customer", timedelta(hours=24), "access", jti=jti)
 
 
 def create_refresh_token(user_id: str, role: str, jti: str | None = None) -> str:

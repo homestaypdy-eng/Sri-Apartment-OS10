@@ -20,7 +20,7 @@ DEFAULT_EXPENSE_CATEGORIES = ("electricity", "water", "laundry", "cleaning", "in
 EXPENSE_CATEGORIES = DEFAULT_EXPENSE_CATEGORIES
 EXPENSE_APPROVAL_STATUSES = ("pending", "approved", "rejected")
 DEPOSIT_STATUSES = ("held", "refunded", "partially_refunded")
-OTA_CHANNELS_FOR_COMMISSION = ("booking_com", "airbnb", "agoda", "direct")
+OTA_CHANNELS_FOR_COMMISSION = ("booking_com", "airbnb", "agoda", "direct", "mmt")
 
 
 class Expense(Base):
@@ -263,6 +263,148 @@ class OTACommission(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     booking = relationship("Booking")
+
+
+OTA_RECONCILIATION_STATUSES = ("matched", "partial", "discrepancy")
+
+
+class OTAPayoutReceipt(Base):
+    """
+    Phase 19E: manual record of the actual OTA payout received against a
+    booking's OTACommission. Expected payout (gross revenue - commission -
+    OTA GST) is deliberately NOT stored here — it's always computed live
+    from Booking + OTACommission (see service.compute_expected_payout), so
+    there is exactly one source of truth for gross revenue/commission/GST
+    and this table can never drift out of sync with a later-corrected
+    commission record. Only the actual-cash-received side lives here,
+    since nothing else in OS10 tracks it.
+
+    One row per OTACommission (enforced by the unique constraint) — a
+    correction to an already-recorded receipt updates this same row rather
+    than creating a second one, mirroring the LoanEmiPayment mark-paid
+    pattern. Absence of a row for a given commission means "not yet
+    reconciled" (displayed as UNRECONCILED), the same "no row = not
+    recorded" convention OTACommission itself uses for bookings with no
+    commission — so "unreconciled" is deliberately not a value this column
+    can hold.
+    """
+
+    __tablename__ = "ota_payout_receipts"
+    __table_args__ = (
+        CheckConstraint(f"status IN {OTA_RECONCILIATION_STATUSES}", name="ck_ota_receipt_status"),
+        UniqueConstraint("ota_commission_id", name="uq_ota_receipt_commission"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ota_commission_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("ota_commissions.id"), nullable=False)
+    actual_received_amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    receipt_date: Mapped[date] = mapped_column(Date, nullable=False)
+    reference_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+    commission = relationship("OTACommission")
+
+
+DEFAULT_LOAN_TYPES = ("home_loan", "equipment_loan", "vehicle_loan", "personal_loan", "other")
+LOAN_STATUSES = ("active", "paid_off", "closed")
+LOAN_EMI_STATUSES = ("due", "paid")
+
+
+class Loan(Base):
+    """
+    A business-level loan/EMI obligation (Phase 19C) — e.g. a home loan or
+    equipment loan taken against the property/business, distinct from
+    StaffAdvance (a staff salary-advance ledger that happens to have a
+    "loan" category option for staff-facing personal advances). unit_id is
+    nullable and defaults to null: the two real loans identified in the
+    Phase 19B gap analysis are property-wide, not apartment-specific, so
+    this follows the same nullable-unit_id "central/shared" convention as
+    Expense/UtilityReading/PurchaseRecord/LaundryEntry rather than forcing
+    an apartment allocation that doesn't reflect reality.
+
+    loan_type is free text (like Expense.category) with DEFAULT_LOAN_TYPES
+    above as a suggested/quick-pick list, not a hard DB constraint — same
+    reasoning as Expense.category: custom loan types shouldn't require a
+    schema change.
+
+    principal_amount and interest_rate are nullable because the source
+    business data (the Excel "Loans & EMI" sheet) only records Loan Name,
+    Bank, EMI Amount, Start Date, and End Date — no principal or interest
+    rate. Rather than inventing an amortization split that isn't backed by
+    real data, these fields are simply optional and populated only when
+    actually known.
+
+    Deliberately has NO relationship to Expense, Payment, Invoice,
+    DailyClosing, or the P&L functions in service.py — see LoanEmiPayment
+    below for why marking an EMI paid does not create a linked Expense the
+    way Payroll.mark_paid does.
+    """
+
+    __tablename__ = "loans"
+    __table_args__ = (CheckConstraint(f"status IN {LOAN_STATUSES}", name="ck_loan_status"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    loan_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    lender_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    loan_type: Mapped[str] = mapped_column(String(50), nullable=False, default="other")
+    principal_amount: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    interest_rate: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)  # annual %, if known
+    emi_amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    unit_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("units.id"), nullable=True)  # null = property-wide, matching the two real loans identified
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    unit = relationship("Unit")
+
+
+class LoanEmiPayment(Base):
+    """
+    A single EMI installment obligation for a Loan — recorded explicitly
+    per due date (same "admin generates the period record, then marks it
+    paid" pattern as staff.Payroll), not auto-generated as a full
+    amortization forecast for the loan's entire tenure. emi_amount is a
+    snapshot at creation time so a later change to Loan.emi_amount doesn't
+    retroactively rewrite historical schedule rows.
+
+    Marking a row paid does NOT create a linked Expense/Payment/Cashbook
+    entry — unlike Payroll.mark_paid's Expense linkage. That linkage would
+    flow straight into Dashboard/apartment_pnl/property_pnl expense totals,
+    silently changing P&L output while Phase 19C is explicitly required to
+    leave P&L untouched pending the Phase 19D definition-reconciliation
+    work. This is the "ambiguous integration" the Phase 19C brief asked to
+    be reported rather than guessed — see the Phase 19C final report.
+    """
+
+    __tablename__ = "loan_emi_payments"
+    __table_args__ = (
+        CheckConstraint(f"status IN {LOAN_EMI_STATUSES}", name="ck_loan_emi_status"),
+        UniqueConstraint("loan_id", "due_date", name="uq_loan_emi_due_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    loan_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("loans.id"), nullable=False)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    emi_amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String(10), default="due")
+    paid_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    paid_amount: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    reference_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    loan = relationship("Loan")
 
 
 LAUNDRY_ITEM_TYPES = ("bedsheet", "pillow_cover", "bath_towel", "face_towel", "blanket", "curtains", "other")

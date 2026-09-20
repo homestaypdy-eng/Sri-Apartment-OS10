@@ -8,12 +8,15 @@ class MaintenanceTicketCreate(BaseModel):
     unit_id: uuid.UUID
     description: str
     priority: str = "medium"  # low/medium/high/urgent
+    category: str | None = None  # ac/electrical/plumbing/water/appliance/furniture/internet/other
+    assigned_to: uuid.UUID | None = None
 
 
 class MaintenanceTicketUpdate(BaseModel):
     status: str | None = None  # open/in_progress/resolved/closed
     assigned_to: uuid.UUID | None = None
     priority: str | None = None
+    category: str | None = None
     cost: float | None = Field(None, ge=0)
 
 
@@ -24,6 +27,7 @@ class MaintenanceTicketOut(BaseModel):
     assigned_to: uuid.UUID | None
     priority: str
     status: str
+    category: str | None
     description: str
     cost: float | None
     created_at: datetime

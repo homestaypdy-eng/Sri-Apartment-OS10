@@ -1,12 +1,19 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type GuestOut, type GuestHistory, type GuestDocumentOut, type GuestSegment } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState } from "../components/ui";
+import { useAuth } from "../context/AuthContext";
 
 type SortBy = "name" | "total_bookings" | "total_spent" | "last_stay" | "segment" | "source";
 
 const DOCUMENT_TYPES = ["aadhaar", "pan", "passport", "driving_license", "other"];
 
 export default function GuestsPage() {
+  // RBAC Phase B security fix (finding I-7): POST /guests/merge is, and
+  // always was, admin-only on the backend (see bookings/router.py) — this
+  // page just never had any role awareness at all, so Manager/Staff could
+  // see and attempt "Merge Duplicate" only to get a 403 at submit time.
+  const { role } = useAuth();
+  const isAdmin = role === "admin";
   const [guests, setGuests] = useState<GuestOut[]>([]);
   const [segments, setSegments] = useState<GuestSegment[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -353,10 +360,10 @@ export default function GuestsPage() {
                 <div className="flex gap-2 mb-4">
                   <Button variant="secondary" onClick={toggleVip}>{activeGuest.is_vip ? "Remove VIP" : "Mark VIP"}</Button>
                   <Button variant="secondary" onClick={toggleBlacklist}>{activeGuest.is_blacklisted ? "Remove from Blacklist" : "Blacklist Guest"}</Button>
-                  <Button variant="secondary" onClick={() => setMergeMode(!mergeMode)}>Merge Duplicate</Button>
+                  {isAdmin && <Button variant="secondary" onClick={() => setMergeMode(!mergeMode)}>Merge Duplicate</Button>}
                 </div>
 
-                {mergeMode && (
+                {isAdmin && mergeMode && (
                   <div className="mb-4 bg-amber-50 rounded-lg p-3">
                     <p className="text-xs text-amber-700 mb-2">Select the duplicate record to merge into this guest. All of its bookings will be reassigned here.</p>
                     <div className="flex gap-2">

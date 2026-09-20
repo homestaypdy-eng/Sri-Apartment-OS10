@@ -14,6 +14,7 @@ from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
 from app.modules.bookings.models import BOOKING_STATUSES, Booking, BookingAttachment, Guest, GuestDocument
 from app.modules.bookings.schemas import (
+    BookingArchiveRequest,
     BookingAttachmentOut,
     BookingCreate,
     BookingOut,
@@ -30,7 +31,11 @@ from app.modules.bookings.schemas import (
 from app.modules.finance.models import OTACommission, SecurityDeposit
 from app.modules.housekeeping.models import HousekeepingTask
 from app.modules.payments.models import Invoice, Payment
-from app.modules.properties.models import Unit
+from app.modules.portal.auth_models import IDENTITY_CHANNELS, GuestIdentity
+from app.modules.portal.auth_schemas import GuestIdentityOut, LinkGuestIdentityRequest
+from app.modules.portal.auth_service import normalize_email, normalize_phone
+from app.modules.properties.models import Property, Unit
+from app.shared.availability import unit_is_available, units_availability
 from app.shared.file_upload import read_and_validate_upload
 from app.shared.rbac import get_current_user, require_role
 
@@ -60,7 +65,7 @@ ALLOWED_TRANSITIONS = {
 INVOICE_IMPACTING_FIELDS = {"check_in", "check_out", "unit_id", "rate_applied"}
 
 
-@router.post("/guests", response_model=GuestOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/guests", response_model=GuestOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_guest(payload: GuestCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     guest = Guest(**payload.model_dump())
     db.add(guest)
@@ -71,7 +76,7 @@ def create_guest(payload: GuestCreate, db: Session = Depends(get_db), user: User
     return guest
 
 
-@router.patch("/guests/{guest_id}", response_model=GuestOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/guests/{guest_id}", response_model=GuestOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_guest(guest_id: uuid.UUID, payload: GuestUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     guest = db.get(Guest, guest_id)
     if guest is None:
@@ -87,7 +92,7 @@ def update_guest(guest_id: uuid.UUID, payload: GuestUpdate, db: Session = Depend
     return guest
 
 
-@router.post("/guests/{guest_id}/documents", response_model=GuestDocumentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/guests/{guest_id}/documents", response_model=GuestDocumentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 async def upload_guest_document(
     guest_id: uuid.UUID,
     document_type: str,
@@ -122,12 +127,12 @@ async def upload_guest_document(
     return doc
 
 
-@router.get("/guests/{guest_id}/documents", response_model=list[GuestDocumentOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/guests/{guest_id}/documents", response_model=list[GuestDocumentOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_guest_documents(guest_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(GuestDocument).where(GuestDocument.guest_id == guest_id)).all()
 
 
-@router.get("/guests/{guest_id}/documents/{document_id}/download", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/guests/{guest_id}/documents/{document_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_guest_document(guest_id: uuid.UUID, document_id: uuid.UUID, db: Session = Depends(get_db)):
     doc = db.get(GuestDocument, document_id)
     if doc is None or doc.guest_id != guest_id:
@@ -137,7 +142,7 @@ def download_guest_document(guest_id: uuid.UUID, document_id: uuid.UUID, db: Ses
     return FileResponse(doc.file_path, media_type=doc.content_type, filename=doc.filename)
 
 
-@router.delete("/guests/{guest_id}/documents/{document_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff"))])
+@router.delete("/guests/{guest_id}/documents/{document_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_guest_document(guest_id: uuid.UUID, document_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     doc = db.get(GuestDocument, document_id)
     if doc is None or doc.guest_id != guest_id:
@@ -183,7 +188,69 @@ def merge_guests(payload: GuestMergeRequest, db: Session = Depends(get_db), user
     return {"primary_guest_id": payload.primary_guest_id, "duplicate_guest_id": payload.duplicate_guest_id, "bookings_reassigned": len(bookings)}
 
 
-@router.get("/guests", response_model=list[GuestOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/guests/{guest_id}/link-identity", response_model=GuestIdentityOut, dependencies=[Depends(require_role("admin"))])
+def link_guest_identity(guest_id: uuid.UUID, payload: LinkGuestIdentityRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Phase 2A guest auth hardening: the staff-assisted path for a guest who
+    OTP-verified (phone or email) before any Guest record existed to
+    auto-link to. Without this, an unlinked GuestIdentity has no way to
+    ever gain booking access — get_current_guest correctly 401s it
+    forever (see auth_router.py/auth_email_router.py's verify-otp: "no
+    data leak even though there's no recovery path yet — that's later-
+    phase work"). This endpoint IS that later-phase work.
+
+    admin-only, same restriction tier as /guests/merge just above — both
+    endpoints change which guest a piece of identity/booking access
+    resolves to, the most sensitive class of guest-data operation in this
+    router (staff/manager can create and edit guests, but not repoint who
+    "owns" existing access).
+
+    Deliberately takes channel + external_id (what a guest would read out
+    over a support call), not a raw identity_id — there's no admin UI
+    listing GuestIdentity rows by UUID for staff to look one up from.
+    """
+    if payload.channel not in IDENTITY_CHANNELS:
+        raise HTTPException(400, f"Unknown channel '{payload.channel}'")
+
+    guest = db.get(Guest, guest_id)
+    if guest is None:
+        raise HTTPException(404, "Guest not found")
+
+    if payload.channel == "phone":
+        normalized = normalize_phone(payload.external_id)
+    elif payload.channel == "email":
+        normalized = normalize_email(payload.external_id)
+    else:
+        normalized = payload.external_id.strip()
+
+    identity = db.scalar(select(GuestIdentity).where(GuestIdentity.channel == payload.channel, GuestIdentity.external_id == normalized))
+    if identity is None:
+        raise HTTPException(404, "No guest identity found for this channel/identifier — the guest may not have completed OTP verification yet")
+
+    # Prevent linking the same identity to multiple guests: a currently-
+    # unlinked identity may be linked; one already linked to ANY guest
+    # (including this same one) is rejected outright rather than silently
+    # re-linked, so this action is never accidentally a no-op or a quiet
+    # transfer of access from one guest to another.
+    if identity.guest_id is not None:
+        if identity.guest_id == guest_id:
+            raise HTTPException(409, "This identity is already linked to this guest")
+        raise HTTPException(409, "This identity is already linked to a different guest")
+
+    identity.guest_id = guest_id
+    identity.linked_at = datetime.now(timezone.utc)
+
+    record_audit_log(
+        db, user.id, "guest_identity.linked",
+        entity_type="guest_identity", entity_id=str(identity.id),
+        details=f"Linked {identity.channel} identity ({normalized}) to guest {guest.name} ({guest.id})",
+    )
+    db.commit()
+    db.refresh(identity)
+    return identity
+
+
+@router.get("/guests", response_model=list[GuestOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_guests(
     search: str | None = Query(None, description="Matches name, phone, or email"),
     ids: str | None = Query(None, description="Comma-separated guest IDs — returns exactly these guests, ignoring pagination/sort. Used when a page needs to resolve names for a specific, already-known set of guests (e.g. Guest Requests) without risking the default page-size window silently excluding some of them."),
@@ -210,7 +277,7 @@ def list_guests(
 _GUEST_SEGMENT_SORT_KEYS = ("name", "total_bookings", "total_spent", "last_stay", "segment", "source")
 
 
-@router.get("/guests/segments", response_model=list[GuestSegment], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/guests/segments", response_model=list[GuestSegment], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_guest_segments(
     search: str | None = Query(None, description="Matches name, phone, or email"),
     ids: str | None = Query(None, description="Comma-separated guest IDs — returns exactly these guests' segmentation stats, ignoring filter/sort/pagination, same convention as GET /guests"),
@@ -317,7 +384,7 @@ def list_guest_segments(
     return rows[offset: offset + limit]
 
 
-@router.get("/guests/{guest_id}/history", response_model=GuestHistory, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/guests/{guest_id}/history", response_model=GuestHistory, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_guest_history(guest_id: uuid.UUID, db: Session = Depends(get_db)):
     """
     A single consolidated view of everything tied to one guest — every
@@ -378,7 +445,7 @@ def get_guest_history(guest_id: uuid.UUID, db: Session = Depends(get_db)):
 
 @router.get(
     "/units/{unit_id}/availability",
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def check_availability(
     unit_id: uuid.UUID,
@@ -398,29 +465,50 @@ def check_availability(
     if not unit.is_active or not unit.property.is_active:
         return {"unit_id": unit_id, "check_in": check_in, "check_out": check_out, "available": False}
 
-    # Mirrors the DB EXCLUDE constraint logic for a pre-flight check
-    # (fast, friendly UX) — the constraint itself is the actual guarantee.
-    conflict = db.execute(
-        text(
-            """
-            SELECT id FROM bookings
-            WHERE unit_id = :unit_id
-              AND status IN ('confirmed', 'checked_in')
-              AND daterange(check_in, check_out, '[)') && daterange(:ci, :co, '[)')
-            LIMIT 1
-            """
-        ),
-        {"unit_id": str(unit_id), "ci": check_in, "co": check_out},
-    ).first()
+    # Same shared, hold-aware check the public website uses (see
+    # app/shared/availability.py) — a unit another guest is actively
+    # paying for on the website must show unavailable here too, not just
+    # a unit already confirmed-booked.
+    available = unit_is_available(db, unit_id, check_in, check_out)
 
-    return {"unit_id": unit_id, "check_in": check_in, "check_out": check_out, "available": conflict is None}
+    return {"unit_id": unit_id, "check_in": check_in, "check_out": check_out, "available": available}
+
+
+@router.get(
+    "/units/availability",
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
+)
+def check_all_units_availability(
+    check_in: date = Query(...),
+    check_out: date = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Batch counterpart to /units/{unit_id}/availability — for the "staff
+    enters dates, sees which units are actually bookable" enquiry flow.
+    One query for candidate units + one pair of queries for conflicts
+    (see units_availability), not one round-trip per unit.
+    """
+    if check_out <= check_in:
+        raise HTTPException(400, "check_out must be after check_in")
+
+    units = db.scalars(select(Unit).where(Unit.status == "available", Unit.is_active.is_(True))).all()
+    active_property_ids = {p.id for p in db.scalars(select(Property).where(Property.is_active.is_(True))).all()}
+    candidate_units = [u for u in units if u.property_id in active_property_ids]
+
+    availability = units_availability(db, [u.id for u in candidate_units], check_in, check_out)
+
+    return [
+        {"unit_id": u.id, "name": u.name, "unit_code": u.unit_code, "available": availability[u.id]}
+        for u in candidate_units
+    ]
 
 
 @router.post(
     "/bookings",
     response_model=BookingOut,
     status_code=201,
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def create_booking(payload: BookingCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     unit = db.get(Unit, payload.unit_id)
@@ -434,6 +522,18 @@ def create_booking(payload: BookingCreate, db: Session = Depends(get_db), user: 
         )
     if not unit.is_active or not unit.property.is_active:
         raise HTTPException(status.HTTP_409_CONFLICT, "This unit (or its property) has been deactivated and is not available for new bookings")
+    # The bookings.no_overlapping_bookings EXCLUDE constraint below only
+    # compares against OTHER bookings — it has no way to see a website
+    # guest's active payment hold on this same unit/range, since holds
+    # live in a different table. Without this pre-check, staff could
+    # confirm a manual booking here while a website payment for the same
+    # dates is already in flight, and that guest's payment would then
+    # fail to convert to a booking *after* their card was already charged.
+    if not unit_is_available(db, payload.unit_id, payload.check_in, payload.check_out):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This unit is already booked, or a website payment for these dates is in progress, for an overlapping date range",
+        )
 
     guest = db.get(Guest, payload.guest_id)
     if guest is None:
@@ -476,12 +576,13 @@ def create_booking(payload: BookingCreate, db: Session = Depends(get_db), user: 
     return booking
 
 
-@router.get("/bookings", response_model=list[BookingOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/bookings", response_model=list[BookingOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_bookings(
     status: str | None = None,
     unit_id: uuid.UUID | None = None,
     guest_id: uuid.UUID | None = None,
     search: str | None = Query(None, description="Matches guest name or phone"),
+    include_archived: bool = Query(False, description="Include archived bookings. Default excludes them, same as before archiving existed."),
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -496,6 +597,8 @@ def list_bookings(
     unbounded one.
     """
     query = select(Booking)
+    if not include_archived:
+        query = query.where(Booking.is_archived.is_(False))
     if status:
         query = query.where(Booking.status == status)
     if unit_id:
@@ -510,7 +613,7 @@ def list_bookings(
     return db.scalars(query).all()
 
 
-@router.patch("/bookings/{booking_id}/status", response_model=BookingOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/bookings/{booking_id}/status", response_model=BookingOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_booking_status(booking_id: uuid.UUID, new_status: str = Query(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     booking = db.get(Booking, booking_id)
     if booking is None:
@@ -551,7 +654,7 @@ def update_booking_status(booking_id: uuid.UUID, new_status: str = Query(...), d
     return booking
 
 
-@router.patch("/bookings/{booking_id}", response_model=BookingOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/bookings/{booking_id}", response_model=BookingOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_booking(booking_id: uuid.UUID, payload: BookingUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
     Full reservation edit — guest, unit, dates, or rate. Changing dates or
@@ -564,7 +667,22 @@ def update_booking(booking_id: uuid.UUID, payload: BookingUpdate, db: Session = 
     if booking is None:
         raise HTTPException(404, "Booking not found")
 
-    changes = payload.model_dump(exclude_unset=True, exclude={"reason"})
+    if payload.expected_updated_at is not None:
+        # Optimistic concurrency: if what the editor loaded is no longer
+        # what's in the database, someone else changed this booking in the
+        # meantime — fail the edit rather than silently overwriting it.
+        # Exact comparison (not a tolerance window) — the frontend echoes
+        # back the identical ISO timestamp string it was given, which
+        # round-trips through JSON/pydantic/psycopg without precision loss,
+        # and two genuinely distinct edits can legitimately land within the
+        # same second of each other.
+        if booking.updated_at != payload.expected_updated_at:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This booking was changed by someone else since you opened it. Reload it and try again.",
+            )
+
+    changes = payload.model_dump(exclude_unset=True, exclude={"reason", "expected_updated_at"})
     if not changes:
         raise HTTPException(400, "No fields to update were provided")
 
@@ -660,7 +778,59 @@ def delete_booking(booking_id: uuid.UUID, db: Session = Depends(get_db), user: U
     db.commit()
 
 
-@router.post("/bookings/{booking_id}/attachments", response_model=BookingAttachmentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/bookings/{booking_id}/archive", response_model=BookingOut, dependencies=[Depends(require_role("admin"))])
+def archive_booking(booking_id: uuid.UUID, payload: BookingArchiveRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Administrative "remove from the active list" action — distinct from
+    Cancel (a business status transition, see update_booking_status) and
+    from the hard DELETE above (blocked whenever any financial record
+    exists). Archiving never touches status, payments, invoices, GST, or
+    audit history, and is always reversible via /restore. Repeating an
+    archive request on an already-archived booking is a safe no-op — it
+    returns the current state rather than erroring or double-logging.
+    """
+    booking = db.get(Booking, booking_id)
+    if booking is None:
+        raise HTTPException(404, "Booking not found")
+
+    if booking.is_archived:
+        return booking
+
+    booking.is_archived = True
+    booking.archived_at = datetime.now(timezone.utc)
+    booking.archived_by = user.id
+    booking.archive_reason = payload.reason
+    record_audit_log(
+        db, user.id, "booking.archive", entity_type="booking", entity_id=str(booking.id),
+        details=f"Reason: {payload.reason or 'not given'} (status was {booking.status})",
+    )
+    db.commit()
+    db.refresh(booking)
+    return booking
+
+
+@router.post("/bookings/{booking_id}/restore", response_model=BookingOut, dependencies=[Depends(require_role("admin"))])
+def restore_booking(booking_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Reverses archive_booking. Same idempotency rule: restoring a booking
+    that isn't archived is a safe no-op, not an error."""
+    booking = db.get(Booking, booking_id)
+    if booking is None:
+        raise HTTPException(404, "Booking not found")
+
+    if not booking.is_archived:
+        return booking
+
+    booking.is_archived = False
+    booking.archived_at = None
+    booking.archived_by = None
+    booking.archive_reason = None
+    record_audit_log(db, user.id, "booking.restore", entity_type="booking", entity_id=str(booking.id), details="Restored from archive")
+    db.commit()
+    db.refresh(booking)
+    return booking
+
+
+@router.post("/bookings/{booking_id}/attachments", response_model=BookingAttachmentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 async def upload_attachment(booking_id: uuid.UUID, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     booking = db.get(Booking, booking_id)
     if booking is None:
@@ -687,12 +857,12 @@ async def upload_attachment(booking_id: uuid.UUID, file: UploadFile = File(...),
     return attachment
 
 
-@router.get("/bookings/{booking_id}/attachments", response_model=list[BookingAttachmentOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/bookings/{booking_id}/attachments", response_model=list[BookingAttachmentOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_attachments(booking_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(BookingAttachment).where(BookingAttachment.booking_id == booking_id)).all()
 
 
-@router.get("/bookings/{booking_id}/attachments/{attachment_id}/download", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/bookings/{booking_id}/attachments/{attachment_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_attachment(booking_id: uuid.UUID, attachment_id: uuid.UUID, db: Session = Depends(get_db)):
     attachment = db.get(BookingAttachment, attachment_id)
     if attachment is None or attachment.booking_id != booking_id:
@@ -702,7 +872,7 @@ def download_attachment(booking_id: uuid.UUID, attachment_id: uuid.UUID, db: Ses
     return FileResponse(attachment.file_path, media_type=attachment.content_type, filename=attachment.filename)
 
 
-@router.delete("/bookings/{booking_id}/attachments/{attachment_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff"))])
+@router.delete("/bookings/{booking_id}/attachments/{attachment_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_attachment(booking_id: uuid.UUID, attachment_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     attachment = db.get(BookingAttachment, attachment_id)
     if attachment is None or attachment.booking_id != booking_id:
@@ -714,7 +884,7 @@ def delete_attachment(booking_id: uuid.UUID, attachment_id: uuid.UUID, db: Sessi
     db.commit()
 
 
-@router.get("/bookings/{booking_id}/timeline", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/bookings/{booking_id}/timeline", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_booking_timeline(booking_id: uuid.UUID, db: Session = Depends(get_db)):
     """
     Every audit-logged action against this specific booking, oldest

@@ -1,7 +1,17 @@
 """
 Dynamic pricing engine.
 
-Resolution order per night, from highest to lowest priority:
+Top-level priority (highest first):
+  0. Long-stay absolute nightly rate: if the stay is `long_stay_min_nights`
+     nights or longer AND a `long_stay_rate` is configured, EVERY night of
+     the stay is billed at that one flat rate. This is an absolute
+     override, not a discount off the rates below — it short-circuits
+     seasonal/weekend/weekday resolution and the percentage discount tiers
+     entirely for the whole stay, rather than blending with them. A
+     qualifying 30-night stay is 30 x long_stay_rate, never a mixture of
+     weekday/weekend/seasonal nights.
+
+Otherwise, resolution order per night, from highest to lowest priority:
   1. Seasonal rate override (if the night falls within any SeasonalRate
      range for this unit) — if multiple seasonal ranges overlap for the
      same night, the most-recently-created one wins (documented choice,
@@ -10,9 +20,12 @@ Resolution order per night, from highest to lowest priority:
      stayed) and a weekend_rate is set on the unit.
   3. The unit's base_rate (weekday rate) otherwise.
 
-Long-stay discount is then applied as a percentage off the summed
-pre-discount subtotal, using the tier with the HIGHEST min_nights the
-stay still qualifies for (see LongStayDiscountTier docstring in models.py).
+Long-stay discount (the older, separate mechanism: LongStayDiscountTier)
+is then applied as a percentage off the summed pre-discount subtotal,
+using the tier with the HIGHEST min_nights the stay still qualifies for
+(see LongStayDiscountTier docstring in models.py) — but only when the
+long-stay absolute rate above did NOT already apply; the two mechanisms
+never stack.
 
 This module is deliberately pure/stateless (takes plain data in, returns
 plain data out) so it's easy to unit-test without a live database inside
@@ -27,7 +40,7 @@ from datetime import date, timedelta
 class DayRate:
     the_date: date
     rate: float
-    source: str  # "seasonal" | "weekend" | "weekday"
+    source: str  # "long_stay" | "seasonal" | "weekend" | "weekday"
     seasonal_name: str | None = None
 
 
@@ -58,12 +71,47 @@ def calculate_price(
     weekend_rate: float | None,
     seasonal_rates: list[dict],
     discount_tiers: list[dict],
+    long_stay_min_nights: int | None = None,
+    long_stay_rate: float | None = None,
 ) -> PriceQuote:
     if check_out <= check_in:
         raise ValueError("check_out must be after check_in")
 
     nights = (check_out - check_in).days
     daily: list[DayRate] = []
+
+    long_stay_applies = (
+        long_stay_min_nights is not None
+        and long_stay_rate is not None
+        and nights >= long_stay_min_nights
+    )
+
+    if long_stay_applies:
+        # Absolute override: every night of the stay is billed at the one
+        # flat long_stay_rate — no seasonal/weekend/weekday resolution and
+        # no percentage discount tier, by design (see module docstring).
+        current = check_in
+        while current < check_out:
+            daily.append(DayRate(the_date=current, rate=float(long_stay_rate), source="long_stay"))
+            current += timedelta(days=1)
+
+        subtotal_before_discount = round(sum(d.rate for d in daily), 2)
+        discount_percent = 0.0
+        discount_amount = 0.0
+        subtotal_after_discount = subtotal_before_discount
+        average_nightly_rate = float(long_stay_rate)
+
+        return PriceQuote(
+            check_in=check_in,
+            check_out=check_out,
+            nights=nights,
+            daily_breakdown=daily,
+            subtotal_before_discount=subtotal_before_discount,
+            long_stay_discount_percent=discount_percent,
+            long_stay_discount_amount=discount_amount,
+            subtotal_after_discount=subtotal_after_discount,
+            average_nightly_rate=average_nightly_rate,
+        )
 
     sorted_seasonal = sorted(seasonal_rates, key=lambda s: s.get("created_at") or date.min)
 

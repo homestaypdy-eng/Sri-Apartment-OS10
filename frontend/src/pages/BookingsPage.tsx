@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type BookingAttachmentOut, type BookingOut, type GuestOut, type UnitOut, type PaymentOut, type PropertyOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, SkeletonRows, EmptyState } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
@@ -23,9 +23,11 @@ export default function BookingsPage() {
   });
   const [checkingAvailability, setCheckingAvailability] = useState(false);
   const [loadingBookings, setLoadingBookings] = useState(true);
+  const [refreshingBookings, setRefreshingBookings] = useState(false);
+  const lastBookingsRefreshRef = useRef(0);
 
   const [detailsBookingId, setDetailsBookingId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState({ guest_id: "", unit_id: "", check_in: "", check_out: "", rate_applied: "", reason: "", adults: "1", children: "0", extra_bed: false, arrival_time: "", departure_time: "" });
+  const [editForm, setEditForm] = useState({ guest_id: "", unit_id: "", check_in: "", check_out: "", rate_applied: "", reason: "", adults: "1", children: "0", extra_bed: false, arrival_time: "", departure_time: "", internal_notes: "", special_requests: "", expected_updated_at: "" });
   const [selectedEditGuest, setSelectedEditGuest] = useState<GuestOut | null>(null);
   const [attachments, setAttachments] = useState<BookingAttachmentOut[]>([]);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
@@ -37,10 +39,30 @@ export default function BookingsPage() {
   const [refundForm, setRefundForm] = useState({ refund_amount: "", reason: "" });
   const [bookingSearch, setBookingSearch] = useState("");
   const [bookingStatusFilter, setBookingStatusFilter] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
+  const [archivingBooking, setArchivingBooking] = useState(false);
+  const [archiveReason, setArchiveReason] = useState("");
+  const detailsRef = useRef<HTMLDivElement>(null);
+
+  // Clicking Edit opens the Reservation Details panel above the booking
+  // table (it's a single shared panel, not one per row), which can be far
+  // below the row that was clicked on a long list — this brings the panel
+  // into view instead of leaving the user to scroll and hunt for it.
+  useEffect(() => {
+    if (detailsBookingId && detailsRef.current) {
+      detailsRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+      detailsRef.current.focus();
+    }
+  }, [detailsBookingId]);
 
   async function loadAll() {
     try {
-      const [b, u, g, p] = await Promise.all([api.get("/bookings"), api.get("/units"), api.get("/guests"), api.get("/properties")]);
+      const [b, u, g, p] = await Promise.all([
+        api.get("/bookings", { params: showArchived ? { include_archived: true } : undefined }),
+        api.get("/units"),
+        api.get("/guests"),
+        api.get("/properties"),
+      ]);
       setBookings(b.data);
       setUnits(u.data);
       setGuests(g.data);
@@ -52,9 +74,66 @@ export default function BookingsPage() {
     }
   }
 
+  // Lighter-weight than loadAll(): re-fetches bookings and guests (not
+  // units/properties, which don't go stale nearly as often — the six real
+  // apartments essentially never change) and never shows the full-table
+  // skeleton — existing rows stay visible while this resolves, since it's
+  // a background refresh, not the initial load. Guests are included
+  // alongside bookings because guestName() below resolves a booking's
+  // guest_id against this same list: a booking for a brand-new guest
+  // (e.g. a website guest who has never booked before) would otherwise
+  // render "—" after a background refresh until the next full page load,
+  // even though the booking itself was already showing correctly.
+  const refreshBookings = useCallback(async () => {
+    setRefreshingBookings(true);
+    try {
+      const [b, g] = await Promise.all([
+        api.get("/bookings", { params: showArchived ? { include_archived: true } : undefined }),
+        api.get("/guests"),
+      ]);
+      setBookings(b.data);
+      setGuests(g.data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    } finally {
+      setRefreshingBookings(false);
+    }
+  }, [showArchived]);
+
   useEffect(() => {
     loadAll();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showArchived]);
+
+  // Booking/OS10 freshness fix: a booking confirmed on the public website
+  // while this page was already open (e.g. a guest paying while staff has
+  // Bookings open in another tab) never appeared until a manual page
+  // reload, since the bookings list was only ever fetched once on mount.
+  // Refetching when the tab regains focus/visibility closes that gap
+  // without resorting to continuous polling.
+  useEffect(() => {
+    function handleVisibilityOrFocus() {
+      if (document.visibilityState !== "visible") return;
+      const now = Date.now();
+      // Browsers commonly fire both "visibilitychange" and "focus" for the
+      // same tab-switch — without this guard, returning to the tab would
+      // trigger two near-simultaneous /bookings requests instead of one.
+      if (now - lastBookingsRefreshRef.current < 1000) return;
+      lastBookingsRefreshRef.current = now;
+      refreshBookings();
+    }
+    window.addEventListener("focus", handleVisibilityOrFocus);
+    document.addEventListener("visibilitychange", handleVisibilityOrFocus);
+    return () => {
+      window.removeEventListener("focus", handleVisibilityOrFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityOrFocus);
+    };
+  }, [refreshBookings]);
+
+  function handleManualBookingsRefresh() {
+    lastBookingsRefreshRef.current = Date.now();
+    refreshBookings();
+  }
 
   useEffect(() => {
     setAvailability({ checked: false, available: false });
@@ -161,6 +240,8 @@ export default function BookingsPage() {
       rate_applied: String(b.rate_applied), reason: "",
       adults: String(b.adults), children: String(b.children), extra_bed: b.extra_bed,
       arrival_time: b.arrival_time ?? "", departure_time: b.departure_time ?? "",
+      internal_notes: b.internal_notes ?? "", special_requests: b.special_requests ?? "",
+      expected_updated_at: b.updated_at,
     });
     setSelectedEditGuest(guests.find((g) => g.id === b.guest_id) ?? null);
     api.get(`/bookings/${b.id}/attachments`).then((r) => setAttachments(r.data)).catch(() => setAttachments([]));
@@ -168,6 +249,8 @@ export default function BookingsPage() {
     api.get(`/payments/${b.id}`).then((r) => setPayments(r.data)).catch(() => setPayments([]));
     setShowTimeline(false);
     setRefundingPaymentId(null);
+    setArchivingBooking(false);
+    setArchiveReason("");
   }
 
   function closeDetails() {
@@ -178,6 +261,8 @@ export default function BookingsPage() {
     setPayments([]);
     setRefundingPaymentId(null);
     setSelectedEditGuest(null);
+    setArchivingBooking(false);
+    setArchiveReason("");
   }
 
   async function handleAddPayment(e: FormEvent) {
@@ -222,6 +307,11 @@ export default function BookingsPage() {
     return list.reduce((sum, p) => sum + p.amount, 0);
   }
 
+  function estimatedTotal(b: BookingOut): number {
+    const nights = Math.max(0, (new Date(b.check_out).getTime() - new Date(b.check_in).getTime()) / (1000 * 60 * 60 * 24));
+    return Math.round(nights * b.rate_applied);
+  }
+
   function refundedSoFar(list: PaymentOut[], paymentId: string): number {
     return list.filter((p) => p.refund_of_payment_id === paymentId).reduce((sum, p) => sum + Math.abs(p.amount), 0);
   }
@@ -242,11 +332,27 @@ export default function BookingsPage() {
         rate_applied: Number(editForm.rate_applied), reason: editForm.reason || undefined,
         adults: Number(editForm.adults), children: Number(editForm.children), extra_bed: editForm.extra_bed,
         arrival_time: editForm.arrival_time || undefined, departure_time: editForm.departure_time || undefined,
+        internal_notes: editForm.internal_notes || undefined, special_requests: editForm.special_requests || undefined,
+        expected_updated_at: editForm.expected_updated_at || undefined,
       });
       setSuccess("Booking updated.");
       closeDetails();
       loadAll();
     } catch (err) {
+      // A 409 here means someone else changed this booking since it was
+      // opened — reload its current state into the form instead of just
+      // showing an error, so the user isn't stuck re-entering everything
+      // from scratch to see what changed.
+      const status = (err as { response?: { status?: number } })?.response?.status;
+      if (status === 409 && detailsBookingId) {
+        try {
+          const fresh = await api.get(`/bookings`, { params: { include_archived: true } });
+          const freshBooking = (fresh.data as BookingOut[]).find((b) => b.id === detailsBookingId);
+          if (freshBooking) openDetails(freshBooking);
+        } catch {
+          // fall through to showing the original error below
+        }
+      }
       setError(extractErrorMessage(err));
     }
   }
@@ -258,6 +364,34 @@ export default function BookingsPage() {
     try {
       await api.delete(`/bookings/${bookingId}`);
       setSuccess("Booking deleted.");
+      closeDetails();
+      loadAll();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleArchiveBooking(e: FormEvent) {
+    e.preventDefault();
+    if (!detailsBookingId) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post(`/bookings/${detailsBookingId}/archive`, { reason: archiveReason || undefined });
+      setSuccess("Booking archived. It's been removed from the active list but its history, payments, and invoices are preserved — restore it any time.");
+      closeDetails();
+      loadAll();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleRestoreBooking(bookingId: string) {
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post(`/bookings/${bookingId}/restore`);
+      setSuccess("Booking restored to the active list.");
       closeDetails();
       loadAll();
     } catch (err) {
@@ -388,9 +522,13 @@ export default function BookingsPage() {
       </Card>
 
       {detailsBooking && (
+        <div ref={detailsRef} tabIndex={-1} className="outline-none">
         <Card className="mb-8">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-sm font-semibold text-slate-900">Reservation Details</h2>
+            <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+              Reservation Details
+              {detailsBooking.is_archived && <Badge tone="amber">Archived</Badge>}
+            </h2>
             <button onClick={closeDetails} className="text-xs text-slate-400 hover:text-slate-600 underline">Close</button>
           </div>
 
@@ -418,12 +556,36 @@ export default function BookingsPage() {
             </label>
             <input placeholder="Arrival time (e.g. 14:00)" value={editForm.arrival_time} onChange={(e) => setEditForm({ ...editForm, arrival_time: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
             <input placeholder="Departure time (e.g. 11:00)" value={editForm.departure_time} onChange={(e) => setEditForm({ ...editForm, departure_time: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <textarea
+              placeholder="Internal notes (staff-only, never shown to the guest)"
+              value={editForm.internal_notes}
+              onChange={(e) => setEditForm({ ...editForm, internal_notes: e.target.value })}
+              className="sm:col-span-2 rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              rows={2}
+            />
+            <textarea
+              placeholder="Special requests (what the guest asked for)"
+              value={editForm.special_requests}
+              onChange={(e) => setEditForm({ ...editForm, special_requests: e.target.value })}
+              className="sm:col-span-2 rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              rows={2}
+            />
             <input placeholder="Reason for change (for audit log)" value={editForm.reason} onChange={(e) => setEditForm({ ...editForm, reason: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <div className="sm:col-span-2 flex gap-3">
+            <div className="sm:col-span-2 flex gap-3 flex-wrap">
               <Button type="submit">Save Changes</Button>
               {(detailsBooking.status === "confirmed" || detailsBooking.status === "inquiry") && (
                 <Button type="button" variant="danger" onClick={() => handleCancelBooking(detailsBooking.id)}>
                   Cancel Booking
+                </Button>
+              )}
+              {isAdmin && !detailsBooking.is_archived && (
+                <Button type="button" variant="secondary" onClick={() => { setArchivingBooking(true); setArchiveReason(""); }}>
+                  Archive Booking
+                </Button>
+              )}
+              {isAdmin && detailsBooking.is_archived && (
+                <Button type="button" variant="secondary" onClick={() => handleRestoreBooking(detailsBooking.id)}>
+                  Restore Booking
                 </Button>
               )}
               {isAdmin && (
@@ -433,6 +595,34 @@ export default function BookingsPage() {
               )}
             </div>
           </form>
+
+          {archivingBooking && (
+            <form onSubmit={handleArchiveBooking} className="mb-4 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm space-y-2">
+              <h3 className="text-xs font-semibold text-amber-800 uppercase tracking-wide">Archive Booking</h3>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-slate-700">
+                <span>Guest: <span className="font-medium">{guestName(detailsBooking.guest_id)}</span></span>
+                <span>Apartment: <span className="font-medium">{unitName(detailsBooking.unit_id)}</span></span>
+                <span>Check-in: <span className="font-medium">{detailsBooking.check_in}</span></span>
+                <span>Check-out: <span className="font-medium">{detailsBooking.check_out}</span></span>
+                <span>Status: <span className="font-medium">{detailsBooking.status}</span></span>
+                <span>Estimated total: <span className="font-medium">₹{estimatedTotal(detailsBooking).toLocaleString()}</span></span>
+                <span>Advance received: <span className="font-medium">₹{netPaid(payments).toLocaleString()}</span></span>
+              </div>
+              <p className="text-xs text-amber-700">
+                This removes the booking from the active list. Payments, invoices, GST records, and audit history are all preserved, and it can be restored at any time.
+              </p>
+              <input
+                placeholder="Reason (optional)"
+                value={archiveReason}
+                onChange={(e) => setArchiveReason(e.target.value)}
+                className="w-full rounded-lg border border-amber-300 px-3 py-2 text-xs"
+              />
+              <div className="flex gap-2">
+                <Button type="submit" variant="danger">Archive Booking</Button>
+                <button type="button" onClick={() => setArchivingBooking(false)} className="text-slate-500 hover:underline text-xs">Cancel</button>
+              </div>
+            </form>
+          )}
 
           <div className="border-t border-slate-100 pt-4 mb-4">
             <h3 className="text-xs font-semibold text-slate-700 mb-3 uppercase tracking-wide">Payments</h3>
@@ -554,12 +744,18 @@ export default function BookingsPage() {
             )}
           </div>
         </Card>
+        </div>
       )}
 
       <Card>
         <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <h2 className="text-sm font-semibold text-slate-900">All Bookings</h2>
-          <Button variant="secondary" onClick={exportBookingsCsv}>Export CSV</Button>
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" onClick={handleManualBookingsRefresh} disabled={refreshingBookings}>
+              {refreshingBookings ? "Refreshing..." : "Refresh"}
+            </Button>
+            <Button variant="secondary" onClick={exportBookingsCsv}>Export CSV</Button>
+          </div>
         </div>
         <div className="flex flex-wrap gap-2 mb-4">
           <input
@@ -576,6 +772,12 @@ export default function BookingsPage() {
             <option value="cancelled">Cancelled</option>
             <option value="no_show">No Show</option>
           </select>
+          {isAdmin && (
+            <label className="flex items-center gap-1.5 text-xs text-slate-600">
+              <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+              Show archived
+            </label>
+          )}
         </div>
         {!loadingBookings && filteredBookings.length === 0 ? (
           <EmptyState message={bookings.length === 0 ? "No bookings yet. Create one using the form above." : "No bookings match these filters."} />
@@ -592,19 +794,24 @@ export default function BookingsPage() {
                     <td className="px-4 py-2.5 text-slate-500">{b.check_in}</td>
                     <td className="px-4 py-2.5 text-slate-500">{b.check_out}</td>
                     <td className="px-4 py-2.5 text-slate-500">₹{b.rate_applied}</td>
-                    <td className="px-4 py-2.5">
+                    <td className="px-4 py-2.5 space-x-1">
                       <Badge tone={b.status === "confirmed" ? "green" : b.status === "checked_in" ? "amber" : "slate"}>{b.status}</Badge>
+                      {b.is_archived && <Badge tone="amber">Archived</Badge>}
                     </td>
                     <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
-                      {b.status === "confirmed" && (
+                      {!b.is_archived && b.status === "confirmed" && (
                         <Button variant="secondary" onClick={() => transitionStatus(b.id, "checked_in")}>Check In</Button>
                       )}
-                      {b.status === "checked_in" && (
+                      {!b.is_archived && b.status === "checked_in" && (
                         <Button variant="secondary" onClick={() => transitionStatus(b.id, "checked_out")}>Check Out</Button>
                       )}
-                      {(b.status === "confirmed" || b.status === "inquiry") && (
+                      {!b.is_archived && (b.status === "confirmed" || b.status === "inquiry") && (
                         <Button variant="danger" onClick={() => handleCancelBooking(b.id)}>Cancel</Button>
                       )}
+                      {b.is_archived && isAdmin && (
+                        <Button variant="secondary" onClick={() => handleRestoreBooking(b.id)}>Restore</Button>
+                      )}
+                      <Button variant="secondary" onClick={() => openDetails(b)}>Edit</Button>
                       <Button variant="secondary" onClick={() => openDetails(b)}>Details</Button>
                     </td>
                   </tr>

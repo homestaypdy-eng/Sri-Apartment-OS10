@@ -25,6 +25,7 @@ class HousekeepingTaskOut(BaseModel):
     status: str
     notes: str | None
     created_at: datetime
+    started_at: datetime | None
     completed_at: datetime | None
 
     class Config:

@@ -3,25 +3,36 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import NotificationBell from "./NotificationBell";
 
+// RBAC Phase B: adminOnly items are also correctly hidden from Manager
+// (the filter below checks role === "admin", same as it always did — a
+// third role doesn't change that). hiddenFromManager is the new, opposite
+// case: routes Staff can still see but Manager's backend access doesn't
+// cover yet (the whole Staff/HR module, and Settings — see
+// RequireNotManager in RequireAuth.tsx for why: neither GET /staff/...
+// nor GET /settings was granted to Manager in Phase B Part 1).
 const navItems = [
   { to: "/", label: "Dashboard", end: true },
   { to: "/properties", label: "Properties & Units" },
   { to: "/guests", label: "Guests" },
   { to: "/bookings", label: "Bookings" },
+  { to: "/operations", label: "Staff Operations" },
   { to: "/inquiries", label: "Inquiries" },
   { to: "/housekeeping", label: "Housekeeping" },
   { to: "/maintenance", label: "Maintenance" },
   { to: "/inventory", label: "Inventory" },
-  { to: "/staff", label: "Staff" },
+  { to: "/staff", label: "Staff", hiddenFromManager: true },
   { to: "/guest-requests", label: "Guest Requests" },
   { to: "/billing", label: "Billing" },
   { to: "/finance", label: "Finance" },
   { to: "/reports", label: "Reports Center" },
+  { to: "/ai-strategist", label: "AI Strategist", adminOnly: true },
   { to: "/profit-simulator", label: "Profit Simulator" },
   { to: "/notifications", label: "Notifications" },
-  { to: "/settings", label: "Settings" },
+  { to: "/promo-codes", label: "Promo Codes" },
+  { to: "/settings", label: "Settings", hiddenFromManager: true },
   { to: "/audit", label: "Audit", adminOnly: true },
   { to: "/users", label: "Users", adminOnly: true },
+  { to: "/zotel", label: "Zotel Integration", adminOnly: true },
 ];
 
 export default function Layout() {
@@ -34,7 +45,9 @@ export default function Layout() {
     navigate("/login");
   }
 
-  const visibleItems = navItems.filter((item) => !item.adminOnly || role === "admin");
+  const visibleItems = navItems.filter(
+    (item) => (!item.adminOnly || role === "admin") && (!item.hiddenFromManager || role !== "manager")
+  );
 
   const sidebarContent = (
     <>

@@ -1,10 +1,11 @@
 import json
 import logging
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
 from app.modules.payment_gateway.models import GatewayOrder, Refund, WebhookEvent
 from app.modules.payment_gateway.schemas import (
@@ -27,7 +28,7 @@ logger = logging.getLogger("sri_apartment_os")
 router = APIRouter(prefix="/api/v1/payment-gateway", tags=["payment-gateway"])
 
 
-@router.post("/orders", response_model=GatewayOrderOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/orders", response_model=GatewayOrderOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_gateway_order(payload: CreateOrderRequest, db: Session = Depends(get_db)):
     order = GatewayOrder(
         booking_id=payload.booking_id,
@@ -55,7 +56,7 @@ def create_gateway_order(payload: CreateOrderRequest, db: Session = Depends(get_
 
 
 @router.post("/webhook")
-async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(None), db: Session = Depends(get_db)):
+async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks, x_razorpay_signature: str = Header(None), db: Session = Depends(get_db)):
     """
     Public endpoint (Razorpay calls this directly, no user JWT) — security
     comes entirely from signature verification, not auth headers. This is
@@ -104,6 +105,7 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
                     from datetime import datetime, timezone
                     from app.modules.public_booking.models import BookingHold
                     from app.modules.public_booking.router import _convert_hold_to_booking
+                    from app.modules.notifications.service import dispatch_booking_notifications
 
                     hold = db.get(BookingHold, order.hold_id)
                     if hold and hold.status == "pending_payment":
@@ -113,7 +115,13 @@ async def razorpay_webhook(request: Request, x_razorpay_signature: str = Header(
                             from datetime import datetime, timezone
                             hold.updated_at = datetime.now(timezone.utc)
                             try:
-                                _convert_hold_to_booking(db, hold)
+                                booking, _invoice = _convert_hold_to_booking(db, hold)
+                                # Same fix as verify-payment: notification sending
+                                # must never happen inline here — it would delay
+                                # Razorpay's webhook ack the same way it delayed
+                                # the browser's response (see
+                                # dispatch_booking_notifications' docstring).
+                                background_tasks.add_task(dispatch_booking_notifications, booking.id)
                             except Exception as exc:
                                 logger.error("Webhook hold conversion failed for hold %s: %s", order.hold_id, exc)
                         else:
@@ -146,6 +154,17 @@ def issue_refund(payload: RefundRequest, db: Session = Depends(get_db), user: Us
         db.rollback()
         raise HTTPException(502, f"Refund failed: {e}")
 
+    # RBAC Phase B: closes a real, pre-existing audit gap — this endpoint
+    # previously recorded no audit trail at all for a genuine financial
+    # refund. Logged only on the success path (refund.status == "processed"),
+    # matching the existing convention elsewhere of logging completed
+    # actions, not attempts. Business logic above is unchanged.
+    record_audit_log(
+        db, user.id, "payment_gateway.refund", entity_type="refund", entity_id=str(refund.id),
+        details=f"Refunded {payload.amount} against payment {payload.payment_id}" + (f": {payload.reason}" if payload.reason else ""),
+        previous_value=f"payment_amount={payment.amount}",
+        new_value=f"refund_amount={payload.amount}, refund_status={refund.status}",
+    )
     db.commit()
     db.refresh(refund)
     return refund

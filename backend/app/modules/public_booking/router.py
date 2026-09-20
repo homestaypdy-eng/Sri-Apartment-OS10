@@ -9,10 +9,12 @@ Flow:
 No authentication — these are called by anonymous website visitors.
 Rate limiting is a known gap (see README), same as the rest of this system.
 """
+import os
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -20,7 +22,8 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.modules.bookings.models import Booking, Guest
-from app.modules.notifications.service import trigger_booking_confirmation, trigger_booking_confirmation_sms
+from app.modules.notifications.models import NotificationLog
+from app.modules.notifications.service import dispatch_booking_notifications
 from app.modules.payment_gateway.models import GatewayOrder
 from app.modules.payment_gateway.service import (
     GatewayNotConfiguredError,
@@ -30,8 +33,10 @@ from app.modules.payment_gateway.service import (
 from app.core.config import settings
 from app.modules.payments.models import Invoice, Payment
 from app.modules.payments.service import calculate_gst, generate_invoice_pdf, next_invoice_number
-from app.modules.properties.models import LongStayDiscountTier, Property, SeasonalRate, Unit
+from app.modules.properties.models import LongStayDiscountTier, Property, SeasonalRate, Unit, UnitPhoto
+from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
 from app.modules.properties.pricing import calculate_price
+from app.shared.availability import unit_is_available, units_availability
 from app.modules.public_booking.models import BookingHold, PromoCode
 from app.modules.public_booking.schemas import (
     CreateHoldRequest,
@@ -40,8 +45,10 @@ from app.modules.public_booking.schemas import (
     PromoValidateResponse,
     PublicAvailabilityOut,
     PublicBookingConfirmation,
+    PublicBusinessInfoOut,
     PublicQuoteOut,
     PublicUnitOut,
+    PublicUnitPhotoOut,
     QuoteSummaryOut,
     VerifyPaymentRequest,
 )
@@ -101,6 +108,35 @@ def list_promo_codes(db: Session = Depends(get_db)):
     return db.scalars(select(PromoCode)).all()
 
 
+class PromoCodeUpdate(BaseModel):
+    """Partial update — covers edit, activate/deactivate (`active`), and
+    changing expiry (`valid_to`) through one endpoint. `code` itself is
+    immutable after creation (create a new code instead of renaming one
+    that may already be in use/redeemed)."""
+
+    discount_type: str | None = None
+    value: float | None = None
+    valid_from: date | None = None
+    valid_to: date | None = None
+    max_uses: int | None = None
+    active: bool | None = None
+
+
+@promo_admin_router.patch("/{promo_id}", response_model=PromoCodeOut, dependencies=[Depends(require_role("admin"))])
+def update_promo_code(promo_id: uuid.UUID, payload: PromoCodeUpdate, db: Session = Depends(get_db)):
+    promo = db.get(PromoCode, promo_id)
+    if promo is None:
+        raise HTTPException(404, "Promo code not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if "discount_type" in changes and changes["discount_type"] not in ("percent", "flat"):
+        raise HTTPException(400, "discount_type must be 'percent' or 'flat'")
+    for field, value in changes.items():
+        setattr(promo, field, value)
+    db.commit()
+    db.refresh(promo)
+    return promo
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -129,31 +165,48 @@ def _get_full_price_quote(db: Session, unit: Unit, check_in: date, check_out: da
         weekend_rate=float(unit.weekend_rate) if unit.weekend_rate is not None else None,
         seasonal_rates=seasonal,
         discount_tiers=tiers,
+        long_stay_min_nights=unit.long_stay_min_nights,
+        long_stay_rate=float(unit.long_stay_rate),
     )
 
 
 def _check_booking_conflict(db: Session, unit_id: uuid.UUID, check_in: date, check_out: date) -> bool:
-    """Returns True if a confirmed/checked_in booking already overlaps these dates."""
-    conflict = db.execute(
-        text(
-            """
-            SELECT id FROM bookings
-            WHERE unit_id = :unit_id AND status IN ('confirmed', 'checked_in')
-              AND daterange(check_in, check_out, '[)') && daterange(:ci, :co, '[)')
-            LIMIT 1
-            """
-        ),
-        {"unit_id": str(unit_id), "ci": check_in, "co": check_out},
-    ).first()
-    return conflict is not None
+    """Returns True if the unit is unavailable for these dates — an
+    overlapping confirmed/checked_in booking OR an overlapping active
+    hold (another guest already mid-payment). See app/shared/availability.py
+    for why both tables have to be checked, not just bookings."""
+    return not unit_is_available(db, unit_id, check_in, check_out)
 
 
-def _convert_hold_to_booking(db: Session, hold: BookingHold) -> tuple[Booking, Invoice, bool]:
+def _convert_hold_to_booking(db: Session, hold: BookingHold) -> tuple[Booking, Invoice]:
     """
     Core conversion logic — shared by the verify-payment endpoint and the
-    webhook backup path. Creates Guest + Booking + Invoice atomically.
-    Raises HTTPException on conflict (409) so callers can handle appropriately.
-    The hold must already be in 'paid' status before calling this.
+    webhook backup path. Creates Guest + Booking + Invoice + Payment
+    atomically. Raises HTTPException on conflict (409) so callers can
+    handle appropriately. The hold must already be in 'paid' status before
+    calling this.
+
+    Deliberately does ONLY database work — no notification sending. It used
+    to also call every trigger_* function in-line before returning, which
+    meant the browser waited on up to 4 real, sequential SMTP sends before
+    ever getting an HTTP response; in this dev environment that was
+    directly observed blocking for the full 15s smtplib timeout on one
+    send, well past the website's 12s client-side timeout, causing the
+    guest's browser to show a timeout even though the booking had already
+    committed successfully (see dispatch_booking_notifications' docstring
+    for the full root-cause writeup). Callers are responsible for
+    scheduling app.modules.notifications.service.dispatch_booking_notifications
+    as a background task once they've committed.
+
+    Because this function is only ever invoked once per BookingHold (the
+    browser path and the webhook backup path both gate on hold.status
+    before calling it, and a converted hold is never re-converted — see
+    verify_payment()'s idempotent replay branch and the webhook's own
+    hold.status == "pending_payment" check), callers scheduling
+    dispatch_booking_notifications after calling this also only ever do so
+    once per BookingHold — no separate duplicate-call protection needed
+    here (dispatch_booking_notifications' own per-recipient idempotency
+    guard is defense-in-depth on top of that, same as before).
     """
     unit = db.get(Unit, hold.unit_id)
     property_ = db.get(Property, unit.property_id)
@@ -220,6 +273,22 @@ def _convert_hold_to_booking(db: Session, hold: BookingHold) -> tuple[Booking, I
     db.add(payment)
     db.flush()
 
+    # Same bank/UPI + signatory source as the OS10-generated invoice
+    # (payments/router.py) and the quotation PDF — BankSettings/
+    # BusinessSettings, not a second/duplicated config surface.
+    business_settings = get_or_create_settings(db)
+    bank_settings = get_or_create_bank_settings(db)
+    bank_details = {
+        "bank_name": bank_settings.bank_name,
+        "bank_account_name": bank_settings.bank_account_name,
+        "bank_account_number": bank_settings.bank_account_number,
+        "bank_ifsc": bank_settings.bank_ifsc,
+        "bank_branch": bank_settings.bank_branch,
+        "upi_id": bank_settings.upi_id,
+        "signatory_name": business_settings.signatory_name,
+        "signatory_title": business_settings.signatory_title,
+    }
+
     pdf_path = generate_invoice_pdf(
         invoice_no=invoice_no,
         property_name=property_.name,
@@ -237,17 +306,25 @@ def _convert_hold_to_booking(db: Session, hold: BookingHold) -> tuple[Booking, I
         hsn_code=invoice.hsn_code,
         gst_rate_percent=gst_data["gst_rate_percent"],
         itc_available=gst_data["itc_available"],
+        bank_details=bank_details,
+        qr_path=business_settings.qr_code_path,
+        # Paid in full via the payment gateway before a booking is ever
+        # created on this path — reflect that instead of the "0 received"
+        # default, which would misleadingly show a fully-paid web booking
+        # as unpaid on its own invoice.
+        payment_received=float(payment.amount),
+        balance_due=round(float(invoice.total) - float(payment.amount), 2),
+        guest_phone=guest.phone, guest_email=guest.email, guest_address=guest.address,
+        num_guests=booking.adults + booking.children, rate_per_night=float(booking.rate_applied),
+        payment_mode=payment.mode,
     )
     invoice.pdf_path = pdf_path
-
-    emailed = trigger_booking_confirmation(db, booking)
-    trigger_booking_confirmation_sms(db, booking)
 
     hold.booking_id = booking.id
     hold.status = "converted"
     hold.updated_at = datetime.now(timezone.utc)
 
-    return booking, invoice, emailed
+    return booking, invoice
 
 
 # ---------------------------------------------------------------------------
@@ -259,12 +336,74 @@ def list_public_units(db: Session = Depends(get_db)):
     rows = db.execute(
         select(Unit, Property)
         .join(Property, Unit.property_id == Property.id)
-        .where(Unit.status == "available")
+        # is_active (soft-deactivation) and status (available/maintenance/
+        # blocked) are two independent flags — a unit must satisfy both to
+        # be a genuinely bookable public listing. Previously only `status`
+        # was checked, so a deactivated-but-still-"available"-status unit
+        # stayed publicly visible (Phase 5 audit finding).
+        .where(Unit.status == "available", Unit.is_active.is_(True))
     ).all()
     return [
-        PublicUnitOut(id=u.id, name=u.name, base_rate=float(u.base_rate), max_occupancy=u.max_occupancy, property_name=p.name)
+        PublicUnitOut(
+            id=u.id, name=u.name, unit_type=u.unit_type, base_rate=float(u.base_rate),
+            max_occupancy=u.max_occupancy, property_name=p.name, property_type=p.property_type,
+            description=u.description, amenities=u.amenities,
+            bedroom_count=u.bedroom_count, bathroom_count=u.bathroom_count,
+            house_rules=u.house_rules, checkin_time=u.checkin_time, checkout_time=u.checkout_time,
+        )
         for u, p in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Public business contact info — read-only, no auth. Single source of truth
+# for the website's footer/contact/location pages, which previously kept
+# their own separate hardcoded/env-var copy of this same information.
+# Deliberately excludes GST/UDYAM/bank/UPI (admin/staff-only elsewhere).
+# ---------------------------------------------------------------------------
+
+@router.get("/business-info", response_model=PublicBusinessInfoOut)
+def get_public_business_info(db: Session = Depends(get_db)):
+    s = get_or_create_settings(db)
+    return PublicBusinessInfoOut(
+        company_name=s.company_name,
+        address=s.address,
+        contact_phone=s.contact_phone,
+        contact_email=s.contact_email,
+        whatsapp_business_number=s.whatsapp_business_number,
+        house_rules=s.house_rules,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public unit photos — read-only, no auth. Reuses the existing UnitPhoto
+# rows/files created via the admin upload endpoint (properties/router.py);
+# no separate storage or duplicate upload path.
+# ---------------------------------------------------------------------------
+
+@router.get("/units/{unit_id}/photos", response_model=list[PublicUnitPhotoOut])
+def list_public_unit_photos(unit_id: uuid.UUID, db: Session = Depends(get_db)):
+    unit = db.get(Unit, unit_id)
+    if unit is None:
+        raise HTTPException(404, "Unit not found")
+
+    photos = db.scalars(
+        select(UnitPhoto).where(UnitPhoto.unit_id == unit_id).order_by(UnitPhoto.is_primary.desc(), UnitPhoto.sort_order.asc(), UnitPhoto.uploaded_at.asc())
+    ).all()
+    return [
+        PublicUnitPhotoOut(id=p.id, caption=p.caption, url=f"/api/v1/public/units/{unit_id}/photos/{p.id}/image")
+        for p in photos
+    ]
+
+
+@router.get("/units/{unit_id}/photos/{photo_id}/image")
+def get_public_unit_photo_image(unit_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db)):
+    record = db.get(UnitPhoto, photo_id)
+    if record is None or record.unit_id != unit_id:
+        raise HTTPException(404, "Photo not found")
+    if not os.path.exists(record.file_path):
+        raise HTTPException(404, "The stored file is missing from disk")
+    return FileResponse(record.file_path, media_type=record.content_type, filename=record.filename)
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +502,7 @@ def public_quote(
     return PublicQuoteOut(
         unit_id=unit_id,
         unit_name=unit.name,
+        unit_type=unit.unit_type,
         check_in=check_in,
         check_out=check_out,
         nights=quote.nights,
@@ -533,12 +673,18 @@ def create_hold(payload: CreateHoldRequest, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @router.post("/holds/{hold_id}/verify-payment", response_model=PublicBookingConfirmation, status_code=201)
-def verify_payment(hold_id: uuid.UUID, payload: VerifyPaymentRequest, db: Session = Depends(get_db)):
+def verify_payment(hold_id: uuid.UUID, payload: VerifyPaymentRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Verifies the Razorpay payment signature server-side and, on success,
     converts the BookingHold into a confirmed Booking with GST invoice.
     A browser callback alone is never sufficient — this endpoint is the
     authoritative gate.
+
+    Notification sending is scheduled as a background task (see
+    dispatch_booking_notifications) rather than awaited here, so
+    confirmation_emailed/confirmation_sms_sent/confirmation_whatsapp_sent
+    are always None on this fast path — the real outcome becomes available
+    on a replay call (below) once dispatch has completed.
     """
     # P1-2: SELECT FOR UPDATE prevents two concurrent verify-payment calls from
     # both reading pending_payment and both attempting a conversion.
@@ -553,6 +699,30 @@ def verify_payment(hold_id: uuid.UUID, payload: VerifyPaymentRequest, db: Sessio
         if booking is None:
             raise HTTPException(409, "Hold is converted but the linked booking could not be found")
         invoice = db.scalar(select(Invoice).where(Invoice.booking_id == booking.id))
+        # A refresh/retry of this page must show what actually happened on
+        # the original call, not a blank/unknown placeholder — look up the
+        # real outcome from the notification log instead of guessing.
+        emailed = db.scalar(
+            select(NotificationLog.success).where(
+                NotificationLog.booking_id == booking.id,
+                NotificationLog.event_type == "booking_confirmation",
+                NotificationLog.channel == "email",
+            ).order_by(NotificationLog.created_at.desc()).limit(1)
+        )
+        sms_sent = db.scalar(
+            select(NotificationLog.success).where(
+                NotificationLog.booking_id == booking.id,
+                NotificationLog.event_type == "booking_confirmation",
+                NotificationLog.channel == "sms",
+            ).order_by(NotificationLog.created_at.desc()).limit(1)
+        )
+        whatsapp_sent = db.scalar(
+            select(NotificationLog.success).where(
+                NotificationLog.booking_id == booking.id,
+                NotificationLog.event_type == "booking_confirmation",
+                NotificationLog.channel == "whatsapp",
+            ).order_by(NotificationLog.created_at.desc()).limit(1)
+        )
         return PublicBookingConfirmation(
             booking_id=booking.id,
             guest_id=booking.guest_id,
@@ -564,7 +734,9 @@ def verify_payment(hold_id: uuid.UUID, payload: VerifyPaymentRequest, db: Sessio
             total=float(hold.total),
             invoice_id=invoice.id if invoice else None,
             invoice_no=invoice.invoice_no if invoice else None,
-            confirmation_emailed=None,
+            confirmation_emailed=emailed,
+            confirmation_sms_sent=sms_sent,
+            confirmation_whatsapp_sent=whatsapp_sent,
         )
     if hold.status in ("expired", "cancelled"):
         raise HTTPException(409, f"This hold is {hold.status} and cannot be confirmed")
@@ -606,11 +778,17 @@ def verify_payment(hold_id: uuid.UUID, payload: VerifyPaymentRequest, db: Sessio
         gateway_order.status = "paid"
         gateway_order.gateway_payment_id = payload.razorpay_payment_id
 
-    booking, invoice, emailed = _convert_hold_to_booking(db, hold)
+    booking, invoice = _convert_hold_to_booking(db, hold)
 
     db.commit()
     db.refresh(booking)
     db.refresh(invoice)
+
+    # Scheduled to run AFTER this HTTP response has been sent (FastAPI
+    # BackgroundTasks) — see dispatch_booking_notifications' docstring for
+    # why sending it inline here was the actual cause of the payment ->
+    # booking-confirmation timeout bug.
+    background_tasks.add_task(dispatch_booking_notifications, booking.id)
 
     return PublicBookingConfirmation(
         booking_id=booking.id,
@@ -623,5 +801,10 @@ def verify_payment(hold_id: uuid.UUID, payload: VerifyPaymentRequest, db: Sessio
         total=float(hold.total),
         invoice_id=invoice.id,
         invoice_no=invoice.invoice_no,
-        confirmation_emailed=emailed,
+        # Not yet known — dispatch just started in the background. A
+        # replay of this same call (see the "already converted" branch
+        # above) reports the real outcome once it completes.
+        confirmation_emailed=None,
+        confirmation_sms_sent=None,
+        confirmation_whatsapp_sent=None,
     )

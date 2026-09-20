@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
-from app.modules.bookings.schemas import UnitCreate, UnitOut, UnitUpdate
+from app.modules.bookings.schemas import UnitCreate, UnitOut, UnitPricingUpdate, UnitUpdate
 from app.modules.properties.models import LongStayDiscountTier, Property, PropertyFile, SeasonalRate, Unit, UnitPhoto
 from app.modules.properties.pricing import calculate_price
 from app.modules.properties.schemas import (
@@ -24,6 +24,7 @@ from app.modules.properties.schemas import (
     SeasonalRateCreate,
     SeasonalRateOut,
     UnitPhotoOut,
+    UnitPhotoUpdate,
 )
 from app.modules.notifications.service import trigger_property_created
 from app.shared.file_upload import read_and_validate_upload, IMAGE_CONTENT_TYPES
@@ -98,7 +99,7 @@ PROPERTY_FILE_STORAGE_DIR = os.environ.get("PROPERTY_FILE_STORAGE_DIR", "/tmp/sr
 os.makedirs(PROPERTY_FILE_STORAGE_DIR, exist_ok=True)
 
 
-@router.post("/properties/{property_id}/files", response_model=PropertyFileOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/properties/{property_id}/files", response_model=PropertyFileOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 async def upload_property_file(
     property_id: uuid.UUID, file_type: str = "document", caption: str | None = None,
     file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(get_current_user),
@@ -130,12 +131,12 @@ async def upload_property_file(
     return record
 
 
-@router.get("/properties/{property_id}/files", response_model=list[PropertyFileOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/properties/{property_id}/files", response_model=list[PropertyFileOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_property_files(property_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(PropertyFile).where(PropertyFile.property_id == property_id)).all()
 
 
-@router.get("/properties/{property_id}/files/{file_id}/download", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/properties/{property_id}/files/{file_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_property_file(property_id: uuid.UUID, file_id: uuid.UUID, db: Session = Depends(get_db)):
     record = db.get(PropertyFile, file_id)
     if record is None or record.property_id != property_id:
@@ -145,7 +146,7 @@ def download_property_file(property_id: uuid.UUID, file_id: uuid.UUID, db: Sessi
     return FileResponse(record.file_path, media_type=record.content_type, filename=record.filename)
 
 
-@router.delete("/properties/{property_id}/files/{file_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff"))])
+@router.delete("/properties/{property_id}/files/{file_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_property_file(property_id: uuid.UUID, file_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     record = db.get(PropertyFile, file_id)
     if record is None or record.property_id != property_id:
@@ -157,7 +158,7 @@ def delete_property_file(property_id: uuid.UUID, file_id: uuid.UUID, db: Session
     db.commit()
 
 
-@router.get("/properties", response_model=list[PropertyOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/properties", response_model=list[PropertyOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_properties(db: Session = Depends(get_db)):
     return db.query(Property).all()
 
@@ -175,7 +176,7 @@ def create_unit(payload: UnitCreate, db: Session = Depends(get_db), user: User =
     return unit
 
 
-@router.get("/units", response_model=list[UnitOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/units", response_model=list[UnitOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_units(db: Session = Depends(get_db)):
     return db.query(Unit).all()
 
@@ -190,6 +191,44 @@ def update_unit(unit_id: uuid.UUID, payload: UnitUpdate, db: Session = Depends(g
         setattr(unit, field, value)
     if changes:
         record_audit_log(db, user.id, "unit.update", entity_type="unit", entity_id=str(unit.id), details=f"Updated: {', '.join(changes.keys())}")
+    db.commit()
+    db.refresh(unit)
+    return unit
+
+
+@router.patch("/units/{unit_id}/pricing", response_model=UnitOut, dependencies=[Depends(require_role("admin", "manager"))])
+def update_unit_pricing(unit_id: uuid.UUID, payload: UnitPricingUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    RBAC Phase B: a narrow, price-only counterpart to PATCH /units/{id} —
+    see UnitPricingUpdate's own docstring for why this exists as a
+    separate endpoint instead of adding "manager" to the general one.
+    Staff does not get this endpoint (staff never had unit-price-edit
+    access before Phase B either). Always logs both fields' before/after
+    values, even if only one of the two was actually sent, for a
+    consistent audit trail.
+    """
+    unit = db.get(Unit, unit_id)
+    if unit is None:
+        raise HTTPException(404, "Unit not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        return unit
+    old_values = {
+        "base_rate": unit.base_rate, "weekend_rate": unit.weekend_rate,
+        "long_stay_min_nights": unit.long_stay_min_nights, "long_stay_rate": unit.long_stay_rate,
+    }
+    for field, value in changes.items():
+        setattr(unit, field, value)
+    new_values = {
+        "base_rate": unit.base_rate, "weekend_rate": unit.weekend_rate,
+        "long_stay_min_nights": unit.long_stay_min_nights, "long_stay_rate": unit.long_stay_rate,
+    }
+    record_audit_log(
+        db, user.id, "unit.pricing_update", entity_type="unit", entity_id=str(unit.id),
+        details=f"Updated: {', '.join(changes.keys())}",
+        previous_value=", ".join(f"{k}={v}" for k, v in old_values.items()),
+        new_value=", ".join(f"{k}={v}" for k, v in new_values.items()),
+    )
     db.commit()
     db.refresh(unit)
     return unit
@@ -233,7 +272,7 @@ UNIT_PHOTO_STORAGE_DIR = os.environ.get("UNIT_PHOTO_STORAGE_DIR", "/tmp/sri_apar
 os.makedirs(UNIT_PHOTO_STORAGE_DIR, exist_ok=True)
 
 
-@router.post("/units/{unit_id}/photos", response_model=UnitPhotoOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/units/{unit_id}/photos", response_model=UnitPhotoOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 async def upload_unit_photo(
     unit_id: uuid.UUID, caption: str | None = None, file: UploadFile = File(...),
     db: Session = Depends(get_db), user: User = Depends(get_current_user),
@@ -262,12 +301,33 @@ async def upload_unit_photo(
     return record
 
 
-@router.get("/units/{unit_id}/photos", response_model=list[UnitPhotoOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/units/{unit_id}/photos", response_model=list[UnitPhotoOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_unit_photos(unit_id: uuid.UUID, db: Session = Depends(get_db)):
-    return db.scalars(select(UnitPhoto).where(UnitPhoto.unit_id == unit_id)).all()
+    return db.scalars(
+        select(UnitPhoto).where(UnitPhoto.unit_id == unit_id).order_by(UnitPhoto.is_primary.desc(), UnitPhoto.sort_order.asc(), UnitPhoto.uploaded_at.asc())
+    ).all()
 
 
-@router.get("/units/{unit_id}/photos/{photo_id}/download", dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/units/{unit_id}/photos/{photo_id}", response_model=UnitPhotoOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def update_unit_photo(unit_id: uuid.UUID, photo_id: uuid.UUID, payload: UnitPhotoUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    record = db.get(UnitPhoto, photo_id)
+    if record is None or record.unit_id != unit_id:
+        raise HTTPException(404, "Photo not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if changes.get("is_primary") is True:
+        # At most one primary photo per unit — clear it on every sibling
+        # before setting it here, in the same transaction.
+        db.query(UnitPhoto).filter(UnitPhoto.unit_id == unit_id, UnitPhoto.id != photo_id).update({"is_primary": False})
+    for field, value in changes.items():
+        setattr(record, field, value)
+    if changes:
+        record_audit_log(db, user.id, "unit.photo_update", entity_type="unit", entity_id=str(unit_id), details=f"Updated photo {record.filename}: {', '.join(changes.keys())}")
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@router.get("/units/{unit_id}/photos/{photo_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_unit_photo(unit_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db)):
     record = db.get(UnitPhoto, photo_id)
     if record is None or record.unit_id != unit_id:
@@ -277,7 +337,7 @@ def download_unit_photo(unit_id: uuid.UUID, photo_id: uuid.UUID, db: Session = D
     return FileResponse(record.file_path, media_type=record.content_type, filename=record.filename)
 
 
-@router.delete("/units/{unit_id}/photos/{photo_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff"))])
+@router.delete("/units/{unit_id}/photos/{photo_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_unit_photo(unit_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     record = db.get(UnitPhoto, photo_id)
     if record is None or record.unit_id != unit_id:
@@ -295,7 +355,11 @@ def delete_unit_photo(unit_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Dep
     "/units/{unit_id}/seasonal-rates",
     response_model=SeasonalRateOut,
     status_code=201,
-    dependencies=[Depends(require_role("admin"))],
+    # RBAC Phase B: seasonal rates are an isolated pricing mechanism (own
+    # table, no unit-identity fields) — Manager gets create/edit/delete
+    # here, unlike the bundled PATCH /units/{id} (see the new pricing-only
+    # endpoint below for base_rate/weekend_rate instead).
+    dependencies=[Depends(require_role("admin", "manager"))],
 )
 def create_seasonal_rate(unit_id: uuid.UUID, payload: SeasonalRateCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     unit = db.get(Unit, unit_id)
@@ -313,7 +377,7 @@ def create_seasonal_rate(unit_id: uuid.UUID, payload: SeasonalRateCreate, db: Se
 @router.get(
     "/units/{unit_id}/seasonal-rates",
     response_model=list[SeasonalRateOut],
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def list_seasonal_rates(unit_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(SeasonalRate).where(SeasonalRate.unit_id == unit_id).order_by(SeasonalRate.start_date)).all()
@@ -322,7 +386,7 @@ def list_seasonal_rates(unit_id: uuid.UUID, db: Session = Depends(get_db)):
 @router.delete(
     "/units/{unit_id}/seasonal-rates/{rate_id}",
     status_code=204,
-    dependencies=[Depends(require_role("admin"))],
+    dependencies=[Depends(require_role("admin", "manager"))],
 )
 def delete_seasonal_rate(unit_id: uuid.UUID, rate_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     rate = db.get(SeasonalRate, rate_id)
@@ -339,7 +403,9 @@ def delete_seasonal_rate(unit_id: uuid.UUID, rate_id: uuid.UUID, db: Session = D
     "/units/{unit_id}/long-stay-discounts",
     response_model=LongStayDiscountTierOut,
     status_code=201,
-    dependencies=[Depends(require_role("admin"))],
+    # RBAC Phase B: same reasoning as seasonal rates above — isolated
+    # pricing mechanism, Manager gets create/edit/delete.
+    dependencies=[Depends(require_role("admin", "manager"))],
 )
 def create_discount_tier(unit_id: uuid.UUID, payload: LongStayDiscountTierCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     unit = db.get(Unit, unit_id)
@@ -357,7 +423,7 @@ def create_discount_tier(unit_id: uuid.UUID, payload: LongStayDiscountTierCreate
 @router.get(
     "/units/{unit_id}/long-stay-discounts",
     response_model=list[LongStayDiscountTierOut],
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def list_discount_tiers(unit_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(
@@ -368,7 +434,7 @@ def list_discount_tiers(unit_id: uuid.UUID, db: Session = Depends(get_db)):
 @router.delete(
     "/units/{unit_id}/long-stay-discounts/{tier_id}",
     status_code=204,
-    dependencies=[Depends(require_role("admin"))],
+    dependencies=[Depends(require_role("admin", "manager"))],
 )
 def delete_discount_tier(unit_id: uuid.UUID, tier_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     tier = db.get(LongStayDiscountTier, tier_id)
@@ -400,13 +466,15 @@ def get_unit_price_quote(db: Session, unit: Unit, check_in: date, check_out: dat
         weekend_rate=float(unit.weekend_rate) if unit.weekend_rate is not None else None,
         seasonal_rates=seasonal,
         discount_tiers=tiers,
+        long_stay_min_nights=unit.long_stay_min_nights,
+        long_stay_rate=float(unit.long_stay_rate),
     )
 
 
 @router.get(
     "/units/{unit_id}/price-quote",
     response_model=PriceQuoteOut,
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def price_quote(unit_id: uuid.UUID, check_in: date = Query(...), check_out: date = Query(...), db: Session = Depends(get_db)):
     unit = db.get(Unit, unit_id)

@@ -13,14 +13,33 @@ class Role(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
-    # e.g. 'super_admin', 'owner', 'manager', 'reception', 'accountant',
-    #      'housekeeping', 'maintenance', 'cleaner', 'security', 'guest'
+    # The currently implemented roles are exactly: 'admin', 'staff',
+    # 'manager' — these are the only role names require_role(...) checks
+    # anywhere in the codebase actually accept. No other role name has any
+    # meaning at runtime; do not read this column as a roadmap of roles
+    # that exist or are planned.
 
     permissions: Mapped[list["Permission"]] = relationship(back_populates="role", cascade="all, delete-orphan")
     users: Mapped[list["User"]] = relationship(back_populates="role")
 
 
 class Permission(Base):
+    """
+    RBAC finding I-5: this table is currently DORMANT — it is seeded at
+    bootstrap (see app/db/seed.py's ROLE_PERMISSIONS) but no runtime
+    authorization code anywhere reads it. Every actual access-control
+    decision in this codebase goes through require_role(...) in
+    app/shared/rbac.py, which checks a route-declared tuple of role NAMES
+    against the current user's role — it never queries this table. Rows
+    here (including the admin "*"/"*" wildcard row) are stored data only,
+    with no enforcement meaning today. Activating genuine per-resource
+    permission checks against this table would be a separate, deliberate
+    RBAC project (defining what the wildcard means, backfilling accurate
+    rows for every role against the real route matrix, then wiring
+    require_role or a successor to actually read it) — not something to
+    assume is already happening because this table and its rows exist.
+    """
+
     __tablename__ = "permissions"
     __table_args__ = (UniqueConstraint("role_id", "resource", "action", name="uq_role_resource_action"),)
 

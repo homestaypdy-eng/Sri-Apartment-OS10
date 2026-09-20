@@ -10,8 +10,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings as app_settings
 from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
-from app.modules.settings.models import SETTINGS_SINGLETON_ID, BusinessSettings
-from app.modules.settings.schemas import BusinessSettingsOut, BusinessSettingsUpdate, RolePermission, RolesPermissionsOut, SystemInfoOut
+from app.modules.settings.models import BANK_SETTINGS_SINGLETON_ID, SETTINGS_SINGLETON_ID, BankSettings, BusinessSettings
+from app.modules.settings.schemas import BankSettingsOut, BankSettingsUpdate, BusinessSettingsOut, BusinessSettingsUpdate, RolePermission, RolesPermissionsOut, SystemInfoOut
 from app.shared.file_upload import read_and_validate_upload, IMAGE_CONTENT_TYPES
 from app.shared.rbac import get_current_user, require_role
 from app.modules.auth.models import User
@@ -27,6 +27,16 @@ def get_or_create_settings(db: Session) -> BusinessSettings:
         db.commit()
         db.refresh(settings)
     return settings
+
+
+def get_or_create_bank_settings(db: Session) -> BankSettings:
+    bank = db.get(BankSettings, BANK_SETTINGS_SINGLETON_ID)
+    if bank is None:
+        bank = BankSettings(id=BANK_SETTINGS_SINGLETON_ID)
+        db.add(bank)
+        db.commit()
+        db.refresh(bank)
+    return bank
 
 
 @router.get("", response_model=BusinessSettingsOut, dependencies=[Depends(require_role("admin", "staff"))])
@@ -47,6 +57,35 @@ def update_settings(payload: BusinessSettingsUpdate, db: Session = Depends(get_d
     db.commit()
     db.refresh(settings)
     return settings
+
+
+@router.get("/bank", response_model=BankSettingsOut, dependencies=[Depends(require_role("admin"))])
+def read_bank_settings(db: Session = Depends(get_db)):
+    """
+    RBAC Phase A: admin-only by design (see BankSettings' own docstring) —
+    unlike GET /settings, this is never shared with staff or any other
+    role. Real bank account number, IFSC, and UPI ID never appear in any
+    admin+staff-accessible response.
+    """
+    return get_or_create_bank_settings(db)
+
+
+@router.put("/bank", response_model=BankSettingsOut, dependencies=[Depends(require_role("admin"))])
+def update_bank_settings(payload: BankSettingsUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    bank = get_or_create_bank_settings(db)
+    changed_fields = payload.model_dump(exclude_unset=True)
+    for field, value in changed_fields.items():
+        setattr(bank, field, value)
+    # Field names only in the audit trail (e.g. "bank_ifsc"), never the new
+    # values themselves — same principle as never logging a raw OTP/token,
+    # applied here to real bank details rather than a security secret.
+    record_audit_log(
+        db, user.id, "settings.bank_update", entity_type="bank_settings",
+        entity_id=str(bank.id), details=f"Updated fields: {list(changed_fields.keys())}",
+    )
+    db.commit()
+    db.refresh(bank)
+    return bank
 
 
 LOGO_STORAGE_DIR = os.environ.get("LOGO_STORAGE_DIR", "/tmp/sri_apartment_logo")
@@ -108,13 +147,14 @@ def get_system_info(db: Session = Depends(get_db)):
         email_configured=bool(app_settings.smtp_host),
         sms_configured=bool(app_settings.sms_api_url and app_settings.sms_api_key),
         whatsapp_configured=True,  # click-to-chat needs no server-side credentials, always available
+        whatsapp_auto_configured=bool(app_settings.whatsapp_access_token and app_settings.whatsapp_phone_number_id),
     )
 
 
 @router.get("/roles-permissions", response_model=RolesPermissionsOut, dependencies=[Depends(require_role("admin", "staff"))])
 def get_roles_permissions():
     """
-    A real, accurate reference of what the two roles in this system can
+    A real, accurate reference of what the roles in this system can
     actually do — reflects the real require_role(...) checks used
     throughout the codebase, not an aspirational or separate permission
     model that could drift from what's actually enforced.
@@ -123,7 +163,7 @@ def get_roles_permissions():
         RolePermission(
             role="admin", description="Full access to every module and every action.",
             can_do=[
-                "Create, edit, and delete properties, units, and pricing rules",
+                "Create, edit, and deactivate properties, units, and pricing rules",
                 "Approve or reject expenses; mark payroll as paid; issue refunds and credit notes",
                 "Create and manage staff user accounts, assign roles",
                 "Edit business settings, upload logo/QR, view system configuration status",
@@ -144,6 +184,33 @@ def get_roles_permissions():
                 "Create staff accounts or change another user's role",
                 "Edit business settings or upload logo/QR",
                 "Issue credit notes",
+            ],
+        ),
+        # RBAC Phase B documentation fix (finding I-4): this reference had
+        # drifted — it described only "the two roles" from before Manager
+        # existed. This entry mirrors the actual require_role(...) grants
+        # verified across the codebase (properties/pricing, bookings/finance
+        # views, staff_ops, OTA view+sync) and exclusions (settings, users,
+        # audit, staff/HR, refunds/credit-notes, AI Strategist, property/unit
+        # CRUD) — informational only, no authorization code reads this.
+        RolePermission(
+            role="manager",
+            description="Operational management access — day-to-day operations and pricing, without administrative, financial-approval, or security functions.",
+            can_do=[
+                "Create and manage bookings, guests, inquiries, housekeeping and maintenance tasks",
+                "Record payments, generate invoices/quotations, and view existing credit notes",
+                "View reports, dashboards, staff operations, and OTA channel/sync status",
+                "Manage accommodation pricing: base/weekend rates, seasonal rates, and long-stay discount tiers",
+            ],
+            cannot_do=[
+                "Create staff accounts, change any user's role, or access user administration",
+                "Access Bank & UPI settings, business settings, system configuration, or backups",
+                "View the audit log or login history",
+                "Access Staff/HR administration (attendance, leave, payroll, staff profiles)",
+                "Issue payment refunds, security-deposit refunds, or credit notes",
+                "Delete, archive, or restore bookings, or merge guest records",
+                "Create, edit, or deactivate properties/units (pricing only)",
+                "Access the AI Strategist",
             ],
         ),
     ])

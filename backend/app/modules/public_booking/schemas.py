@@ -8,9 +8,42 @@ from pydantic import BaseModel, EmailStr, Field
 class PublicUnitOut(BaseModel):
     id: uuid.UUID
     name: str
+    unit_type: str
     base_rate: float
     max_occupancy: int
     property_name: str
+    property_type: str | None = None
+    description: str | None = None
+    amenities: str | None = None
+    bedroom_count: int | None = None
+    bathroom_count: int | None = None
+    # Per-unit override; None means "this unit hasn't set one" — the
+    # website falls back to its own existing default copy / the business-
+    # level house_rules (PublicBusinessInfoOut) respectively.
+    house_rules: str | None = None
+    checkin_time: str | None = None
+    checkout_time: str | None = None
+
+
+class PublicUnitPhotoOut(BaseModel):
+    id: uuid.UUID
+    caption: str | None
+    url: str
+
+
+class PublicBusinessInfoOut(BaseModel):
+    """Business contact fields safe to publish on the public website —
+    deliberately excludes GST/UDYAM/bank/UPI and any other internal-only
+    BusinessSettings field. Single source of truth for the website's
+    footer/contact/location pages, replacing what used to be separately
+    hardcoded/env-var content there."""
+
+    company_name: str
+    address: str
+    contact_phone: str
+    contact_email: str
+    whatsapp_business_number: str | None = None
+    house_rules: str | None = None
 
 
 class PublicAvailabilityOut(BaseModel):
@@ -45,6 +78,7 @@ class DayRateOut(BaseModel):
 class PublicQuoteOut(BaseModel):
     unit_id: uuid.UUID
     unit_name: str
+    unit_type: str
     check_in: date
     check_out: date
     nights: int
@@ -70,8 +104,15 @@ class CreateHoldRequest(BaseModel):
     unit_id: uuid.UUID
     check_in: date
     check_out: date
-    guest_name: str
-    guest_phone: str
+    # WEBSITE-04A: this is an anonymous, internet-facing endpoint (unlike
+    # the admin-side GuestCreate schema, which is behind auth) — bound the
+    # input size so an anonymous submission can't write an arbitrarily
+    # large name/phone into a real guest record. Limits match the
+    # BookingHold.guest_name/guest_phone column sizes (models.py) exactly,
+    # so an oversized submission is rejected with a clean 422 here rather
+    # than a raw DB truncation error.
+    guest_name: str = Field(min_length=1, max_length=150)
+    guest_phone: str = Field(min_length=6, max_length=20)
     guest_email: EmailStr | None = None
     promo_code: str | None = None
 
@@ -114,3 +155,14 @@ class PublicBookingConfirmation(BaseModel):
     invoice_id: uuid.UUID | None
     invoice_no: str | None
     confirmation_emailed: bool | None
+    # None here means "nothing to send to" (guest has no phone on file),
+    # matching confirmation_emailed's own None-vs-bool convention.
+    confirmation_sms_sent: bool | None
+    # Notification-audit addition: real automatic WhatsApp send attempt via
+    # send_whatsapp() (Meta WhatsApp Business Cloud API) — see
+    # notifications/service.py::trigger_booking_confirmation_whatsapp. No
+    # provider is configured anywhere in this project as of this change, so
+    # this currently reads False whenever the guest has a phone on file
+    # (an honest "attempted, not configured" outcome) and None only when
+    # there's no phone at all — it is NEVER fabricated as True.
+    confirmation_whatsapp_sent: bool | None

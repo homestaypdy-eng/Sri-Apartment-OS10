@@ -135,14 +135,34 @@ class GuestHistory(BaseModel):
 class UnitCreate(BaseModel):
     property_id: uuid.UUID
     name: str
+    # Both fields already existed here with defaults before Phase 1 — kept
+    # optional (not required) so no existing API client that omits them
+    # breaks; the Admin UI is expected to start sending them explicitly
+    # from Phase 2 onward, but the API contract itself doesn't force that.
     unit_type: str = "apartment"
     max_occupancy: int = 2
     base_rate: float = Field(gt=0)
     weekend_rate: float | None = Field(default=None, gt=0)
+    # Long-stay absolute nightly rate (see Unit model + pricing.py) — a
+    # stay of long_stay_min_nights+ nights is billed at long_stay_rate for
+    # every night, not a percentage discount. Concrete defaults (not None)
+    # matching the column's own DB-level default, same reasoning as
+    # unit_type/max_occupancy above: create_unit() below passes the full
+    # model_dump() straight into Unit(...), and the column is NOT NULL, so
+    # a None default here would try to insert an explicit null instead of
+    # actually using the column default.
+    long_stay_min_nights: int = Field(default=30, gt=0)
+    long_stay_rate: float = Field(default=2000, gt=0)
     unit_code: str | None = None
     floor: str | None = None
     flat_number: str | None = None
     amenities: str | None = None
+    description: str | None = None
+    bedroom_count: int | None = Field(default=None, ge=0)
+    bathroom_count: int | None = Field(default=None, ge=0)
+    house_rules: str | None = None
+    checkin_time: str | None = None
+    checkout_time: str | None = None
 
 
 class UnitUpdate(BaseModel):
@@ -151,12 +171,41 @@ class UnitUpdate(BaseModel):
     max_occupancy: int | None = Field(default=None, gt=0)
     base_rate: float | None = Field(default=None, gt=0)
     weekend_rate: float | None = Field(default=None, gt=0)
+    long_stay_min_nights: int | None = Field(default=None, gt=0)
+    long_stay_rate: float | None = Field(default=None, gt=0)
     status: str | None = None  # available / maintenance / blocked
     housekeeping_status: str | None = None
     unit_code: str | None = None
     floor: str | None = None
     flat_number: str | None = None
     amenities: str | None = None
+    description: str | None = None
+    bedroom_count: int | None = Field(default=None, ge=0)
+    bathroom_count: int | None = Field(default=None, ge=0)
+    house_rules: str | None = None
+    checkin_time: str | None = None
+    checkout_time: str | None = None
+
+
+class UnitPricingUpdate(BaseModel):
+    """
+    RBAC Phase B: the narrow counterpart to UnitUpdate used by
+    PATCH /units/{id}/pricing — deliberately declares ONLY the price
+    fields, none of UnitUpdate's identity/configuration fields (name,
+    status, unit_type, max_occupancy, unit_code, floor, flat_number,
+    amenities, description). This is what lets Manager be granted price
+    changes without also granting unit-editing power through the same
+    endpoint. extra="forbid" rejects any other field in the request body
+    outright (422) rather than silently ignoring it — a client can never
+    smuggle a broader update through this schema.
+    """
+    base_rate: float | None = Field(default=None, gt=0)
+    weekend_rate: float | None = Field(default=None, gt=0)
+    long_stay_min_nights: int | None = Field(default=None, gt=0)
+    long_stay_rate: float | None = Field(default=None, gt=0)
+
+    class Config:
+        extra = "forbid"
 
 
 class UnitOut(UnitCreate):
@@ -213,6 +262,17 @@ class BookingUpdate(BaseModel):
     arrival_time: str | None = None
     departure_time: str | None = None
     reason: str | None = None  # optional free-text reason, logged to the audit trail
+    # Optimistic-concurrency token: the value of BookingOut.updated_at the
+    # editor loaded before making changes. Optional and backward-compatible
+    # — omitted entirely, the request is applied without a staleness check
+    # (existing callers keep working); provided, it's compared against the
+    # booking's current updated_at and the request is rejected with 409 if
+    # someone else changed the booking in the meantime.
+    expected_updated_at: datetime | None = None
+
+
+class BookingArchiveRequest(BaseModel):
+    reason: str | None = None
 
 
 class BookingAttachmentOut(BaseModel):
@@ -243,6 +303,10 @@ class BookingOut(BaseModel):
     extra_bed: bool = False
     arrival_time: str | None = None
     departure_time: str | None = None
+    updated_at: datetime
+    is_archived: bool = False
+    archived_at: datetime | None = None
+    archive_reason: str | None = None
 
     class Config:
         from_attributes = True

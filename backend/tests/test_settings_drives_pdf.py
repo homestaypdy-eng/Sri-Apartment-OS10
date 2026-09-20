@@ -14,8 +14,7 @@ from app.main import app
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 
 @pytest.fixture(scope="module")
@@ -62,11 +61,18 @@ def test_changing_settings_changes_quotation_pdf_content(headers):
 
 
 def test_bank_account_number_from_settings_appears_in_pdf(headers):
-    original = client.get("/api/v1/settings", headers=headers).json()
+    """RBAC Phase A moved bank fields to the admin-only /settings/bank
+    endpoint (see BankSettings) — this test now drives the PDF change
+    through that endpoint instead of the general /settings one, but keeps
+    proving the same thing: an admin-edited real bank account number
+    genuinely flows through into the generated PDF, not just a default."""
+    original = client.get("/api/v1/settings/bank", headers=headers).json()
     marker_account = f"{uuid.uuid4().int % 10**12:012d}"
 
     try:
-        client.put("/api/v1/settings", headers=headers, json={"bank_account_number": marker_account})
+        update = client.put("/api/v1/settings/bank", headers=headers, json={"bank_account_number": marker_account})
+        assert update.status_code == 200
+        assert update.json()["bank_account_number"] == marker_account
 
         inquiry = client.post(
             "/api/v1/inquiries",
@@ -86,7 +92,7 @@ def test_bank_account_number_from_settings_appears_in_pdf(headers):
         text = _extract_pdf_text(pdf_resp.content)
         assert marker_account in text
     finally:
-        client.put("/api/v1/settings", headers=headers, json={"bank_account_number": original["bank_account_number"]})
+        client.put("/api/v1/settings/bank", headers=headers, json={"bank_account_number": original["bank_account_number"]})
 
 
 def test_pdf_generation_without_settings_row_falls_back_to_defaults():

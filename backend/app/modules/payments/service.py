@@ -176,6 +176,7 @@ def generate_invoice_pdf(
     num_guests: int | None = None,
     rate_per_night: float | None = None,
     payment_mode: str | None = None,
+    extra_charges: float = 0.0,
 ) -> str:
     pdf = FPDF()
     pdf.add_page()
@@ -299,13 +300,19 @@ def generate_invoice_pdf(
 
     nights = (check_out - check_in).days if check_out >= check_in else 1
     rate_value = float(rate_per_night) if rate_per_night is not None else (float(subtotal) / nights if nights else 0.0)
+    extra_charges_value = float(extra_charges) if extra_charges else 0.0
+    # Accommodation-only amount, separate from extra_charges — `subtotal`
+    # (the taxable value) already includes both, same as the quotation's
+    # split between its "Accommodation Charges" row and its own "Extra
+    # Charges" row below it.
+    accommodation_amount = round(rate_value * nights, 2)
     pdf.set_font("Helvetica", "", 8)
-    row1 = ["1", "Accommodation Charges", hsn_code or "996311", str(nights), f"{rate_value:.2f}", f"{subtotal:.2f}"]
+    row1 = ["1", "Accommodation Charges", hsn_code or "996311", str(nights), f"{rate_value:.2f}", f"{accommodation_amount:.2f}"]
     for v, w, align in zip(row1, widths, ["C", "L", "C", "C", "R", "R"]):
         pdf.cell(w, 6, v, border=1, align=align)
     pdf.ln()
 
-    for label, val in [("Extra Charges (if any)", 0.0), ("Discount (if any)", 0.0)]:
+    for label, val in [("Extra Charges (if any)", extra_charges_value), ("Discount (if any)", 0.0)]:
         pdf.cell(widths[0] + widths[1] + widths[2] + widths[3], 6, label, border=1)
         pdf.cell(widths[4], 6, "", border=1)
         pdf.cell(widths[5], 6, f"{val:.2f}", border=1, align="R")

@@ -23,7 +23,7 @@ os.makedirs(PHOTO_STORAGE_DIR, exist_ok=True)
 router = APIRouter(prefix="/api/v1/housekeeping-tasks", tags=["housekeeping"])
 
 
-@router.post("", response_model=HousekeepingTaskOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("", response_model=HousekeepingTaskOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_task(payload: HousekeepingTaskCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     unit = db.get(Unit, payload.unit_id)
     if unit is None:
@@ -49,7 +49,7 @@ def create_task(payload: HousekeepingTaskCreate, db: Session = Depends(get_db), 
     return task
 
 
-@router.get("", response_model=list[HousekeepingTaskOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("", response_model=list[HousekeepingTaskOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_tasks(
     unit_id: uuid.UUID | None = None,
     status: str | None = None,
@@ -65,7 +65,7 @@ def list_tasks(
     return db.scalars(query.order_by(HousekeepingTask.created_at.desc(), HousekeepingTask.id).offset(offset).limit(limit)).all()
 
 
-@router.patch("/{task_id}", response_model=HousekeepingTaskOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/{task_id}", response_model=HousekeepingTaskOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_task(task_id: uuid.UUID, payload: HousekeepingTaskUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     task = db.get(HousekeepingTask, task_id)
     if task is None:
@@ -78,6 +78,8 @@ def update_task(task_id: uuid.UUID, payload: HousekeepingTaskUpdate, db: Session
             raise HTTPException(400, f"Invalid status '{payload.status}'")
         changes.append(f"status: {task.status} -> {payload.status}")
         task.status = payload.status
+        if payload.status == "in_progress" and task.started_at is None:
+            task.started_at = datetime.now(timezone.utc)
         if payload.status == "completed":
             task.completed_at = datetime.now(timezone.utc)
             # Completing a cleaning task is what actually clears the room's
@@ -86,11 +88,15 @@ def update_task(task_id: uuid.UUID, payload: HousekeepingTaskUpdate, db: Session
             unit = db.get(Unit, task.unit_id)
             unit.housekeeping_status = "clean"
 
-    if payload.assigned_to is not None:
-        if db.get(User, payload.assigned_to) is None:
+    # model_fields_set (not `is not None`) distinguishes "field omitted"
+    # from an explicit `assigned_to: null` — the latter now clears the
+    # assignment. Every other field on this endpoint is untouched.
+    if "assigned_to" in payload.model_fields_set:
+        new_assignee = payload.assigned_to
+        if new_assignee is not None and db.get(User, new_assignee) is None:
             raise HTTPException(404, "Assigned user not found")
-        changes.append(f"assigned_to: {task.assigned_to} -> {payload.assigned_to}")
-        task.assigned_to = payload.assigned_to
+        changes.append(f"assigned_to: {task.assigned_to} -> {new_assignee}")
+        task.assigned_to = new_assignee
     if payload.notes is not None:
         task.notes = payload.notes
 
@@ -103,7 +109,7 @@ def update_task(task_id: uuid.UUID, payload: HousekeepingTaskUpdate, db: Session
     return task
 
 
-@router.post("/{task_id}/photos", response_model=HousekeepingPhotoOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/{task_id}/photos", response_model=HousekeepingPhotoOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 async def upload_housekeeping_photo(task_id: uuid.UUID, caption: str | None = None, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     task = db.get(HousekeepingTask, task_id)
     if task is None:
@@ -131,12 +137,12 @@ async def upload_housekeeping_photo(task_id: uuid.UUID, caption: str | None = No
     return photo
 
 
-@router.get("/{task_id}/photos", response_model=list[HousekeepingPhotoOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{task_id}/photos", response_model=list[HousekeepingPhotoOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_housekeeping_photos(task_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(HousekeepingPhoto).where(HousekeepingPhoto.task_id == task_id)).all()
 
 
-@router.get("/{task_id}/photos/{photo_id}/download", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{task_id}/photos/{photo_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db)):
     photo = db.get(HousekeepingPhoto, photo_id)
     if photo is None or photo.task_id != task_id:
@@ -146,7 +152,7 @@ def download_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Ses
     return FileResponse(photo.file_path, media_type=photo.content_type, filename=photo.filename)
 
 
-@router.delete("/{task_id}/photos/{photo_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff"))])
+@router.delete("/{task_id}/photos/{photo_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     photo = db.get(HousekeepingPhoto, photo_id)
     if photo is None or photo.task_id != task_id:
@@ -158,7 +164,7 @@ def delete_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Sessi
     db.commit()
 
 
-@router.get("/{task_id}/timeline", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{task_id}/timeline", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_housekeeping_timeline(task_id: uuid.UUID, db: Session = Depends(get_db)):
     """Every audit-logged event for this task, oldest first — same pattern
     as the booking timeline (a thin read over the shared AuditLog table,

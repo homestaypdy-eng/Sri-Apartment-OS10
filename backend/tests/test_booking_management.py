@@ -14,8 +14,7 @@ from app.main import app
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 
 @pytest.fixture(scope="module")
@@ -354,3 +353,193 @@ def test_delete_booking_with_ota_commission_is_blocked(headers):
     resp = client.delete(f"/api/v1/bookings/{booking['id']}", headers=headers)
     assert resp.status_code == 409
     assert "ota commission" in resp.json()["detail"].lower()
+
+
+# --- Edit: notes fields ---
+
+def test_edit_booking_notes(headers):
+    booking, _ = _make_booking(headers)
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={
+        "internal_notes": "VIP guest, upgrade if possible", "special_requests": "Late checkout requested",
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["internal_notes"] == "VIP guest, upgrade if possible"
+    assert resp.json()["special_requests"] == "Late checkout requested"
+
+
+# --- Edit: stale-update / optimistic concurrency protection ---
+
+def test_edit_booking_without_expected_updated_at_still_works(headers):
+    """Backward compatibility: omitting the concurrency token entirely
+    performs the edit unchecked, same as before this field existed."""
+    booking, _ = _make_booking(headers)
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 4321})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rate_applied"] == 4321.0
+
+
+def test_edit_booking_with_fresh_expected_updated_at_succeeds(headers):
+    booking, _ = _make_booking(headers)
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={
+        "rate_applied": 4500, "expected_updated_at": booking["updated_at"],
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rate_applied"] == 4500.0
+
+
+def test_edit_booking_with_stale_expected_updated_at_rejected(headers):
+    """Simulates two staff editing the same booking: the first save
+    succeeds and bumps updated_at; the second save, still holding the
+    booking's *original* updated_at, must be rejected rather than silently
+    overwriting the first staff member's change."""
+    booking, _ = _make_booking(headers)
+    stale_token = booking["updated_at"]
+
+    first = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={
+        "rate_applied": 5000, "expected_updated_at": stale_token,
+    })
+    assert first.status_code == 200, first.text
+
+    second = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={
+        "rate_applied": 6000, "expected_updated_at": stale_token,
+    })
+    assert second.status_code == 409, second.text
+
+    # The first staff member's change must have stuck, not been overwritten.
+    current = client.get("/api/v1/bookings", headers=headers, params={"guest_id": booking["guest_id"]}).json()
+    match = next(b for b in current if b["id"] == booking["id"])
+    assert match["rate_applied"] == 5000.0
+
+
+# --- Archive / restore (safe soft-delete) ---
+
+def test_archive_booking_removes_from_active_list(headers):
+    booking, _ = _make_booking(headers)
+    resp = client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=headers, json={"reason": "Duplicate entry"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_archived"] is True
+
+    active = client.get("/api/v1/bookings", headers=headers, params={"guest_id": booking["guest_id"]}).json()
+    assert not any(b["id"] == booking["id"] for b in active)
+
+    with_archived = client.get("/api/v1/bookings", headers=headers, params={"guest_id": booking["guest_id"], "include_archived": True}).json()
+    assert any(b["id"] == booking["id"] for b in with_archived)
+
+
+def test_archive_booking_logs_audit(headers):
+    booking, _ = _make_booking(headers)
+    client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=headers, json={"reason": "Test archive reason"})
+
+    logs = client.get("/api/v1/audit/logs", headers=headers, params={"action": "booking.archive"}).json()
+    match = next((l for l in logs if l["entity_id"] == booking["id"]), None)
+    assert match is not None
+    assert "Test archive reason" in match["details"]
+
+
+def test_archive_booking_is_idempotent(headers):
+    booking, _ = _make_booking(headers)
+    first = client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=headers, json={"reason": "First"})
+    assert first.status_code == 200
+
+    second = client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=headers, json={"reason": "Second"})
+    assert second.status_code == 200
+    assert second.json()["is_archived"] is True
+
+    # The no-op second call must not have overwritten the original reason.
+    logs = client.get("/api/v1/audit/logs", headers=headers, params={"action": "booking.archive"}).json()
+    matches = [l for l in logs if l["entity_id"] == booking["id"]]
+    assert len(matches) == 1
+    assert "First" in matches[0]["details"]
+
+
+def test_restore_booking_returns_to_active_list(headers):
+    booking, _ = _make_booking(headers)
+    client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=headers, json={"reason": "temp"})
+
+    resp = client.post(f"/api/v1/bookings/{booking['id']}/restore", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_archived"] is False
+
+    active = client.get("/api/v1/bookings", headers=headers, params={"guest_id": booking["guest_id"]}).json()
+    assert any(b["id"] == booking["id"] for b in active)
+
+
+def test_restore_booking_is_idempotent(headers):
+    booking, _ = _make_booking(headers)
+    resp = client.post(f"/api/v1/bookings/{booking['id']}/restore", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["is_archived"] is False
+
+
+def test_archive_booking_preserves_payment_and_can_still_be_deleted_is_blocked(headers):
+    """Archiving a booking with a real payment must not touch the
+    payment, and the existing hard-delete financial guard must still apply
+    to an archived booking exactly as it does to an active one."""
+    booking, _ = _make_booking(headers)
+    client.post("/api/v1/payments", headers=headers, json={"booking_id": booking["id"], "amount": 750, "mode": "cash"})
+    client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=headers, json={"reason": "Old record"})
+
+    payments = client.get(f"/api/v1/payments/{booking['id']}", headers=headers).json()
+    assert any(p["amount"] == 750 for p in payments)
+
+    delete_resp = client.delete(f"/api/v1/bookings/{booking['id']}", headers=headers)
+    assert delete_resp.status_code == 409
+
+
+def test_staff_cannot_archive_booking():
+    admin_login = client.post("/api/v1/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+    email = f"bkstaff_{uuid.uuid4().hex[:6]}@sriapartmenthomestay.com"
+    client.post("/api/v1/auth/register", headers=admin_headers, json={"name": "Bk Staff 2", "email": email, "password": "Pass12345!", "role": "staff"})
+    staff_login = client.post("/api/v1/auth/login", json={"email": email, "password": "Pass12345!"})
+    staff_headers = {"Authorization": f"Bearer {staff_login.json()['access_token']}"}
+
+    booking, _ = _make_booking(admin_headers)
+    resp = client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=staff_headers, json={})
+    assert resp.status_code == 403
+
+
+def test_archive_booking_unauthenticated_rejected(headers):
+    booking, _ = _make_booking(headers)
+    resp = client.post(f"/api/v1/bookings/{booking['id']}/archive", json={})
+    assert resp.status_code == 401
+
+
+def test_archive_unknown_booking_404s(headers):
+    resp = client.post(f"/api/v1/bookings/{uuid.uuid4()}/archive", headers=headers, json={})
+    assert resp.status_code == 404
+
+
+def test_restore_booking_logs_audit(headers):
+    booking, _ = _make_booking(headers)
+    client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=headers, json={"reason": "temp"})
+    client.post(f"/api/v1/bookings/{booking['id']}/restore", headers=headers)
+
+    logs = client.get("/api/v1/audit/logs", headers=headers, params={"action": "booking.restore"}).json()
+    assert any(l["entity_id"] == booking["id"] for l in logs)
+
+
+def test_staff_cannot_restore_booking():
+    admin_login = client.post("/api/v1/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+    email = f"bkstaff_{uuid.uuid4().hex[:6]}@sriapartmenthomestay.com"
+    client.post("/api/v1/auth/register", headers=admin_headers, json={"name": "Bk Staff 3", "email": email, "password": "Pass12345!", "role": "staff"})
+    staff_login = client.post("/api/v1/auth/login", json={"email": email, "password": "Pass12345!"})
+    staff_headers = {"Authorization": f"Bearer {staff_login.json()['access_token']}"}
+
+    booking, _ = _make_booking(admin_headers)
+    client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=admin_headers, json={})
+    resp = client.post(f"/api/v1/bookings/{booking['id']}/restore", headers=staff_headers)
+    assert resp.status_code == 403
+
+
+def test_restore_booking_unauthenticated_rejected(headers):
+    booking, _ = _make_booking(headers)
+    client.post(f"/api/v1/bookings/{booking['id']}/archive", headers=headers, json={})
+    resp = client.post(f"/api/v1/bookings/{booking['id']}/restore")
+    assert resp.status_code == 401
+
+
+def test_restore_unknown_booking_404s(headers):
+    resp = client.post(f"/api/v1/bookings/{uuid.uuid4()}/restore", headers=headers)
+    assert resp.status_code == 404

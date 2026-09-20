@@ -26,7 +26,7 @@ def _ensure_channels_exist(db: Session):
     db.commit()
 
 
-@router.get("/channels", response_model=list[OTAChannelConfigOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/channels", response_model=list[OTAChannelConfigOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_channels(db: Session = Depends(get_db)):
     _ensure_channels_exist(db)
     return db.scalars(select(OTAChannelConfig)).all()
@@ -58,7 +58,7 @@ def create_mapping(payload: OTAListingMappingCreate, db: Session = Depends(get_d
     return mapping
 
 
-@router.get("/mappings", response_model=list[OTAListingMappingOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/mappings", response_model=list[OTAListingMappingOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_mappings(channel: str | None = None, db: Session = Depends(get_db)):
     query = select(OTAListingMapping)
     if channel:
@@ -66,7 +66,7 @@ def list_mappings(channel: str | None = None, db: Session = Depends(get_db)):
     return db.scalars(query).all()
 
 
-@router.post("/sync", response_model=OTASyncLogOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/sync", response_model=OTASyncLogOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """The 'Manual Sync Button' — runs the mock adapter (see service.py docstring for why it's mock)."""
     if payload.channel not in OTA_CHANNELS:
@@ -76,7 +76,7 @@ def manual_sync(payload: ManualSyncRequest, db: Session = Depends(get_db), user:
     return run_sync(db, payload.channel, payload.sync_type, triggered_by=user.id)
 
 
-@router.get("/sync-logs", response_model=list[OTASyncLogOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/sync-logs", response_model=list[OTASyncLogOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_sync_logs(channel: str | None = None, db: Session = Depends(get_db)):
     query = select(OTASyncLog).order_by(OTASyncLog.created_at.desc()).limit(200)
     if channel:

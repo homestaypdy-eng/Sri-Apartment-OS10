@@ -5,6 +5,7 @@ Run with: pytest tests/test_ota_portal_public_booking.py -v
 """
 import uuid
 from datetime import date, timedelta
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,8 +14,36 @@ from app.main import app
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
+
+
+@pytest.fixture
+def dev_magic_token_enabled(monkeypatch):
+    """
+    WEBSITE-04A: the guest-portal magic-link `dev_magic_token` response
+    field is a deliberate, documented testability concession (see
+    portal/router.py P0-2) that is nulled whenever settings.environment
+    == "production" — real guests must only ever get their login link via
+    email, never in the API response. This container's ENVIRONMENT is
+    "production" (the docker-compose default), so these tests need it
+    forced to a non-production value to exercise the login flow without a
+    real inbox — exactly like a real non-production deployment would.
+
+    This does NOT touch the real running app's ENVIRONMENT (only this
+    pytest process's view of the shared settings object, auto-reverted
+    after each test) and does NOT weaken the production guard itself.
+
+    Also mocks send_email so no real SMTP call happens regardless of
+    ambient SMTP_HOST configuration — the guest fixtures used by these
+    tests set a real-looking guest.email, which would otherwise trigger
+    a genuine outbound send via whatever SMTP credentials the container
+    happens to have configured.
+    """
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "environment", "test")
+    with patch("app.modules.portal.router.send_email") as mock_send:
+        mock_send.return_value = None
+        yield
 
 
 @pytest.fixture(scope="module")
@@ -35,7 +64,8 @@ def _make_property_and_unit(headers, base_rate=2000):
 def test_channels_auto_created_and_not_live(headers):
     channels = client.get("/api/v1/ota/channels", headers=headers).json()
     names = {c["channel"] for c in channels}
-    assert names == {"booking_com", "airbnb", "agoda"}
+    # Phase 19E added "mmt" to OTA_CHANNELS — existing channels unchanged.
+    assert names == {"booking_com", "airbnb", "agoda", "mmt"}
     assert all(c["is_live"] is False for c in channels)
 
 
@@ -98,7 +128,7 @@ def test_login_request_for_unknown_phone_does_not_leak_info():
     assert resp.json()["dev_magic_token"] is None
 
 
-def test_full_magic_link_login_flow(headers):
+def test_full_magic_link_login_flow(headers, dev_magic_token_enabled):
     phone, guest_id, booking_id = _make_guest_with_booking(headers)
 
     req = client.post("/api/v1/portal/request-login", json={"phone": phone})
@@ -119,7 +149,7 @@ def test_full_magic_link_login_flow(headers):
     assert any(b["id"] == booking_id for b in bookings.json())
 
 
-def test_guest_cannot_use_magic_token_as_session_token(headers):
+def test_guest_cannot_use_magic_token_as_session_token(headers, dev_magic_token_enabled):
     phone, _, _ = _make_guest_with_booking(headers)
     magic_token = client.post("/api/v1/portal/request-login", json={"phone": phone}).json()["dev_magic_token"]
 
@@ -127,7 +157,7 @@ def test_guest_cannot_use_magic_token_as_session_token(headers):
     assert resp.status_code == 403
 
 
-def test_guest_cannot_see_other_guests_bookings(headers):
+def test_guest_cannot_see_other_guests_bookings(headers, dev_magic_token_enabled):
     phone_a, _, booking_a = _make_guest_with_booking(headers)
     phone_b, _, booking_b = _make_guest_with_booking(headers)
 
@@ -139,7 +169,7 @@ def test_guest_cannot_see_other_guests_bookings(headers):
     assert booking_b not in booking_ids
 
 
-def test_guest_can_raise_complaint_and_staff_sees_it(headers):
+def test_guest_can_raise_complaint_and_staff_sees_it(headers, dev_magic_token_enabled):
     phone, _, booking_id = _make_guest_with_booking(headers)
     guest_token = client.post("/api/v1/portal/verify", json={"token": client.post("/api/v1/portal/request-login", json={"phone": phone}).json()["dev_magic_token"]}).json()["access_token"]
 
@@ -151,7 +181,7 @@ def test_guest_can_raise_complaint_and_staff_sees_it(headers):
     assert any(r["id"] == complaint.json()["id"] for r in staff_view)
 
 
-def test_staff_can_resolve_guest_request(headers):
+def test_staff_can_resolve_guest_request(headers, dev_magic_token_enabled):
     phone, _, booking_id = _make_guest_with_booking(headers)
     guest_token = client.post("/api/v1/portal/verify", json={"token": client.post("/api/v1/portal/request-login", json={"phone": phone}).json()["dev_magic_token"]}).json()["access_token"]
     req = client.post("/api/v1/portal/requests", headers={"Authorization": f"Bearer {guest_token}"}, json={"booking_id": booking_id, "description": "Extra towels please"}).json()
@@ -162,7 +192,7 @@ def test_staff_can_resolve_guest_request(headers):
     assert resolved.json()["resolved_at"] is not None
 
 
-def test_extend_stay_request_type_inferred_from_date(headers):
+def test_extend_stay_request_type_inferred_from_date(headers, dev_magic_token_enabled):
     phone, _, booking_id = _make_guest_with_booking(headers)
     guest_token = client.post("/api/v1/portal/verify", json={"token": client.post("/api/v1/portal/request-login", json={"phone": phone}).json()["dev_magic_token"]}).json()["access_token"]
 
@@ -186,6 +216,53 @@ def test_public_units_listing_requires_no_auth(headers):
     resp = client.get("/api/v1/public/units")
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
+
+
+def _public_unit_ids(resp) -> set[str]:
+    return {u["id"] for u in resp.json()}
+
+
+def test_public_units_active_and_available_unit_appears(headers):
+    _, unit_id = _make_property_and_unit(headers)
+    resp = client.get("/api/v1/public/units")
+    assert resp.status_code == 200
+    assert unit_id in _public_unit_ids(resp)
+
+
+def test_public_units_inactive_unit_hidden(headers):
+    """Phase 5 audit finding: deactivating a unit (is_active=False) must
+    remove it from the public listing even though its `status` column is
+    untouched and stays 'available' — the two flags are independent, and
+    the public endpoint must require both."""
+    _, unit_id = _make_property_and_unit(headers)
+    deactivate = client.patch(f"/api/v1/units/{unit_id}/deactivate", headers=headers)
+    assert deactivate.status_code == 200
+    assert deactivate.json()["is_active"] is False
+    assert deactivate.json()["status"] == "available"  # confirms status is untouched by deactivation
+
+    resp = client.get("/api/v1/public/units")
+    assert resp.status_code == 200
+    assert unit_id not in _public_unit_ids(resp)
+
+
+def test_public_units_blocked_status_hidden(headers):
+    _, unit_id = _make_property_and_unit(headers)
+    patch = client.patch(f"/api/v1/units/{unit_id}", headers=headers, json={"status": "blocked"})
+    assert patch.status_code == 200
+
+    resp = client.get("/api/v1/public/units")
+    assert resp.status_code == 200
+    assert unit_id not in _public_unit_ids(resp)
+
+
+def test_public_units_maintenance_status_hidden(headers):
+    _, unit_id = _make_property_and_unit(headers)
+    patch = client.patch(f"/api/v1/units/{unit_id}", headers=headers, json={"status": "maintenance"})
+    assert patch.status_code == 200
+
+    resp = client.get("/api/v1/public/units")
+    assert resp.status_code == 200
+    assert unit_id not in _public_unit_ids(resp)
 
 
 def test_public_availability_check(headers):
@@ -229,6 +306,93 @@ def test_promo_code_creation_and_validation(headers):
 def test_invalid_promo_code_rejected():
     resp = client.post("/api/v1/public/promo/validate", json={"code": "DOES_NOT_EXIST", "subtotal": 1000})
     assert resp.json()["valid"] is False
+
+
+def test_promo_code_edit_changes_value(headers):
+    code = f"EDIT{uuid.uuid4().hex[:6].upper()}"
+    create = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": code, "discount_type": "flat", "value": 500,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    promo_id = create.json()["id"]
+
+    edit = client.patch(f"/api/v1/promo-codes/{promo_id}", headers=headers, json={"value": 750})
+    assert edit.status_code == 200
+    assert edit.json()["value"] == 750.0
+
+    validate = client.post("/api/v1/public/promo/validate", json={"code": code, "subtotal": 3000})
+    assert validate.json()["discount_amount"] == 750.0
+
+
+def test_promo_code_deactivate_stops_it_validating(headers):
+    code = f"DEACT{uuid.uuid4().hex[:6].upper()}"
+    create = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": code, "discount_type": "flat", "value": 500,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    promo_id = create.json()["id"]
+
+    deactivate = client.patch(f"/api/v1/promo-codes/{promo_id}", headers=headers, json={"active": False})
+    assert deactivate.status_code == 200
+    assert deactivate.json()["active"] is False
+
+    validate = client.post("/api/v1/public/promo/validate", json={"code": code, "subtotal": 3000})
+    assert validate.json()["valid"] is False
+
+    reactivate = client.patch(f"/api/v1/promo-codes/{promo_id}", headers=headers, json={"active": True})
+    assert reactivate.json()["active"] is True
+    validate_again = client.post("/api/v1/public/promo/validate", json={"code": code, "subtotal": 3000})
+    assert validate_again.json()["valid"] is True
+
+
+def test_promo_code_expiry_can_be_changed(headers):
+    code = f"EXP{uuid.uuid4().hex[:6].upper()}"
+    create = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": code, "discount_type": "flat", "value": 500,
+        "valid_from": "2020-01-01", "valid_to": "2020-01-02",  # already expired
+    })
+    promo_id = create.json()["id"]
+
+    expired_check = client.post("/api/v1/public/promo/validate", json={"code": code, "subtotal": 1000})
+    assert expired_check.json()["valid"] is False
+
+    extend = client.patch(f"/api/v1/promo-codes/{promo_id}", headers=headers, json={"valid_to": "2099-01-01"})
+    assert extend.status_code == 200
+
+    validate = client.post("/api/v1/public/promo/validate", json={"code": code, "subtotal": 1000})
+    assert validate.json()["valid"] is True
+
+
+def test_promo_code_patch_rejects_invalid_discount_type(headers):
+    code = f"BADTYPE{uuid.uuid4().hex[:6].upper()}"
+    create = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": code, "discount_type": "flat", "value": 500,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    promo_id = create.json()["id"]
+    resp = client.patch(f"/api/v1/promo-codes/{promo_id}", headers=headers, json={"discount_type": "not_a_real_type"})
+    assert resp.status_code == 400
+
+
+def test_promo_code_patch_requires_admin(headers):
+    """list_promo_codes allows staff too, but the PATCH (edit/activate/
+    deactivate) endpoint is admin-only — staff must not be able to
+    silently change discount economics."""
+    code = f"RBAC{uuid.uuid4().hex[:6].upper()}"
+    create = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": code, "discount_type": "flat", "value": 500,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    promo_id = create.json()["id"]
+
+    staff_email = f"promorbac_{uuid.uuid4().hex[:8]}@sriapartmenthomestay.com"
+    register = client.post("/api/v1/auth/register", headers=headers, json={"name": "Promo RBAC Test", "email": staff_email, "password": "Pass12345!", "role": "staff"})
+    assert register.status_code == 201
+    staff_login = client.post("/api/v1/auth/login", json={"email": staff_email, "password": "Pass12345!"})
+    staff_headers = {"Authorization": f"Bearer {staff_login.json()['access_token']}"}
+
+    resp = client.patch(f"/api/v1/promo-codes/{promo_id}", headers=staff_headers, json={"active": False})
+    assert resp.status_code == 403
 
 
 def test_flat_discount_never_exceeds_subtotal(headers):
@@ -276,8 +440,16 @@ def test_public_quote_invalid_promo_rejected(headers):
     assert resp.status_code == 400
 
 
-def test_hold_requires_razorpay_configuration(headers):
-    """POST /holds returns 501 when Razorpay credentials are not configured (this environment)."""
+def test_hold_requires_razorpay_configuration(headers, monkeypatch):
+    """POST /holds returns 501 when Razorpay credentials are not configured."""
+    from app.core.config import settings
+    # WEBSITE-04A: force the not-configured path explicitly — real
+    # RAZORPAY_KEY_ID/SECRET are legitimately configured in this
+    # environment since WEBSITE-03, so the ambient state can no longer be
+    # relied on to exercise this contract (and this avoids a real call to
+    # Razorpay's TEST API during the test suite).
+    monkeypatch.setattr(settings, "razorpay_key_id", "")
+    monkeypatch.setattr(settings, "razorpay_key_secret", "")
     _, unit_id = _make_property_and_unit(headers, base_rate=2000)
     resp = client.post("/api/v1/public/holds", json={
         "unit_id": unit_id,

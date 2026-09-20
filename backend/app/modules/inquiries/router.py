@@ -41,7 +41,7 @@ from app.modules.inquiries.service import (
 from app.modules.payments.models import Payment
 from app.modules.properties.models import Unit
 from app.modules.properties.router import get_unit_price_quote
-from app.modules.settings.router import get_or_create_settings
+from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
 from app.shared.rbac import get_current_user, require_role
 
 router = APIRouter(prefix="/api/v1/inquiries", tags=["inquiries"])
@@ -59,7 +59,7 @@ def _map_payment_mode(inquiry_payment_mode: str) -> str:
     return "bank_transfer"  # covers "Online / Bank Transfer" and any other default
 
 
-@router.post("", response_model=InquiryOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("", response_model=InquiryOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_inquiry(payload: InquiryCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     if payload.source not in INQUIRY_SOURCES:
         raise HTTPException(400, f"Invalid source '{payload.source}'. Must be one of {INQUIRY_SOURCES}")
@@ -166,7 +166,7 @@ def create_inquiry(payload: InquiryCreate, db: Session = Depends(get_db), user: 
     return inquiry
 
 
-@router.get("", response_model=list[InquiryOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("", response_model=list[InquiryOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_inquiries(
     status: str | None = None,
     lead_status: str | None = None,
@@ -204,7 +204,7 @@ def list_inquiries(
 # matches routes in registration order, so "/expiring" would otherwise be
 # swallowed by "/{inquiry_id}" (with inquiry_id="expiring") and fail UUID
 # validation instead of ever reaching this handler.
-@router.get("/follow-ups/due", response_model=list[InquiryOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/follow-ups/due", response_model=list[InquiryOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_follow_ups_due(as_of: date | None = Query(None), db: Session = Depends(get_db)):
     """
     Leads with a follow-up date on or before `as_of` (default: today) that
@@ -220,7 +220,7 @@ def list_follow_ups_due(as_of: date | None = Query(None), db: Session = Depends(
     return db.scalars(query).all()
 
 
-@router.get("/expiring", response_model=list[InquiryOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/expiring", response_model=list[InquiryOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_expiring_soon(within_days: int = Query(3, ge=0), db: Session = Depends(get_db)):
     """Quotations whose validity ends within the next N days and haven't converted or been lost."""
     today = date.today()
@@ -233,7 +233,7 @@ def list_expiring_soon(within_days: int = Query(3, ge=0), db: Session = Depends(
     return db.scalars(query).all()
 
 
-@router.get("/{inquiry_id}", response_model=InquiryOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{inquiry_id}", response_model=InquiryOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_inquiry(inquiry_id: uuid.UUID, db: Session = Depends(get_db)):
     inquiry = db.get(Inquiry, inquiry_id)
     if inquiry is None:
@@ -241,7 +241,7 @@ def get_inquiry(inquiry_id: uuid.UUID, db: Session = Depends(get_db)):
     return inquiry
 
 
-@router.patch("/{inquiry_id}", response_model=InquiryOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/{inquiry_id}", response_model=InquiryOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_inquiry(inquiry_id: uuid.UUID, payload: InquiryUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     inquiry = db.get(Inquiry, inquiry_id)
     if inquiry is None:
@@ -387,14 +387,14 @@ def update_inquiry(inquiry_id: uuid.UUID, payload: InquiryUpdate, db: Session = 
     return inquiry
 
 
-@router.get("/{inquiry_id}/pdf", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{inquiry_id}/pdf", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_quotation_pdf(inquiry_id: uuid.UUID, db: Session = Depends(get_db)):
     inquiry = db.get(Inquiry, inquiry_id)
     if inquiry is None:
         raise HTTPException(404, "Inquiry not found")
 
     business_settings = get_or_create_settings(db)
-    filepath = generate_quotation_pdf(inquiry, business_settings=business_settings)
+    filepath = generate_quotation_pdf(inquiry, business_settings=business_settings, bank_settings=get_or_create_bank_settings(db))
     inquiry.pdf_path = filepath
     db.commit()
 
@@ -409,7 +409,7 @@ def download_quotation_pdf(inquiry_id: uuid.UUID, db: Session = Depends(get_db))
     "/{inquiry_id}/convert-to-booking",
     response_model=ConvertToBookingResponse,
     status_code=201,
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def convert_to_booking(
     inquiry_id: uuid.UUID,
@@ -538,7 +538,7 @@ def _bump_lead_after_contact(inquiry: Inquiry) -> None:
 @router.post(
     "/{inquiry_id}/send/whatsapp",
     response_model=SendWhatsAppResponse,
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def send_whatsapp(inquiry_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     inquiry = db.get(Inquiry, inquiry_id)
@@ -568,7 +568,7 @@ def send_whatsapp(inquiry_id: uuid.UUID, db: Session = Depends(get_db), user: Us
 @router.post(
     "/{inquiry_id}/send/email",
     response_model=SendEmailResponse,
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def send_email(
     inquiry_id: uuid.UUID,
@@ -584,7 +584,7 @@ def send_email(
     if not to_email:
         raise HTTPException(400, "No email address on file for this inquiry — provide to_email in the request")
 
-    pdf_path = generate_quotation_pdf(inquiry, business_settings=get_or_create_settings(db))
+    pdf_path = generate_quotation_pdf(inquiry, business_settings=get_or_create_settings(db), bank_settings=get_or_create_bank_settings(db))
     inquiry.pdf_path = pdf_path
 
     try:
@@ -618,7 +618,7 @@ def send_email(
 @router.get(
     "/{inquiry_id}/communications",
     response_model=list[CommunicationOut],
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def list_communications(inquiry_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(
@@ -628,7 +628,7 @@ def list_communications(inquiry_id: uuid.UUID, db: Session = Depends(get_db)):
     ).all()
 
 
-@router.get("/{inquiry_id}/timeline", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{inquiry_id}/timeline", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_inquiry_timeline(inquiry_id: uuid.UUID, db: Session = Depends(get_db)):
     """Every audit-logged action against this specific inquiry, oldest
     first — same pattern as the Booking/Housekeeping/Maintenance
@@ -661,7 +661,7 @@ INQUIRY_ATTACHMENT_STORAGE_DIR = os.environ.get("INQUIRY_ATTACHMENT_STORAGE_DIR"
 os.makedirs(INQUIRY_ATTACHMENT_STORAGE_DIR, exist_ok=True)
 
 
-@router.post("/{inquiry_id}/attachments", response_model=InquiryAttachmentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/{inquiry_id}/attachments", response_model=InquiryAttachmentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 async def upload_inquiry_attachment(inquiry_id: uuid.UUID, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     inquiry = db.get(Inquiry, inquiry_id)
     if inquiry is None:
@@ -686,12 +686,12 @@ async def upload_inquiry_attachment(inquiry_id: uuid.UUID, file: UploadFile = Fi
     return record
 
 
-@router.get("/{inquiry_id}/attachments", response_model=list[InquiryAttachmentOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{inquiry_id}/attachments", response_model=list[InquiryAttachmentOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_inquiry_attachments(inquiry_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(InquiryAttachment).where(InquiryAttachment.inquiry_id == inquiry_id)).all()
 
 
-@router.get("/{inquiry_id}/attachments/{attachment_id}/download", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{inquiry_id}/attachments/{attachment_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_inquiry_attachment(inquiry_id: uuid.UUID, attachment_id: uuid.UUID, db: Session = Depends(get_db)):
     record = db.get(InquiryAttachment, attachment_id)
     if record is None or record.inquiry_id != inquiry_id:
@@ -701,7 +701,7 @@ def download_inquiry_attachment(inquiry_id: uuid.UUID, attachment_id: uuid.UUID,
     return FileResponse(record.file_path, media_type=record.content_type, filename=record.filename)
 
 
-@router.delete("/{inquiry_id}/attachments/{attachment_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff"))])
+@router.delete("/{inquiry_id}/attachments/{attachment_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_inquiry_attachment(inquiry_id: uuid.UUID, attachment_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     record = db.get(InquiryAttachment, attachment_id)
     if record is None or record.inquiry_id != inquiry_id:

@@ -24,8 +24,7 @@ from app.modules.payments.models import PAYMENT_MODES
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 # Use days 800-899 to avoid conflicts with other test files
 _DAY_OFFSET = 800

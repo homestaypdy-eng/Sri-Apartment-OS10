@@ -1,9 +1,22 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, extractErrorMessage, type AttendanceOut, type LeaveRequestOut, type PayrollOut, type ShiftOut, type HolidayOut, type UserOut, type UnitOut, type StaffApartmentAssignmentOut, type StaffPerformanceNoteOut, type StaffProfileOut, type StaffAdvanceOut } from "../lib/api";
+import { api, extractErrorMessage, type AttendanceOut, type LeaveRequestOut, type PayrollOut, type ShiftOut, type HolidayOut, type UserOut, type UnitOut, type StaffApartmentAssignmentOut, type StaffPerformanceNoteOut, type StaffProfileOut, type StaffAdvanceOut, type StaffDesignationOut, type ResolvedPolicyOut, type AttendanceMonthlySummaryOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
-type Tab = "directory" | "attendance" | "leave" | "payroll" | "shifts" | "holidays" | "assignments" | "performance";
+type Tab = "directory" | "attendance" | "leave" | "payroll" | "shifts" | "holidays" | "assignments" | "performance" | "designations";
+
+function minutesToHm(minutes: number | null | undefined): string {
+  if (minutes === null || minutes === undefined) return "—";
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `${h}h ${m}m`;
+}
+
+function sourceBadge(source: "override" | "designation" | "unconfigured" | undefined) {
+  if (source === "override") return <Badge tone="blue">custom override</Badge>;
+  if (source === "designation") return <Badge tone="slate">post default</Badge>;
+  return <Badge tone="amber">unconfigured</Badge>;
+}
 
 const DESIGNATION_SUGGESTIONS = [
   "Property Manager", "Housekeeping Supervisor", "Housekeeping Attendant", "Maintenance Technician",
@@ -26,6 +39,7 @@ export default function StaffPage() {
 
   const tabs: { key: Tab; label: string }[] = [
     { key: "directory", label: "Staff Directory" },
+    ...(isAdmin ? [{ key: "designations" as Tab, label: "Designations" }] : []),
     { key: "attendance", label: "Attendance" },
     { key: "leave", label: "Leave" },
     { key: "payroll", label: "Payroll" },
@@ -56,6 +70,7 @@ export default function StaffPage() {
       </div>
 
       {tab === "directory" && <DirectoryTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
+      {tab === "designations" && isAdmin && <DesignationsTab setError={setError} setSuccess={setSuccess} />}
       {tab === "attendance" && <AttendanceTab users={users} setError={setError} setSuccess={setSuccess} />}
       {tab === "leave" && <LeaveTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "payroll" && <PayrollTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
@@ -69,6 +84,165 @@ export default function StaffPage() {
 
 function userName(users: UserOut[], id: string) {
   return users.find((u) => u.id === id)?.name ?? id.slice(0, 8);
+}
+
+// --- Designations (post/designation master — admin-managed defaults that
+// an individual employee's profile can override; see CompensationPanel) ---
+
+const EMPTY_DESIGNATION_FORM = {
+  id: "", name: "", default_basic_salary: "", default_shift_start: "09:00", default_shift_end: "18:00",
+  default_lunch_break_minutes: "60", standard_working_hours: "8", leave_entitlement_per_month: "4",
+  overtime_mode: "tracked_no_pay", overtime_rate_multiplier: "",
+};
+
+function DesignationsTab({ setError, setSuccess }: { setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+  const [designations, setDesignations] = useState<StaffDesignationOut[]>([]);
+  const [showInactive, setShowInactive] = useState(false);
+  const [form, setForm] = useState(EMPTY_DESIGNATION_FORM);
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  function load() {
+    api.get("/staff/designations", { params: { include_inactive: showInactive } }).then((r) => setDesignations(r.data)).catch(() => {});
+  }
+  useEffect(load, [showInactive]);
+
+  function startEdit(d: StaffDesignationOut) {
+    setEditingId(d.id);
+    setForm({
+      id: d.id, name: d.name, default_basic_salary: String(d.default_basic_salary),
+      default_shift_start: d.default_shift_start.slice(0, 5), default_shift_end: d.default_shift_end.slice(0, 5),
+      default_lunch_break_minutes: String(d.default_lunch_break_minutes), standard_working_hours: String(d.standard_working_hours),
+      leave_entitlement_per_month: String(d.leave_entitlement_per_month), overtime_mode: d.overtime_mode,
+      overtime_rate_multiplier: d.overtime_rate_multiplier === null ? "" : String(d.overtime_rate_multiplier),
+    });
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+    const payload = {
+      name: form.name,
+      default_basic_salary: Number(form.default_basic_salary),
+      default_shift_start: `${form.default_shift_start}:00`,
+      default_shift_end: `${form.default_shift_end}:00`,
+      default_lunch_break_minutes: Number(form.default_lunch_break_minutes),
+      standard_working_hours: Number(form.standard_working_hours),
+      leave_entitlement_per_month: Number(form.leave_entitlement_per_month),
+      overtime_mode: form.overtime_mode,
+      overtime_rate_multiplier: form.overtime_rate_multiplier ? Number(form.overtime_rate_multiplier) : null,
+    };
+    try {
+      if (editingId) {
+        await api.patch(`/staff/designations/${editingId}`, payload);
+        setSuccess("Designation updated.");
+      } else {
+        await api.post("/staff/designations", payload);
+        setSuccess("Designation created.");
+      }
+      setForm(EMPTY_DESIGNATION_FORM);
+      setEditingId(null);
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function toggleActive(d: StaffDesignationOut) {
+    setError(null);
+    try {
+      await api.patch(`/staff/designations/${d.id}/${d.is_active ? "deactivate" : "reactivate"}`);
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <Card>
+        <h3 className="text-sm font-semibold text-slate-900 mb-1">{editingId ? "Edit Designation" : "New Designation"}</h3>
+        <p className="text-xs text-slate-400 mb-3">
+          These are the defaults every employee assigned to this post gets — salary, shift timing, lunch break, standard hours,
+          overtime handling, and leave entitlement. An individual employee's profile can override any of these; see the
+          "Compensation & Schedule" tab on their staff profile.
+        </p>
+        <form onSubmit={handleSubmit} className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+          <input placeholder="Post name (e.g. Manager)" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required className="rounded-lg border border-slate-300 px-2 py-1.5 col-span-2" />
+          <input type="number" min="0" step="0.01" placeholder="Default basic salary (₹/month)" value={form.default_basic_salary} onChange={(e) => setForm({ ...form, default_basic_salary: e.target.value })} required className="rounded-lg border border-slate-300 px-2 py-1.5 col-span-2" />
+          <div>
+            <label className="block text-slate-500 mb-1">Shift start</label>
+            <input type="time" value={form.default_shift_start} onChange={(e) => setForm({ ...form, default_shift_start: e.target.value })} required className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+          </div>
+          <div>
+            <label className="block text-slate-500 mb-1">Shift end</label>
+            <input type="time" value={form.default_shift_end} onChange={(e) => setForm({ ...form, default_shift_end: e.target.value })} required className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+          </div>
+          <div>
+            <label className="block text-slate-500 mb-1">Lunch break (minutes)</label>
+            <input type="number" min="0" value={form.default_lunch_break_minutes} onChange={(e) => setForm({ ...form, default_lunch_break_minutes: e.target.value })} className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+          </div>
+          <div>
+            <label className="block text-slate-500 mb-1">Standard working hours</label>
+            <input type="number" min="0" step="0.5" value={form.standard_working_hours} onChange={(e) => setForm({ ...form, standard_working_hours: e.target.value })} className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+          </div>
+          <div>
+            <label className="block text-slate-500 mb-1">Leave entitlement / month</label>
+            <input type="number" min="0" value={form.leave_entitlement_per_month} onChange={(e) => setForm({ ...form, leave_entitlement_per_month: e.target.value })} className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+          </div>
+          <div>
+            <label className="block text-slate-500 mb-1">Overtime handling</label>
+            <select value={form.overtime_mode} onChange={(e) => setForm({ ...form, overtime_mode: e.target.value })} className="w-full rounded-lg border border-slate-300 px-2 py-1.5">
+              <option value="untracked">Not tracked</option>
+              <option value="tracked_no_pay">Tracked, no auto-pay</option>
+              <option value="tracked_with_rate">Tracked, with rate</option>
+            </select>
+          </div>
+          {form.overtime_mode === "tracked_with_rate" && (
+            <div>
+              <label className="block text-slate-500 mb-1">Overtime rate multiplier</label>
+              <input type="number" min="0" step="0.1" placeholder="e.g. 1.5" value={form.overtime_rate_multiplier} onChange={(e) => setForm({ ...form, overtime_rate_multiplier: e.target.value })} className="w-full rounded-lg border border-slate-300 px-2 py-1.5" />
+            </div>
+          )}
+          <div className="col-span-2 md:col-span-4 flex gap-2">
+            <Button type="submit">{editingId ? "Save Changes" : "Create Designation"}</Button>
+            {editingId && <Button type="button" variant="secondary" onClick={() => { setEditingId(null); setForm(EMPTY_DESIGNATION_FORM); }}>Cancel</Button>}
+          </div>
+        </form>
+      </Card>
+
+      <Card>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-slate-900">Posts / Designations</h3>
+          <label className="flex items-center gap-1.5 text-xs text-slate-500">
+            <input type="checkbox" checked={showInactive} onChange={(e) => setShowInactive(e.target.checked)} />
+            Show deactivated
+          </label>
+        </div>
+        <Table headers={["Post", "Default Salary", "Shift", "Lunch", "Std. Hours", "Leave/mo", "Overtime", "Status", "Actions"]}>
+          {designations.map((d) => (
+            <tr key={d.id}>
+              <td className="px-4 py-2.5 font-medium text-slate-800">{d.name}</td>
+              <td className="px-4 py-2.5 text-slate-500">₹{d.default_basic_salary.toLocaleString()}</td>
+              <td className="px-4 py-2.5 text-slate-500">{d.default_shift_start.slice(0, 5)}–{d.default_shift_end.slice(0, 5)}</td>
+              <td className="px-4 py-2.5 text-slate-500">{d.default_lunch_break_minutes}m</td>
+              <td className="px-4 py-2.5 text-slate-500">{d.standard_working_hours}h</td>
+              <td className="px-4 py-2.5 text-slate-500">{d.leave_entitlement_per_month}</td>
+              <td className="px-4 py-2.5 text-slate-500">
+                {d.overtime_mode === "untracked" ? "Not tracked" : d.overtime_mode === "tracked_no_pay" ? "Tracked only" : `Tracked ×${d.overtime_rate_multiplier ?? "—"}`}
+              </td>
+              <td className="px-4 py-2.5"><Badge tone={d.is_active ? "green" : "slate"}>{d.is_active ? "Active" : "Deactivated"}</Badge></td>
+              <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
+                <button onClick={() => startEdit(d)} className="text-xs text-slate-500 hover:text-slate-900">Edit</button>
+                <button onClick={() => toggleActive(d)} className="text-xs text-slate-500 hover:text-slate-900">{d.is_active ? "Deactivate" : "Reactivate"}</button>
+              </td>
+            </tr>
+          ))}
+        </Table>
+        {designations.length === 0 && <p className="text-xs text-slate-400 mt-2">No designations created yet.</p>}
+      </Card>
+    </div>
+  );
 }
 
 // --- Staff Directory ---
@@ -206,7 +380,7 @@ function ToggleActiveProfileButton({ profile, setError, setSuccess, onDone }: { 
 }
 
 type ProfileModalTab =
-  | "overview" | "employment" | "personal" | "emergency" | "documents" | "bank" | "work"
+  | "overview" | "employment" | "compensation" | "personal" | "emergency" | "documents" | "bank" | "work"
   | "attendance" | "leave" | "payroll" | "advances" | "shifts" | "performance" | "audit";
 
 const PROFILE_EDIT_TABS: ProfileModalTab[] = ["employment", "personal", "emergency", "documents", "bank", "work"];
@@ -259,6 +433,7 @@ function StaffProfileModal({
   const modalTabs: { key: ProfileModalTab; label: string }[] = [
     { key: "overview", label: "Overview" },
     { key: "employment", label: "Employment" },
+    { key: "compensation", label: "Compensation & Schedule" },
     { key: "personal", label: "Personal" },
     { key: "emergency", label: "Emergency Contact" },
     { key: "documents", label: "Documents / ID" },
@@ -333,6 +508,14 @@ function StaffProfileModal({
             </select>
             <textarea placeholder="Notes" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="col-span-2 rounded-lg border border-slate-300 px-2 py-1.5" rows={2} />
           </div>
+        )}
+
+        {modalTab === "compensation" && (
+          currentProfile ? (
+            <CompensationPanel profile={currentProfile} onSaved={(p) => { setCurrentProfile(p); onSaved(p); }} setError={setError} setSuccess={setSuccess} />
+          ) : (
+            <p className="text-xs text-slate-400">Create the staff profile first (Employment tab) before setting compensation and schedule.</p>
+          )
         )}
 
         {modalTab === "personal" && (
@@ -413,6 +596,133 @@ function StaffProfileModal({
   );
 }
 
+// Post default -> employee-specific override, resolved. Shows what
+// actually applies right now (via GET /staff/policy/{user_id}) and lets
+// an admin set/clear each override individually — clearing an override
+// (empty input, Save) reverts that field to the linked post's default.
+function CompensationPanel({
+  profile, onSaved, setError, setSuccess,
+}: {
+  profile: StaffProfileOut; onSaved: (p: StaffProfileOut) => void;
+  setError: (e: string | null) => void; setSuccess: (s: string | null) => void;
+}) {
+  const [designations, setDesignations] = useState<StaffDesignationOut[]>([]);
+  const [policy, setPolicy] = useState<ResolvedPolicyOut | null>(null);
+  const [designationId, setDesignationId] = useState(profile.designation_id ?? "");
+  const [overrides, setOverrides] = useState({
+    salary_override: profile.salary_override === null ? "" : String(profile.salary_override),
+    shift_start_override: profile.shift_start_override?.slice(0, 5) ?? "",
+    shift_end_override: profile.shift_end_override?.slice(0, 5) ?? "",
+    lunch_break_override_minutes: profile.lunch_break_override_minutes === null ? "" : String(profile.lunch_break_override_minutes),
+    standard_working_hours_override: profile.standard_working_hours_override === null ? "" : String(profile.standard_working_hours_override),
+    leave_entitlement_override: profile.leave_entitlement_override === null ? "" : String(profile.leave_entitlement_override),
+  });
+
+  function loadPolicy() {
+    api.get(`/staff/policy/${profile.user_id}`).then((r) => setPolicy(r.data)).catch(() => {});
+  }
+  useEffect(() => {
+    api.get("/staff/designations").then((r) => setDesignations(r.data)).catch(() => {});
+    loadPolicy();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile.user_id]);
+
+  async function handleSave() {
+    setError(null);
+    setSuccess(null);
+    // Empty input explicitly clears the override (reverts to post
+    // default) — sent as null, not omitted, so the backend's
+    // exclude_unset PATCH actually changes it rather than leaving it alone.
+    const payload = {
+      designation_id: designationId || null,
+      salary_override: overrides.salary_override === "" ? null : Number(overrides.salary_override),
+      shift_start_override: overrides.shift_start_override === "" ? null : `${overrides.shift_start_override}:00`,
+      shift_end_override: overrides.shift_end_override === "" ? null : `${overrides.shift_end_override}:00`,
+      lunch_break_override_minutes: overrides.lunch_break_override_minutes === "" ? null : Number(overrides.lunch_break_override_minutes),
+      standard_working_hours_override: overrides.standard_working_hours_override === "" ? null : Number(overrides.standard_working_hours_override),
+      leave_entitlement_override: overrides.leave_entitlement_override === "" ? null : Number(overrides.leave_entitlement_override),
+    };
+    try {
+      const { data } = await api.patch(`/staff/profiles/${profile.id}`, payload);
+      onSaved(data);
+      setSuccess("Compensation & schedule updated.");
+      loadPolicy();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  const rows: { label: string; overrideKey: keyof typeof overrides; type: string; resolved: string; source?: "override" | "designation" | "unconfigured" }[] = [
+    { label: "Basic salary (₹/month)", overrideKey: "salary_override", type: "number",
+      resolved: policy?.basic_salary != null ? `₹${policy.basic_salary.toLocaleString()}` : "—", source: policy?.source.basic_salary },
+    { label: "Shift start", overrideKey: "shift_start_override", type: "time",
+      resolved: policy?.shift_start ?? "—", source: policy?.source.shift_start },
+    { label: "Shift end", overrideKey: "shift_end_override", type: "time",
+      resolved: policy?.shift_end ?? "—", source: policy?.source.shift_end },
+    { label: "Lunch break (minutes)", overrideKey: "lunch_break_override_minutes", type: "number",
+      resolved: policy?.lunch_break_minutes != null ? `${policy.lunch_break_minutes}m` : "—", source: policy?.source.lunch_break_minutes },
+    { label: "Standard working hours", overrideKey: "standard_working_hours_override", type: "number",
+      resolved: policy?.standard_working_hours != null ? `${policy.standard_working_hours}h` : "—", source: policy?.source.standard_working_hours },
+    { label: "Leave entitlement / month", overrideKey: "leave_entitlement_override", type: "number",
+      resolved: policy?.leave_entitlement_per_month != null ? String(policy.leave_entitlement_per_month) : "—", source: policy?.source.leave_entitlement_per_month },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <label className="block text-xs text-slate-500 mb-1">Post / Designation</label>
+        <select value={designationId} onChange={(e) => setDesignationId(e.target.value)} className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+          <option value="">No post linked (defaults unconfigured)</option>
+          {designations.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select>
+      </div>
+
+      {policy?.overtime_mode && (
+        <p className="text-xs text-slate-400">
+          Overtime: {policy.overtime_mode === "untracked" ? "not tracked for this post" : policy.overtime_mode === "tracked_no_pay" ? "hours tracked, not auto-paid" : `tracked at ×${policy.overtime_rate_multiplier}`}
+        </p>
+      )}
+
+      <div className="border border-slate-200 rounded-xl overflow-hidden">
+        <table className="min-w-full text-xs">
+          <thead className="bg-slate-50 border-b border-slate-200">
+            <tr>
+              <th className="text-left px-3 py-2 font-medium text-slate-500">Field</th>
+              <th className="text-left px-3 py-2 font-medium text-slate-500">Currently Applies</th>
+              <th className="text-left px-3 py-2 font-medium text-slate-500">Employee Override</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {rows.map((r) => (
+              <tr key={r.overrideKey}>
+                <td className="px-3 py-2 text-slate-700">{r.label}</td>
+                <td className="px-3 py-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-slate-600">{r.resolved}</span>
+                    {sourceBadge(r.source)}
+                  </div>
+                </td>
+                <td className="px-3 py-2">
+                  <input
+                    type={r.type}
+                    step={r.overrideKey === "salary_override" ? "0.01" : r.overrideKey === "standard_working_hours_override" ? "0.5" : undefined}
+                    placeholder="use post default"
+                    value={overrides[r.overrideKey]}
+                    onChange={(e) => setOverrides({ ...overrides, [r.overrideKey]: e.target.value })}
+                    className="w-full rounded-lg border border-slate-300 px-2 py-1"
+                  />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-xs text-slate-400">Leave any override field blank and save to revert that field to the post's default.</p>
+      <Button onClick={handleSave} type="button">Save Compensation & Schedule</Button>
+    </div>
+  );
+}
+
 function WorkAssignmentPanel({ targetUserId, setError, setSuccess }: { targetUserId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [units, setUnits] = useState<UnitOut[]>([]);
   const [assignments, setAssignments] = useState<StaffApartmentAssignmentOut[]>([]);
@@ -488,7 +798,10 @@ function WorkAssignmentPanel({ targetUserId, setError, setSuccess }: { targetUse
 
 function ScopedAttendancePanel({ userId, setError, setSuccess }: { userId: string; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [records, setRecords] = useState<AttendanceOut[]>([]);
-  const [form, setForm] = useState({ date: "", status: "present" });
+  const [form, setForm] = useState({ date: "", status: "present", check_in_time: "", check_out_time: "" });
+  const [checkoutTimes, setCheckoutTimes] = useState<Record<string, string>>({});
+  const [summary, setSummary] = useState<AttendanceMonthlySummaryOut | null>(null);
+  const today = new Date();
 
   async function load() {
     try {
@@ -498,8 +811,13 @@ function ScopedAttendancePanel({ userId, setError, setSuccess }: { userId: strin
       setError(extractErrorMessage(err));
     }
   }
+  function loadSummary() {
+    api.get("/staff/attendance/monthly-summary", { params: { user_id: userId, year: today.getFullYear(), month: today.getMonth() + 1 } })
+      .then((r) => setSummary(r.data)).catch(() => {});
+  }
   useEffect(() => {
     load();
+    loadSummary();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
 
@@ -508,10 +826,30 @@ function ScopedAttendancePanel({ userId, setError, setSuccess }: { userId: strin
     setError(null);
     setSuccess(null);
     try {
-      await api.post("/staff/attendance", { user_id: userId, date: form.date, status: form.status });
+      await api.post("/staff/attendance", {
+        user_id: userId, date: form.date, status: form.status,
+        check_in_time: form.check_in_time ? `${form.check_in_time}:00` : undefined,
+        check_out_time: form.check_out_time ? `${form.check_out_time}:00` : undefined,
+      });
       setSuccess("Attendance recorded.");
-      setForm({ date: "", status: "present" });
+      setForm({ date: "", status: "present", check_in_time: "", check_out_time: "" });
       load();
+      loadSummary();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleCheckOut(recordId: string) {
+    const time = checkoutTimes[recordId];
+    if (!time) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.patch(`/staff/attendance/${recordId}`, { check_out_time: `${time}:00` });
+      setSuccess("Check-out recorded — hours computed.");
+      load();
+      loadSummary();
     } catch (err) {
       setError(extractErrorMessage(err));
     }
@@ -519,8 +857,18 @@ function ScopedAttendancePanel({ userId, setError, setSuccess }: { userId: strin
 
   return (
     <div>
+      {summary && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3 text-xs">
+          <div className="border border-slate-100 rounded-lg px-3 py-2"><p className="text-slate-400">This month, working hours</p><p className="font-medium text-slate-800">{minutesToHm(summary.total_working_minutes)}</p></div>
+          <div className="border border-slate-100 rounded-lg px-3 py-2"><p className="text-slate-400">This month, overtime</p><p className="font-medium text-slate-800">{minutesToHm(summary.total_overtime_minutes)}</p></div>
+          <div className="border border-slate-100 rounded-lg px-3 py-2"><p className="text-slate-400">Approved leave (free / excess)</p><p className="font-medium text-slate-800">{summary.free_leave_days} / {summary.excess_leave_days}</p></div>
+          <div className="border border-slate-100 rounded-lg px-3 py-2"><p className="text-slate-400">Leave entitlement</p><p className="font-medium text-slate-800">{summary.leave_entitlement_per_month ?? "—"}/mo</p></div>
+        </div>
+      )}
       <form onSubmit={handleSubmit} className="flex flex-wrap gap-2 mb-3">
         <input required type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input type="time" title="Check-in time" value={form.check_in_time} onChange={(e) => setForm({ ...form, check_in_time: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+        <input type="time" title="Check-out time (leave blank to check out later)" value={form.check_out_time} onChange={(e) => setForm({ ...form, check_out_time: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
         <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
           <option value="present">Present</option>
           <option value="absent">Absent</option>
@@ -534,9 +882,22 @@ function ScopedAttendancePanel({ userId, setError, setSuccess }: { userId: strin
       ) : (
         <div className="space-y-1">
           {records.map((r) => (
-            <div key={r.id} className="flex items-center justify-between border border-slate-100 rounded-lg px-3 py-1.5 text-xs">
-              <span>{r.date}</span>
+            <div key={r.id} className="flex items-center justify-between border border-slate-100 rounded-lg px-3 py-1.5 text-xs gap-2">
+              <span className="w-24 shrink-0">{r.date}</span>
               <Badge tone={r.status === "present" ? "green" : r.status === "absent" ? "red" : "amber"}>{r.status.replace("_", " ")}</Badge>
+              <span className="text-slate-500">{r.check_in_time?.slice(0, 5) ?? "—"} → {r.check_out_time?.slice(0, 5) ?? "—"}</span>
+              {r.working_minutes !== null ? (
+                <span className="text-slate-500 ml-auto">
+                  {minutesToHm(r.working_minutes)} worked{r.overtime_minutes ? `, ${minutesToHm(r.overtime_minutes)} OT` : ""}
+                </span>
+              ) : r.check_in_time ? (
+                <div className="flex items-center gap-1 ml-auto">
+                  <input type="time" value={checkoutTimes[r.id] ?? ""} onChange={(e) => setCheckoutTimes({ ...checkoutTimes, [r.id]: e.target.value })} className="rounded border border-slate-300 px-1.5 py-0.5" />
+                  <button onClick={() => handleCheckOut(r.id)} className="text-slate-500 hover:text-slate-900">Check out</button>
+                </div>
+              ) : (
+                <span className="text-slate-300 ml-auto">no check-in</span>
+              )}
             </div>
           ))}
         </div>
@@ -916,7 +1277,7 @@ function ScopedAuditPanel({ entityId, setError }: { entityId: string; setError: 
 
 function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [records, setRecords] = useState<AttendanceOut[]>([]);
-  const [form, setForm] = useState({ user_id: "", date: "", status: "present" });
+  const [form, setForm] = useState({ user_id: "", date: "", status: "present", check_in_time: "", check_out_time: "" });
 
   async function load() {
     try {
@@ -936,9 +1297,13 @@ function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setE
     setError(null);
     setSuccess(null);
     try {
-      await api.post("/staff/attendance", form);
+      await api.post("/staff/attendance", {
+        user_id: form.user_id, date: form.date, status: form.status,
+        check_in_time: form.check_in_time ? `${form.check_in_time}:00` : undefined,
+        check_out_time: form.check_out_time ? `${form.check_out_time}:00` : undefined,
+      });
       setSuccess("Attendance recorded.");
-      setForm({ user_id: "", date: "", status: "present" });
+      setForm({ user_id: "", date: "", status: "present", check_in_time: "", check_out_time: "" });
       load();
     } catch (err) {
       setError(extractErrorMessage(err));
@@ -965,18 +1330,32 @@ function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setE
               <option value="on_leave">On Leave</option>
             </select>
           </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs text-slate-500 mb-1">Check-in (optional)</label>
+              <input type="time" value={form.check_in_time} onChange={(e) => setForm({ ...form, check_in_time: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            </div>
+            <div>
+              <label className="block text-xs text-slate-500 mb-1">Check-out (optional — can add later)</label>
+              <input type="time" value={form.check_out_time} onChange={(e) => setForm({ ...form, check_out_time: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            </div>
+          </div>
           <Button type="submit">Record</Button>
         </form>
       </Card>
       <Card>
         <h2 className="text-sm font-semibold text-slate-900 mb-4">Records</h2>
         <div className="overflow-x-auto">
-          <Table headers={["Staff", "Date", "Status"]}>
+          <Table headers={["Staff", "Date", "Status", "In → Out", "Worked / Overtime"]}>
             {records.map((r) => (
               <tr key={r.id}>
                 <td className="px-4 py-2.5 font-medium text-slate-800">{userName(users, r.user_id)}</td>
                 <td className="px-4 py-2.5 text-slate-500">{r.date}</td>
                 <td className="px-4 py-2.5"><Badge tone={r.status === "present" ? "green" : r.status === "absent" ? "red" : "amber"}>{r.status.replace("_", " ")}</Badge></td>
+                <td className="px-4 py-2.5 text-slate-500">{r.check_in_time?.slice(0, 5) ?? "—"} → {r.check_out_time?.slice(0, 5) ?? "—"}</td>
+                <td className="px-4 py-2.5 text-slate-500">
+                  {r.working_minutes !== null ? `${minutesToHm(r.working_minutes)}${r.overtime_minutes ? ` (+${minutesToHm(r.overtime_minutes)} OT)` : ""}` : "—"}
+                </td>
               </tr>
             ))}
           </Table>
@@ -1077,6 +1456,7 @@ function LeaveTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]; 
 function PayrollTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]; isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [records, setRecords] = useState<PayrollOut[]>([]);
   const [form, setForm] = useState({ user_id: "", period_year: String(new Date().getFullYear()), period_month: String(new Date().getMonth() + 1), basic_salary: "", deductions: "0", bonus: "0" });
+  const [summary, setSummary] = useState<AttendanceMonthlySummaryOut | null>(null);
 
   async function load() {
     try {
@@ -1090,6 +1470,21 @@ function PayrollTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Selecting a staff member + period pre-fills basic salary from their
+  // resolved policy (post default, or their own override) and pulls the
+  // month's attendance/leave numbers in as reference — the admin still
+  // reviews and can adjust everything before submitting; see plan §F on
+  // why excess-leave/overtime deductions are never auto-filled.
+  useEffect(() => {
+    if (!form.user_id) { setSummary(null); return; }
+    api.get(`/staff/policy/${form.user_id}`).then((r) => {
+      if (r.data.basic_salary != null) setForm((f) => ({ ...f, basic_salary: String(r.data.basic_salary) }));
+    }).catch(() => {});
+    api.get("/staff/attendance/monthly-summary", { params: { user_id: form.user_id, year: Number(form.period_year), month: Number(form.period_month) } })
+      .then((r) => setSummary(r.data)).catch(() => setSummary(null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.user_id, form.period_year, form.period_month]);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -1161,6 +1556,16 @@ function PayrollTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]
             <input type="number" placeholder="Deductions" value={form.deductions} onChange={(e) => setForm({ ...form, deductions: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
             <input type="number" placeholder="Bonus" value={form.bonus} onChange={(e) => setForm({ ...form, bonus: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
           </div>
+          {summary && (
+            <div className="text-xs text-slate-500 bg-slate-50 rounded-lg px-3 py-2 space-y-0.5">
+              <p>Basic salary pre-filled from their post default / override — review before generating.</p>
+              <p>This period: {minutesToHm(summary.total_working_minutes)} worked, {minutesToHm(summary.total_overtime_minutes)} overtime.</p>
+              <p>
+                Approved leave: {summary.approved_leave_days_in_month} day(s) — {summary.free_leave_days} free
+                {summary.excess_leave_days > 0 ? `, ${summary.excess_leave_days} beyond entitlement (no automatic deduction — add one above manually if applicable)` : ", within entitlement"}.
+              </p>
+            </div>
+          )}
           <Button type="submit">Generate</Button>
         </form>
       </Card>

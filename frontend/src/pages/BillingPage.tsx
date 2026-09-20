@@ -1,10 +1,21 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type BookingOut, type InvoiceOut, type CreditNoteOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table } from "../components/ui";
+import { useAuth } from "../context/AuthContext";
 
 const PAYMENT_MODES = ["upi", "card", "bank_transfer", "cash"];
 
 export default function BillingPage() {
+  // RBAC Phase B: credit-note issuance is Admin-only on the backend
+  // (POST /invoices/{id}/credit-notes) — this page previously had no role
+  // check at all, so Staff already saw a form that would 403 for them;
+  // gating it here fixes that for Staff too, not just Manager, since the
+  // check matches the real backend boundary rather than singling out one
+  // role. Viewing/downloading existing credit notes stays visible to
+  // everyone who can reach this page (that's a GET, already granted).
+  const { role } = useAuth();
+  const isAdmin = role === "admin";
+
   const [bookings, setBookings] = useState<BookingOut[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -242,24 +253,26 @@ export default function BillingPage() {
 
               <div className="pt-3 mt-3 border-t border-slate-200">
                 <h3 className="text-xs font-semibold text-slate-700 uppercase tracking-wide mb-2">Credit Notes</h3>
-                <form onSubmit={handleCreateCreditNote} className="flex flex-wrap gap-2 mb-2">
-                  <input
-                    required
-                    type="number"
-                    placeholder="Amount (excl. GST)"
-                    value={creditNoteForm.amount}
-                    onChange={(e) => setCreditNoteForm({ ...creditNoteForm, amount: e.target.value })}
-                    className="w-40 rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
-                  />
-                  <input
-                    required
-                    placeholder="Reason"
-                    value={creditNoteForm.reason}
-                    onChange={(e) => setCreditNoteForm({ ...creditNoteForm, reason: e.target.value })}
-                    className="flex-1 min-w-[160px] rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
-                  />
-                  <Button type="submit" variant="secondary">Issue Credit Note</Button>
-                </form>
+                {isAdmin && (
+                  <form onSubmit={handleCreateCreditNote} className="flex flex-wrap gap-2 mb-2">
+                    <input
+                      required
+                      type="number"
+                      placeholder="Amount (excl. GST)"
+                      value={creditNoteForm.amount}
+                      onChange={(e) => setCreditNoteForm({ ...creditNoteForm, amount: e.target.value })}
+                      className="w-40 rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                    />
+                    <input
+                      required
+                      placeholder="Reason"
+                      value={creditNoteForm.reason}
+                      onChange={(e) => setCreditNoteForm({ ...creditNoteForm, reason: e.target.value })}
+                      className="flex-1 min-w-[160px] rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                    />
+                    <Button type="submit" variant="secondary">Issue Credit Note</Button>
+                  </form>
+                )}
                 {creditNotes.length === 0 ? (
                   <p className="text-xs text-slate-400">No credit notes issued against this invoice.</p>
                 ) : (

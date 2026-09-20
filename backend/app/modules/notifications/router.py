@@ -13,16 +13,30 @@ from datetime import datetime, timezone
 
 router = APIRouter(prefix="/api/v1/notifications", tags=["notifications"])
 
+# RBAC Phase B security fix (finding I-2): GET /logs is the system-wide,
+# unscoped notification log — unlike /inbox (self-scoped to the caller),
+# it was never meant to expose HR-adjacent events about OTHER staff members
+# to Manager. These are the only two event_type values that reveal
+# HR/payroll activity (see trigger_leave_reviewed / trigger_payroll_paid in
+# notifications/service.py) — every other event_type is operational and
+# stays visible to Manager unchanged.
+MANAGER_EXCLUDED_EVENT_TYPES = {"leave_reviewed", "payroll_paid"}
 
-@router.get("/logs", response_model=list[NotificationLogOut], dependencies=[Depends(require_role("admin", "staff"))])
-def list_notification_logs(event_type: str | None = None, db: Session = Depends(get_db)):
+
+@router.get("/logs", response_model=list[NotificationLogOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def list_notification_logs(event_type: str | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     query = select(NotificationLog).order_by(NotificationLog.created_at.desc()).limit(500)
     if event_type:
         query = query.where(NotificationLog.event_type == event_type)
+    # Applied unconditionally, after the optional event_type filter above —
+    # a Manager passing ?event_type=payroll_paid must still get nothing back,
+    # not have this exclusion narrowed away by their own query param.
+    if user.role.name == "manager":
+        query = query.where(NotificationLog.event_type.notin_(MANAGER_EXCLUDED_EVENT_TYPES))
     return db.scalars(query).all()
 
 
-@router.get("/inbox", response_model=list[NotificationLogOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/inbox", response_model=list[NotificationLogOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_my_inbox(unread_only: bool = False, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """The current logged-in user's in-app notifications — things
     addressed to THEM specifically (their leave decision, their payslip),
@@ -33,7 +47,7 @@ def get_my_inbox(unread_only: bool = False, db: Session = Depends(get_db), user:
     return db.scalars(query).all()
 
 
-@router.post("/inbox/{notification_id}/mark-read", response_model=NotificationLogOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/inbox/{notification_id}/mark-read", response_model=NotificationLogOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def mark_notification_read(notification_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     notification = db.get(NotificationLog, notification_id)
     if notification is None or notification.user_id != user.id:

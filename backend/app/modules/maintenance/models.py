@@ -9,6 +9,11 @@ from app.db.session import Base
 
 TICKET_PRIORITIES = ("low", "medium", "high", "urgent")
 TICKET_STATUSES = ("open", "in_progress", "resolved", "closed")
+# App-layer validated (like priority/status) rather than a DB CHECK
+# constraint, matching the pattern of other free-choice classification
+# fields in this codebase (e.g. Booking.source) — nullable so existing
+# tickets created before this field existed are simply uncategorized.
+TICKET_CATEGORIES = ("ac", "electrical", "plumbing", "water", "appliance", "furniture", "internet", "other")
 
 
 class MaintenanceTicket(Base):
@@ -24,6 +29,7 @@ class MaintenanceTicket(Base):
     assigned_to: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     priority: Mapped[str] = mapped_column(String(10), default="medium")
     status: Mapped[str] = mapped_column(String(20), default="open")
+    category: Mapped[str | None] = mapped_column(String(20), nullable=True)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     cost: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

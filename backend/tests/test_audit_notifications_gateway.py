@@ -13,8 +13,7 @@ from app.main import app
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 
 @pytest.fixture(scope="module")
@@ -153,13 +152,24 @@ def test_webhook_endpoint_rejects_when_not_configured():
     assert resp.status_code == 501
 
 
-def test_create_order_honestly_fails_without_credentials():
+def test_create_order_honestly_fails_without_credentials(monkeypatch):
+    from app.core.config import settings
     from app.modules.payment_gateway.service import create_order, GatewayNotConfiguredError
+    # WEBSITE-04A: this test verifies the not-configured contract itself,
+    # not this sandbox's ambient credential state — real RAZORPAY_KEY_ID/
+    # SECRET are legitimately configured in this environment (WEBSITE-03),
+    # so the not-configured path must be forced explicitly to stay
+    # deterministic regardless of what's in the real environment.
+    monkeypatch.setattr(settings, "razorpay_key_id", "")
+    monkeypatch.setattr(settings, "razorpay_key_secret", "")
     with pytest.raises(GatewayNotConfiguredError):
         create_order(1000, "receipt_123")
 
 
-def test_create_gateway_order_endpoint_returns_501_without_credentials(headers):
+def test_create_gateway_order_endpoint_returns_501_without_credentials(headers, monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "razorpay_key_id", "")
+    monkeypatch.setattr(settings, "razorpay_key_secret", "")
     resp = client.post("/api/v1/payment-gateway/orders", headers=headers, json={"amount": 1000, "receipt": "test_receipt"})
     assert resp.status_code == 501
 

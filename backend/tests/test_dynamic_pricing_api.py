@@ -13,8 +13,7 @@ from app.main import app
 
 client = TestClient(app)
 
-ADMIN_EMAIL = "homestaypdy@gmail.com"
-ADMIN_PASSWORD = "Sri@2026"
+from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 
 @pytest.fixture(scope="module")
@@ -148,6 +147,111 @@ def test_inquiry_without_unit_still_requires_rate_per_night(headers):
         "advance_amount": 0,
     })
     assert resp.status_code == 400
+
+
+def test_new_unit_defaults_to_business_long_stay_policy(headers):
+    """A unit created without specifying long-stay fields gets the
+    business's current policy (30 nights / Rs.2,000) from the column
+    default, not an unset/null value."""
+    unit_id = _make_unit(headers)
+    units = client.get("/api/v1/units", headers=headers).json()
+    unit = next(u for u in units if u["id"] == unit_id)
+    assert unit["long_stay_min_nights"] == 30
+    assert unit["long_stay_rate"] == 2000.0
+
+
+def test_unit_pricing_update_can_change_long_stay_rate(headers):
+    unit_id = _make_unit(headers)
+    resp = client.patch(f"/api/v1/units/{unit_id}/pricing", headers=headers, json={"long_stay_min_nights": 21, "long_stay_rate": 1800})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["long_stay_min_nights"] == 21
+    assert resp.json()["long_stay_rate"] == 1800.0
+
+
+def test_price_quote_29_nights_uses_standard_pricing_not_long_stay(headers):
+    unit_id = _make_unit(headers, base_rate=3500, weekend_rate=3800)
+    resp = client.get(f"/api/v1/units/{unit_id}/price-quote", headers=headers, params={"check_in": "2027-11-01", "check_out": "2027-11-30"})  # 29 nights
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["nights"] == 29
+    assert "long_stay" not in {d["source"] for d in data["daily_breakdown"]}
+
+
+def test_price_quote_30_nights_exactly_60000(headers):
+    unit_id = _make_unit(headers, base_rate=3500, weekend_rate=3800)
+    resp = client.get(f"/api/v1/units/{unit_id}/price-quote", headers=headers, params={"check_in": "2027-11-01", "check_out": "2027-12-01"})  # 30 nights
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["nights"] == 30
+    assert data["subtotal_before_discount"] == 60000.0
+    assert data["average_nightly_rate"] == 2000.0
+    assert all(d["source"] == "long_stay" for d in data["daily_breakdown"])
+
+
+def test_price_quote_31_nights_exactly_62000(headers):
+    unit_id = _make_unit(headers, base_rate=3500, weekend_rate=3800)
+    resp = client.get(f"/api/v1/units/{unit_id}/price-quote", headers=headers, params={"check_in": "2027-11-01", "check_out": "2027-12-02"})  # 31 nights
+    assert resp.json()["subtotal_before_discount"] == 62000.0
+
+
+def test_price_quote_60_nights_exactly_120000(headers):
+    unit_id = _make_unit(headers, base_rate=3500, weekend_rate=3800)
+    resp = client.get(f"/api/v1/units/{unit_id}/price-quote", headers=headers, params={"check_in": "2027-11-01", "check_out": "2027-12-31"})  # 60 nights
+    assert resp.json()["subtotal_before_discount"] == 120000.0
+
+
+def test_inquiry_30_night_stay_auto_calculates_60000_with_correct_gst_and_dynamic_advance(headers):
+    """Critical assertion (task spec): 30 nights must produce exactly
+    30 x Rs.2,000 = Rs.60,000 before GST, via the quotation flow — the
+    same path that feeds the quotation PDF."""
+    unit_id = _make_unit(headers, base_rate=3500, weekend_rate=3800)
+    resp = client.post("/api/v1/inquiries", headers=headers, json={
+        "client_name": "Long Stay Quotation Test",
+        "client_phone": f"93{uuid.uuid4().int % 10**8:08d}",
+        "unit_id": unit_id,
+        "flat_room_label": "Test Room",
+        "check_in_date": "2027-11-01",
+        "check_out_date": "2027-12-01",  # 30 nights
+        "advance_amount": 15000,
+    })
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert data["pricing_source"] == "auto"
+    assert data["nights"] == 30
+    assert data["rate_per_night"] == 2000.0
+    assert data["taxable_value"] == 60000.0
+    assert data["gst_rate_percent"] == 5.0  # same slab engine as before — 1,001-7,500/night bracket
+    assert data["cgst"] == 1500.0
+    assert data["sgst"] == 1500.0
+    assert data["grand_total"] == 63000.0
+    assert data["advance_amount"] == 15000.0  # dynamic, exactly what was sent
+    assert data["balance_amount"] == 48000.0  # grand_total - advance
+
+
+def test_inquiry_29_night_stay_does_not_get_long_stay_rate(headers):
+    unit_id = _make_unit(headers, base_rate=3500, weekend_rate=3800)
+    resp = client.post("/api/v1/inquiries", headers=headers, json={
+        "client_name": "Just Under Long Stay Test",
+        "client_phone": f"92{uuid.uuid4().int % 10**8:08d}",
+        "unit_id": unit_id,
+        "flat_room_label": "Test Room",
+        "check_in_date": "2027-11-01",
+        "check_out_date": "2027-11-30",  # 29 nights
+        "advance_amount": 0,
+    })
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["nights"] == 29
+    assert resp.json()["rate_per_night"] != 2000.0
+
+
+def test_public_quote_api_30_nights_matches_os10_price_quote(headers):
+    """Website and OS10 must agree exactly — both read the same pricing
+    engine off the same unit."""
+    unit_id = _make_unit(headers, base_rate=3500, weekend_rate=3800)
+    os10 = client.get(f"/api/v1/units/{unit_id}/price-quote", headers=headers, params={"check_in": "2027-11-01", "check_out": "2027-12-01"}).json()
+    website = client.get("/api/v1/public/quote", params={"unit_id": unit_id, "check_in": "2027-11-01", "check_out": "2027-12-01"}).json()
+    assert os10["subtotal_before_discount"] == website["subtotal_before_discount"] == 60000.0
+    assert website["total"] > 0  # website response also includes GST-inclusive total, unlike the raw OS10 price-quote
 
 
 def test_seasonal_rate_correctly_reflected_in_inquiry_total(headers):

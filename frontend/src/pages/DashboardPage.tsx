@@ -1,8 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { BarChart, Bar, LineChart, Line, Legend, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
-import { api, extractErrorMessage, type OperationalDashboard, type DashboardCalendar } from "../lib/api";
-import { Card, PageHeader, ErrorBanner, Spinner } from "../components/ui";
+import {
+  api,
+  extractErrorMessage,
+  type OperationalDashboard,
+  type DashboardCalendar,
+  type BookingOut,
+  type GuestOut,
+  type UnitOut,
+} from "../lib/api";
+import { Card, PageHeader, ErrorBanner, Spinner, Badge, Table, EmptyState, Button, AttentionRow } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
 // Polling interval for the "keep this reasonably fresh across multiple
@@ -12,6 +20,23 @@ import { useAuth } from "../context/AuthContext";
 // instantly. A true real-time push would need a WebSocket/SSE layer,
 // which is a genuinely separate, larger piece of infrastructure.
 const REFRESH_INTERVAL_MS = 20_000;
+const RECENT_BOOKINGS_LIMIT = 6;
+
+const QUICK_ACTIONS = [
+  { label: "+ New Booking", to: "/bookings", variant: "primary" as const },
+  { label: "+ Record Payment", to: "/billing", variant: "secondary" as const },
+  { label: "+ Add Guest", to: "/guests", variant: "secondary" as const },
+  { label: "Manage Properties", to: "/properties", variant: "secondary" as const },
+  { label: "+ Raise Maintenance Ticket", to: "/maintenance", variant: "secondary" as const },
+  { label: "+ Add Housekeeping Task", to: "/housekeeping", variant: "secondary" as const },
+  { label: "+ New Enquiry", to: "/inquiries", variant: "secondary" as const },
+];
+
+function bookingStatusTone(status: string): "green" | "amber" | "slate" {
+  if (status === "confirmed") return "green";
+  if (status === "checked_in") return "amber";
+  return "slate";
+}
 
 export default function DashboardPage() {
   const { role } = useAuth();
@@ -23,6 +48,12 @@ export default function DashboardPage() {
   const [calendar, setCalendar] = useState<DashboardCalendar | null>(null);
   const [calYear, setCalYear] = useState(new Date().getFullYear());
   const [calMonth, setCalMonth] = useState(new Date().getMonth() + 1);
+
+  const [recentBookings, setRecentBookings] = useState<BookingOut[]>([]);
+  const [guests, setGuests] = useState<GuestOut[]>([]);
+  const [units, setUnits] = useState<UnitOut[]>([]);
+  const [recentLoading, setRecentLoading] = useState(true);
+  const [recentError, setRecentError] = useState<string | null>(null);
 
   const load = useCallback(async (isBackground = false) => {
     try {
@@ -48,6 +79,33 @@ export default function DashboardPage() {
       .catch(() => setCalendar(null));
   }, [calYear, calMonth]);
 
+  // Recent Bookings isn't part of /reports/dashboard — it's the same
+  // existing /bookings, /guests, /units list endpoints BookingsPage already
+  // uses, just fetched here too and trimmed to the most recently updated
+  // few. Kept on its own loading/error state so a slow guest/unit list
+  // never blocks the primary operational numbers above from rendering.
+  useEffect(() => {
+    Promise.all([api.get("/bookings"), api.get("/guests"), api.get("/units")])
+      .then(([b, g, u]) => {
+        setRecentBookings(b.data);
+        setGuests(g.data);
+        setUnits(u.data);
+      })
+      .catch((err) => setRecentError(extractErrorMessage(err)))
+      .finally(() => setRecentLoading(false));
+  }, []);
+
+  function guestName(id: string) {
+    return guests.find((g) => g.id === id)?.name ?? "—";
+  }
+  function unitName(id: string) {
+    return units.find((u) => u.id === id)?.name ?? "—";
+  }
+
+  const topRecentBookings = [...recentBookings]
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
+    .slice(0, RECENT_BOOKINGS_LIMIT);
+
   if (loading) {
     return (
       <div>
@@ -66,68 +124,83 @@ export default function DashboardPage() {
     );
   }
 
+  const subtitle = `${data.total_units} accommodation${data.total_units === 1 ? "" : "s"} · ${data.active_bookings} active booking${data.active_bookings === 1 ? "" : "s"} · ${data.occupancy_percent}% occupancy`;
+
   return (
     <div>
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-1">
-        <PageHeader title="Dashboard" />
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+        <h1 className="text-lg font-semibold text-slate-900">Dashboard</h1>
         {lastRefreshed && (
-          <p className="text-xs text-slate-400 mb-4">
+          <p className="text-xs text-slate-400">
             Updated {lastRefreshed.toLocaleTimeString()} · auto-refreshes every {REFRESH_INTERVAL_MS / 1000}s
           </p>
         )}
       </div>
+      <p className="mb-6 text-xs text-slate-500">{subtitle}</p>
       <ErrorBanner message={error} />
 
-      <div className="flex flex-wrap gap-2 mb-6">
-        <Link to="/bookings" className="rounded-lg bg-slate-900 text-white text-xs font-medium px-3 py-2 hover:bg-slate-800">+ New Booking</Link>
-        <Link to="/billing" className="rounded-lg border border-slate-300 text-xs font-medium px-3 py-2 hover:bg-slate-50">+ Record Payment</Link>
-        <Link to="/guests" className="rounded-lg border border-slate-300 text-xs font-medium px-3 py-2 hover:bg-slate-50">+ Add Guest</Link>
-        <Link to="/maintenance" className="rounded-lg border border-slate-300 text-xs font-medium px-3 py-2 hover:bg-slate-50">+ Raise Maintenance Ticket</Link>
-        <Link to="/housekeeping" className="rounded-lg border border-slate-300 text-xs font-medium px-3 py-2 hover:bg-slate-50">+ Add Housekeeping Task</Link>
-        <Link to="/inquiries" className="rounded-lg border border-slate-300 text-xs font-medium px-3 py-2 hover:bg-slate-50">+ New Enquiry</Link>
+      <div className="mb-6 flex flex-wrap gap-2">
+        {QUICK_ACTIONS.map((a) => (
+          <Link key={a.to + a.label} to={a.to}>
+            <Button variant={a.variant} className="text-sm">{a.label}</Button>
+          </Link>
+        ))}
       </div>
 
       {(data.attention_items.length > 0 || data.follow_ups_due_today > 0 || data.staff_absent_today > 0) && (
-        <Card className="mb-6 border-amber-300 bg-amber-50">
-          <h2 className="text-sm font-semibold text-amber-900 mb-2">Needs Attention</h2>
-          {data.attention_items.length > 0 && (
-            <ul className="text-xs text-amber-900 space-y-2 mb-2">
-              {data.attention_items.map((item, i) => (
-                <li key={i} className="flex items-start gap-2">
-                  <span className={`mt-0.5 shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase ${item.severity === "critical" ? "bg-red-600 text-white" : "bg-amber-500 text-white"}`}>
-                    {item.severity}
-                  </span>
-                  <span>
-                    <Link to={item.link} className="font-medium hover:underline">{item.title}</Link>
-                    <span className="block text-amber-800">{item.reason} {item.action}</span>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-          {(data.follow_ups_due_today > 0 || data.staff_absent_today > 0) && (
-            <ul className="text-xs text-amber-900 space-y-1 list-disc list-inside">
-              {data.follow_ups_due_today > 0 && <li><Link to="/inquiries" className="hover:underline">{data.follow_ups_due_today} enquiry follow-up(s) due today</Link></li>}
-              {data.staff_absent_today > 0 && <li><Link to="/staff" className="hover:underline">{data.staff_absent_today} staff member(s) absent today</Link></li>}
-            </ul>
-          )}
+        <Card className="mb-6 border-amber-200 bg-amber-50/60">
+          <h2 className="mb-3 text-sm font-semibold text-amber-900">Needs Attention</h2>
+          <div className="space-y-2">
+            {data.attention_items.map((item, i) => (
+              <AttentionRow
+                key={i}
+                severity={item.severity}
+                severityTone={item.severity === "critical" ? "red" : "amber"}
+                title={item.title}
+                description={`${item.reason} ${item.action}`}
+                to={item.link}
+              />
+            ))}
+            {data.follow_ups_due_today > 0 && (
+              <AttentionRow
+                severity="info"
+                severityTone="amber"
+                title={`${data.follow_ups_due_today} enquiry follow-up(s) due today`}
+                to="/inquiries"
+              />
+            )}
+            {data.staff_absent_today > 0 && (
+              <AttentionRow
+                severity="info"
+                severityTone="amber"
+                title={`${data.staff_absent_today} staff member(s) absent today`}
+                to="/staff"
+              />
+            )}
+          </div>
         </Card>
       )}
 
-      <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Today's Operational Picture</h2>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
+      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Overview</h2>
+      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard label="Occupancy" value={`${data.occupancy_percent}%`} highlight />
+        <StatCard label="Active Bookings" value={data.active_bookings} to="/bookings" highlight />
+        <StatCard label="Total Guests" value={data.total_guests} to="/guests" highlight />
+        <StatCard label="Vacant Units" value={data.vacant_units} to="/properties" highlight />
+      </div>
+
+      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Today's Operations</h2>
+      <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
         <StatCard label="Arrivals Today" value={data.arrivals_today} to="/bookings" />
         <StatCard label="Departures Today" value={data.departures_today} to="/bookings" />
-        <StatCard label="In-House Guests" value={data.in_house_guests} to="/bookings" />
-        <StatCard label="Pending Check-ins" value={data.pending_checkins} to="/bookings" />
-        <StatCard label="Pending Check-outs" value={data.pending_checkouts} to="/bookings" />
-        <StatCard label="Vacant Units" value={data.vacant_units} to="/properties" />
-        <StatCard label="Total Guests" value={data.total_guests} to="/guests" />
-        <StatCard label="Active Bookings" value={data.active_bookings} to="/bookings" />
+        <StatCard label="Current Stays" value={data.in_house_guests} to="/bookings" />
+        <StatCard label="Pending Check-ins" value={data.pending_checkins} to="/bookings" tone={data.pending_checkins > 0 ? "amber" : undefined} />
+        <StatCard label="Pending Check-outs" value={data.pending_checkouts} to="/bookings" tone={data.pending_checkouts > 0 ? "amber" : undefined} />
       </div>
+
       {isAdmin && (
         <Card className="mb-8">
-          <h2 className="text-sm font-semibold text-slate-900 mb-3">Today</h2>
+          <h2 className="mb-3 text-sm font-semibold text-slate-900">Today</h2>
           <div className="space-y-2 text-sm">
             <Row label="Revenue" value={`₹${data.today_revenue.toLocaleString()}`} />
             <Row label="Expenses" value={`₹${data.today_expenses.toLocaleString()}`} />
@@ -136,19 +209,49 @@ export default function DashboardPage() {
         </Card>
       )}
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
-        <StatCard label="Occupancy" value={`${data.occupancy_percent}%`} />
-      </div>
-
       {!isAdmin && (
-        <p className="text-xs text-slate-400 mb-8">Revenue and P&amp;L are available under Finance and Reports Center.</p>
+        <p className="mb-8 text-xs text-slate-400">Revenue and P&amp;L are available under Finance and Reports Center.</p>
       )}
+
+      <Card className="mb-8">
+        <div className="mb-4 flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900">Recent Bookings</h2>
+            <p className="text-xs text-slate-400">Most recently updated bookings across all units.</p>
+          </div>
+          <Link to="/bookings"><Button variant="secondary" className="text-xs">View All</Button></Link>
+        </div>
+        {recentLoading ? (
+          <Spinner label="Loading recent bookings..." />
+        ) : recentError ? (
+          <ErrorBanner message={recentError} />
+        ) : topRecentBookings.length === 0 ? (
+          <EmptyState message="No bookings yet." />
+        ) : (
+          <div className="overflow-x-auto">
+            <Table headers={["Guest", "Unit", "Check-in", "Check-out", "Status"]}>
+              {topRecentBookings.map((b) => (
+                <tr key={b.id}>
+                  <td className="px-4 py-2.5 font-medium text-slate-800">{guestName(b.guest_id)}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{unitName(b.unit_id)}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{b.check_in}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{b.check_out}</td>
+                  <td className="px-4 py-2.5">
+                    <Badge tone={bookingStatusTone(b.status)}>{b.status}</Badge>
+                    {b.is_archived && <Badge tone="amber">Archived</Badge>}
+                  </td>
+                </tr>
+              ))}
+            </Table>
+          </div>
+        )}
+      </Card>
 
       {isAdmin && (
         <>
-          <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">This Month — Financial Summary</h2>
+          <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">This Month — Financial Summary</h2>
           <Card className="mb-8">
-            <h2 className="text-sm font-semibold text-slate-900 mb-3">This Month</h2>
+            <h2 className="mb-3 text-sm font-semibold text-slate-900">This Month</h2>
             <div className="space-y-2 text-sm">
               <Row label="Revenue" value={`₹${data.month_revenue.toLocaleString()}`} />
               <Row label="Expenses" value={`₹${data.month_expenses.toLocaleString()}`} />
@@ -157,8 +260,8 @@ export default function DashboardPage() {
           </Card>
 
           <Card className="mb-8">
-            <h2 className="text-sm font-semibold text-slate-900 mb-1">Apartment-wise Performance (this month)</h2>
-            <p className="text-xs text-slate-400 mb-4">Revenue vs. expenses per unit, sorted by revenue highest to lowest.</p>
+            <h2 className="mb-1 text-sm font-semibold text-slate-900">Apartment-wise Performance (this month)</h2>
+            <p className="mb-4 text-xs text-slate-400">Revenue vs. expenses per unit, sorted by revenue highest to lowest.</p>
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={data.apartment_performance.slice(0, 12)} margin={{ top: 5, right: 10, left: 0, bottom: 40 }}>
@@ -172,37 +275,25 @@ export default function DashboardPage() {
                 </BarChart>
               </ResponsiveContainer>
             </div>
-            <div className="overflow-x-auto mt-4">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="text-left text-slate-400 border-b border-slate-100">
-                    <th className="py-1.5 pr-4">Unit</th>
-                    <th className="py-1.5 pr-4">Revenue</th>
-                    <th className="py-1.5 pr-4">Expenses</th>
-                    <th className="py-1.5 pr-4">Profit</th>
-                    <th className="py-1.5 pr-4">Nights Booked</th>
-                    <th className="py-1.5">Occupancy</th>
+            <div className="mt-4 overflow-x-auto">
+              <Table headers={["Unit", "Revenue", "Expenses", "Profit", "Nights Booked", "Occupancy"]}>
+                {data.apartment_performance.map((a) => (
+                  <tr key={a.unit_id}>
+                    <td className="px-4 py-2.5 font-medium text-slate-700">{a.unit_name}</td>
+                    <td className="px-4 py-2.5 text-slate-500">₹{a.month_revenue.toLocaleString()}</td>
+                    <td className="px-4 py-2.5 text-slate-500">₹{a.month_expenses.toLocaleString()}</td>
+                    <td className={`px-4 py-2.5 font-medium ${a.month_profit >= 0 ? "text-emerald-600" : "text-red-600"}`}>₹{a.month_profit.toLocaleString()}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{a.month_nights_booked}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{a.month_occupancy_percent}%</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {data.apartment_performance.map((a) => (
-                    <tr key={a.unit_id} className="border-b border-slate-50">
-                      <td className="py-1.5 pr-4 font-medium text-slate-700">{a.unit_name}</td>
-                      <td className="py-1.5 pr-4 text-slate-500">₹{a.month_revenue.toLocaleString()}</td>
-                      <td className="py-1.5 pr-4 text-slate-500">₹{a.month_expenses.toLocaleString()}</td>
-                      <td className={`py-1.5 pr-4 font-medium ${a.month_profit >= 0 ? "text-emerald-600" : "text-red-600"}`}>₹{a.month_profit.toLocaleString()}</td>
-                      <td className="py-1.5 pr-4 text-slate-500">{a.month_nights_booked}</td>
-                      <td className="py-1.5 text-slate-500">{a.month_occupancy_percent}%</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                ))}
+              </Table>
             </div>
           </Card>
 
           <Card className="mb-8">
-            <h2 className="text-sm font-semibold text-slate-900 mb-1">Monthly Trend (last 6 months)</h2>
-            <p className="text-xs text-slate-400 mb-4">Revenue, expenses, and profit — including the current, in-progress month.</p>
+            <h2 className="mb-1 text-sm font-semibold text-slate-900">Monthly Trend (last 6 months)</h2>
+            <p className="mb-4 text-xs text-slate-400">Revenue, expenses, and profit — including the current, in-progress month.</p>
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={data.monthly_trend.map((t) => ({ ...t, label: `${t.month}/${t.year}` }))} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
@@ -221,8 +312,8 @@ export default function DashboardPage() {
         </>
       )}
 
-      <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Reference</h2>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
+      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Reference</h2>
+      <div className="mb-8 grid grid-cols-2 gap-4 sm:grid-cols-4">
         <StatCard
           label="Pending Payments"
           value={data.pending_payments_count}
@@ -239,7 +330,7 @@ export default function DashboardPage() {
       </div>
 
       <Card className="mt-8">
-        <div className="flex items-center justify-between mb-4">
+        <div className="mb-4 flex items-center justify-between">
           <div>
             <h2 className="text-sm font-semibold text-slate-900">Calendar</h2>
             <p className="text-xs text-slate-400">Check-ins, check-outs, and in-house guests by day.</p>
@@ -280,12 +371,16 @@ export default function DashboardPage() {
   );
 }
 
-function StatCard({ label, value, to, sub, tone }: { label: string; value: string | number; to?: string; sub?: string; tone?: "amber" }) {
+function StatCard({ label, value, to, sub, tone, highlight }: { label: string; value: string | number; to?: string; sub?: string; tone?: "amber"; highlight?: boolean }) {
   const content = (
-    <div className={`bg-white border rounded-xl p-4 h-full ${tone === "amber" ? "border-amber-300 bg-amber-50" : "border-slate-200"}`}>
-      <p className="text-xs text-slate-500 mb-1">{label}</p>
-      <p className="text-xl font-semibold text-slate-900">{value}</p>
-      {sub && <p className="text-xs text-slate-400 mt-0.5">{sub}</p>}
+    <div
+      className={`h-full rounded-xl border p-4 ${
+        tone === "amber" ? "border-amber-300 bg-amber-50" : "border-slate-200 bg-white"
+      }`}
+    >
+      <p className="mb-1 text-xs text-slate-500">{label}</p>
+      <p className={`font-semibold text-slate-900 ${highlight ? "text-2xl" : "text-xl"}`}>{value}</p>
+      {sub && <p className="mt-0.5 text-xs text-slate-400">{sub}</p>}
     </div>
   );
   return to ? <Link to={to}>{content}</Link> : content;

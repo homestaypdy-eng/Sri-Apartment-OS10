@@ -2,6 +2,13 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 
 interface GuestAuthContextValue {
   isGuestAuthenticated: boolean;
+  // Starts true, flips to false once the localStorage check below has
+  // run — without this, a hard page load/refresh of /guest renders
+  // RequireGuestAuth BEFORE the useEffect below restores a valid session
+  // from localStorage, incorrectly bouncing an already-authenticated
+  // guest back to /guest/login. Same pattern AuthContext/
+  // CustomerAuthContext already use for the identical reason.
+  isInitializing: boolean;
   guestLogin: (token: string) => void;
   guestLogout: () => void;
 }
@@ -12,9 +19,11 @@ const GUEST_TOKEN_KEY = "guest_access_token";
 
 export function GuestAuthProvider({ children }: { children: ReactNode }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(true);
 
   useEffect(() => {
     setIsAuthenticated(!!localStorage.getItem(GUEST_TOKEN_KEY));
+    setIsInitializing(false);
   }, []);
 
   function guestLogin(token: string) {
@@ -28,7 +37,7 @@ export function GuestAuthProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <GuestAuthContext.Provider value={{ isGuestAuthenticated: isAuthenticated, guestLogin, guestLogout }}>
+    <GuestAuthContext.Provider value={{ isGuestAuthenticated: isAuthenticated, isInitializing, guestLogin, guestLogout }}>
       {children}
     </GuestAuthContext.Provider>
   );

@@ -28,6 +28,13 @@ class AuditLog(Base):
     previous_value: Mapped[str | None] = mapped_column(Text, nullable=True)  # structured "before" state, when the action is a modification
     new_value: Mapped[str | None] = mapped_column(Text, nullable=True)  # structured "after" state
     ip_address: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # RBAC Phase A: the actor's role NAME at the moment this row was
+    # written — a plain, immutable string snapshot, not a live FK to
+    # roles.id. If user_id's role is changed later (or the user is
+    # deactivated/deleted), this column must not change retroactively;
+    # only a fresh audit-log write ever sets it. Nullable for backward
+    # compatibility with rows written before this column existed.
+    actor_role: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User")

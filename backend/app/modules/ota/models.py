@@ -7,7 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
 
-OTA_CHANNELS = ("booking_com", "airbnb", "agoda")
+OTA_CHANNELS = ("booking_com", "airbnb", "agoda", "mmt")
 SYNC_TYPES = ("reservation_import", "availability_sync", "rate_sync", "booking_update", "cancellation_sync")
 SYNC_STATUSES = ("success", "failed", "partial")
 

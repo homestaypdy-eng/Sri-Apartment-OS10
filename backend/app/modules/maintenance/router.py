@@ -11,7 +11,7 @@ from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
 from app.modules.finance.models import Expense
-from app.modules.maintenance.models import PHOTO_TYPES, TICKET_PRIORITIES, TICKET_STATUSES, MaintenancePhoto, MaintenanceTicket
+from app.modules.maintenance.models import PHOTO_TYPES, TICKET_CATEGORIES, TICKET_PRIORITIES, TICKET_STATUSES, MaintenancePhoto, MaintenanceTicket
 from app.modules.maintenance.schemas import MaintenancePhotoOut, MaintenanceTicketCreate, MaintenanceTicketOut, MaintenanceTicketUpdate
 from app.modules.notifications.service import trigger_maintenance_ticket_created, trigger_maintenance_ticket_resolved
 from app.modules.properties.models import Unit
@@ -24,18 +24,24 @@ os.makedirs(PHOTO_STORAGE_DIR, exist_ok=True)
 router = APIRouter(prefix="/api/v1/maintenance-tickets", tags=["maintenance"])
 
 
-@router.post("", response_model=MaintenanceTicketOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("", response_model=MaintenanceTicketOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_ticket(payload: MaintenanceTicketCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     unit = db.get(Unit, payload.unit_id)
     if unit is None:
         raise HTTPException(404, "Unit not found")
     if payload.priority not in TICKET_PRIORITIES:
         raise HTTPException(400, f"Invalid priority '{payload.priority}'")
+    if payload.category is not None and payload.category not in TICKET_CATEGORIES:
+        raise HTTPException(400, f"Invalid category '{payload.category}'")
+    if payload.assigned_to is not None and db.get(User, payload.assigned_to) is None:
+        raise HTTPException(404, "Assigned user not found")
 
     ticket = MaintenanceTicket(
         unit_id=payload.unit_id,
         description=payload.description,
         priority=payload.priority,
+        category=payload.category,
+        assigned_to=payload.assigned_to,
         reported_by=user.id,
         status="open",
     )
@@ -48,7 +54,7 @@ def create_ticket(payload: MaintenanceTicketCreate, db: Session = Depends(get_db
     return ticket
 
 
-@router.get("", response_model=list[MaintenanceTicketOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("", response_model=list[MaintenanceTicketOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_tickets(
     unit_id: uuid.UUID | None = None,
     status: str | None = None,
@@ -64,7 +70,7 @@ def list_tickets(
     return db.scalars(query.order_by(MaintenanceTicket.created_at.desc(), MaintenanceTicket.id).offset(offset).limit(limit)).all()
 
 
-@router.patch("/{ticket_id}", response_model=MaintenanceTicketOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/{ticket_id}", response_model=MaintenanceTicketOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_ticket(ticket_id: uuid.UUID, payload: MaintenanceTicketUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # with_for_update locks the row for the rest of this transaction, so two
     # near-simultaneous PATCHes on the same ticket (e.g. a double-clicked
@@ -84,16 +90,25 @@ def update_ticket(ticket_id: uuid.UUID, payload: MaintenanceTicketUpdate, db: Se
         if payload.status in ("resolved", "closed") and ticket.resolved_at is None:
             ticket.resolved_at = datetime.now(timezone.utc)
 
-    if payload.assigned_to is not None:
-        if db.get(User, payload.assigned_to) is None:
+    # model_fields_set (not `is not None`) distinguishes "field omitted"
+    # from an explicit `assigned_to: null` — the latter now clears the
+    # assignment. Every other field on this endpoint is untouched.
+    if "assigned_to" in payload.model_fields_set:
+        new_assignee = payload.assigned_to
+        if new_assignee is not None and db.get(User, new_assignee) is None:
             raise HTTPException(404, "Assigned user not found")
-        changes.append(f"assigned_to: {ticket.assigned_to} -> {payload.assigned_to}")
-        ticket.assigned_to = payload.assigned_to
+        changes.append(f"assigned_to: {ticket.assigned_to} -> {new_assignee}")
+        ticket.assigned_to = new_assignee
     if payload.priority is not None:
         if payload.priority not in TICKET_PRIORITIES:
             raise HTTPException(400, f"Invalid priority '{payload.priority}'")
         changes.append(f"priority: {ticket.priority} -> {payload.priority}")
         ticket.priority = payload.priority
+    if payload.category is not None:
+        if payload.category not in TICKET_CATEGORIES:
+            raise HTTPException(400, f"Invalid category '{payload.category}'")
+        changes.append(f"category: {ticket.category} -> {payload.category}")
+        ticket.category = payload.category
     cost_changed_this_request = payload.cost is not None
     if payload.cost is not None:
         changes.append(f"cost: {ticket.cost} -> {payload.cost}")
@@ -143,7 +158,7 @@ def update_ticket(ticket_id: uuid.UUID, payload: MaintenanceTicketUpdate, db: Se
     return ticket
 
 
-@router.post("/{ticket_id}/photos", response_model=MaintenancePhotoOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/{ticket_id}/photos", response_model=MaintenancePhotoOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 async def upload_maintenance_photo(ticket_id: uuid.UUID, photo_type: str, file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     ticket = db.get(MaintenanceTicket, ticket_id)
     if ticket is None:
@@ -173,12 +188,12 @@ async def upload_maintenance_photo(ticket_id: uuid.UUID, photo_type: str, file: 
     return photo
 
 
-@router.get("/{ticket_id}/photos", response_model=list[MaintenancePhotoOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{ticket_id}/photos", response_model=list[MaintenancePhotoOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_maintenance_photos(ticket_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(MaintenancePhoto).where(MaintenancePhoto.ticket_id == ticket_id)).all()
 
 
-@router.get("/{ticket_id}/photos/{photo_id}/download", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{ticket_id}/photos/{photo_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def download_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db)):
     photo = db.get(MaintenancePhoto, photo_id)
     if photo is None or photo.ticket_id != ticket_id:
@@ -188,7 +203,7 @@ def download_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Se
     return FileResponse(photo.file_path, media_type=photo.content_type, filename=photo.filename)
 
 
-@router.delete("/{ticket_id}/photos/{photo_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff"))])
+@router.delete("/{ticket_id}/photos/{photo_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     photo = db.get(MaintenancePhoto, photo_id)
     if photo is None or photo.ticket_id != ticket_id:
@@ -200,7 +215,7 @@ def delete_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Sess
     db.commit()
 
 
-@router.get("/{ticket_id}/timeline", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/{ticket_id}/timeline", dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def get_maintenance_timeline(ticket_id: uuid.UUID, db: Session = Depends(get_db)):
     """Every audit-logged event for this ticket, oldest first — same
     pattern as the booking/housekeeping timelines."""

@@ -11,6 +11,13 @@ export default function GuestDashboardPage() {
   const [requests, setRequests] = useState<GuestRequestOut[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  // A guest OTP/magic-link session can be genuinely valid while the
+  // identity behind it isn't linked to a Guest record yet (see the
+  // customer-auth/guest-auth Phase 2A architecture: a brand-new phone/
+  // email that hasn't been staff-linked to a booking yet). That is NOT a
+  // login failure — never bounce the guest back to /guest/login for it,
+  // and never show the raw backend wording ("Guest not found").
+  const [unlinked, setUnlinked] = useState(false);
 
   const [requestForm, setRequestForm] = useState({ booking_id: "", description: "", type: "service" as "service" | "complaint" | "extend" });
   const [extendDate, setExtendDate] = useState("");
@@ -26,8 +33,14 @@ export default function GuestDashboardPage() {
       setBookings(b.data);
       setRequests(r.data);
     } catch (err) {
+      const status = (err as any)?.response?.status;
+      const detail = (err as any)?.response?.data?.detail;
+      if (status === 401 && detail === "Guest not found") {
+        setUnlinked(true);
+        return;
+      }
       setError(extractErrorMessage(err));
-      if ((err as any)?.response?.status === 401) {
+      if (status === 401) {
         guestLogout();
         navigate("/guest/login");
       }
@@ -77,6 +90,26 @@ export default function GuestDashboardPage() {
     } catch (err) {
       setError(extractErrorMessage(err));
     }
+  }
+
+  if (unlinked) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4">
+        <div className="w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 text-center shadow-sm">
+          <h1 className="font-semibold text-slate-900">You're verified — almost there</h1>
+          <p className="mt-2 text-sm text-slate-500">
+            We couldn't find a booking linked to this login yet. If you've just made a booking, please check back
+            shortly, or contact our front desk staff for assistance.
+          </p>
+          <button
+            onClick={handleLogout}
+            className="mt-4 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
+          >
+            Log out
+          </button>
+        </div>
+      </div>
+    );
   }
 
   if (!profile) {

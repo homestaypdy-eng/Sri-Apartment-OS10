@@ -28,7 +28,7 @@ router = APIRouter(prefix="/api/v1/inventory", tags=["inventory"])
 
 # --- Suppliers ---
 
-@router.post("/suppliers", response_model=SupplierOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/suppliers", response_model=SupplierOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_supplier(payload: SupplierCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     supplier = Supplier(**payload.model_dump())
     db.add(supplier)
@@ -39,14 +39,14 @@ def create_supplier(payload: SupplierCreate, db: Session = Depends(get_db), user
     return supplier
 
 
-@router.get("/suppliers", response_model=list[SupplierOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/suppliers", response_model=list[SupplierOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_suppliers(db: Session = Depends(get_db)):
     return db.scalars(select(Supplier)).all()
 
 
 # --- Items ---
 
-@router.post("/items", response_model=InventoryItemOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/items", response_model=InventoryItemOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def create_item(payload: InventoryItemCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     if payload.category not in ITEM_CATEGORIES:
         raise HTTPException(400, f"Invalid category '{payload.category}'. Must be one of {ITEM_CATEGORIES}")
@@ -75,7 +75,7 @@ def create_item(payload: InventoryItemCreate, db: Session = Depends(get_db), use
     return item
 
 
-@router.patch("/items/{item_id}", response_model=InventoryItemOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/items/{item_id}", response_model=InventoryItemOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_item(item_id: uuid.UUID, payload: InventoryItemUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     item = db.get(InventoryItem, item_id)
     if item is None:
@@ -107,7 +107,7 @@ def update_item(item_id: uuid.UUID, payload: InventoryItemUpdate, db: Session = 
     return item
 
 
-@router.get("/items", response_model=list[InventoryItemOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/items", response_model=list[InventoryItemOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def list_items(category: str | None = None, low_stock_only: bool = False, db: Session = Depends(get_db)):
     query = select(InventoryItem)
     if category:
@@ -121,7 +121,7 @@ def list_items(category: str | None = None, low_stock_only: bool = False, db: Se
 # --- Stock movements ---
 
 @router.post(
-    "/stock-in", response_model=StockMovementOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))]
+    "/stock-in", response_model=StockMovementOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))]
 )
 def stock_in(payload: StockMovementCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # with_for_update locks the row for the rest of this transaction — the
@@ -181,7 +181,7 @@ def stock_in(payload: StockMovementCreate, db: Session = Depends(get_db), user: 
 
 
 @router.post(
-    "/stock-out", response_model=StockMovementOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))]
+    "/stock-out", response_model=StockMovementOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))]
 )
 def stock_out(payload: StockMovementCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # Same row-lock rationale as stock_in — see comment there.
@@ -221,7 +221,7 @@ def stock_out(payload: StockMovementCreate, db: Session = Depends(get_db), user:
 @router.get(
     "/items/{item_id}/movements",
     response_model=list[StockMovementOut],
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def list_movements(
     item_id: uuid.UUID,
@@ -237,7 +237,7 @@ def list_movements(
 
 # --- Reports ---
 
-@router.get("/reports/summary", response_model=InventoryReport, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/reports/summary", response_model=InventoryReport, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def inventory_report(db: Session = Depends(get_db)):
     items = db.scalars(select(InventoryItem)).all()
     by_category: dict[str, int] = defaultdict(int)

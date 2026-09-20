@@ -24,13 +24,13 @@ from app.modules.payments.schemas import (
 from app.modules.payments.service import calculate_gst, generate_credit_note_pdf, generate_invoice_pdf, next_credit_note_number, next_invoice_number
 from app.modules.notifications.service import trigger_invoice_delivery, trigger_payment_received
 from app.modules.properties.models import Property, Unit
-from app.modules.settings.models import BusinessSettings
+from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
 from app.shared.rbac import get_current_user, require_role
 
 router = APIRouter(prefix="/api/v1", tags=["payments"])
 
 
-@router.post("/payments", response_model=PaymentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/payments", response_model=PaymentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def record_payment(payload: PaymentCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     booking = db.get(Booking, payload.booking_id)
     if booking is None:
@@ -103,7 +103,7 @@ def list_payments_for_booking(booking_id: uuid.UUID, db: Session = Depends(get_d
     "/invoices/generate/{booking_id}",
     response_model=InvoiceOut,
     status_code=201,
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
 )
 def generate_invoice(booking_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     booking = db.get(Booking, booking_id)
@@ -119,7 +119,8 @@ def generate_invoice(booking_id: uuid.UUID, db: Session = Depends(get_db), user:
     property_ = unit.property
 
     nights = (booking.check_out - booking.check_in).days
-    subtotal = round(float(booking.rate_applied) * nights + float(booking.extra_guest_charge), 2)
+    extra_charges = float(booking.extra_guest_charge)
+    subtotal = round(float(booking.rate_applied) * nights + extra_charges, 2)
 
     gst = calculate_gst(
         subtotal=subtotal,
@@ -144,22 +145,35 @@ def generate_invoice(booking_id: uuid.UUID, db: Session = Depends(get_db), user:
     db.add(invoice)
     db.flush()  # get invoice.id without committing yet
 
-    settings_row = db.scalar(select(BusinessSettings))
-    bank_details = None
-    qr_path = None
+    # Bank/UPI details moved to their own BankSettings table (RBAC Phase A) —
+    # BusinessSettings no longer has these columns at all; reading them off
+    # BusinessSettings here (as this endpoint previously did) raises
+    # AttributeError and crashes every invoice generation. Signatory name/
+    # title and the QR image path stayed on BusinessSettings, same split
+    # already used by the quotation PDF (inquiries/service.py._pdf_context).
+    business_settings = get_or_create_settings(db)
+    bank_settings = get_or_create_bank_settings(db)
+    bank_details = {
+        "bank_name": bank_settings.bank_name,
+        "bank_account_name": bank_settings.bank_account_name,
+        "bank_account_number": bank_settings.bank_account_number,
+        "bank_ifsc": bank_settings.bank_ifsc,
+        "bank_branch": bank_settings.bank_branch,
+        "upi_id": bank_settings.upi_id,
+        "signatory_name": business_settings.signatory_name,
+        "signatory_title": business_settings.signatory_title,
+    }
+    qr_path = business_settings.qr_code_path
 
-    if settings_row:
-        bank_details = {
-            "bank_name": settings_row.bank_name,
-            "bank_account_name": settings_row.bank_account_name,
-            "bank_account_number": settings_row.bank_account_number,
-            "bank_ifsc": settings_row.bank_ifsc,
-            "bank_branch": settings_row.bank_branch,
-            "upi_id": settings_row.upi_id,
-            "signatory_name": settings_row.signatory_name,
-            "signatory_title": settings_row.signatory_title,
-        }
-        qr_path = settings_row.qr_code_path
+    # Payment status/paid-amount/balance must reflect what was actually
+    # recorded against this booking, not a hardcoded "fully paid" assumption
+    # — same sum-of-Payment.amount pattern already used for guest history's
+    # total_paid (bookings/router.py), which correctly nets out refunds
+    # since those are stored as negative amounts.
+    payments = db.scalars(select(Payment).where(Payment.booking_id == booking_id)).all()
+    payment_received = round(sum(float(p.amount) for p in payments), 2)
+    balance_due = round(float(gst["total"]) - payment_received, 2)
+    latest_payment_mode = payments[-1].mode if payments else None
 
     pdf_path = generate_invoice_pdf(
         invoice_no=invoice_no,
@@ -180,6 +194,15 @@ def generate_invoice(booking_id: uuid.UUID, db: Session = Depends(get_db), user:
         itc_available=gst["itc_available"],
         bank_details=bank_details,
         qr_path=qr_path,
+        payment_received=payment_received,
+        balance_due=balance_due,
+        guest_phone=guest.phone,
+        guest_email=guest.email,
+        guest_address=guest.address,
+        num_guests=booking.adults + booking.children,
+        rate_per_night=float(booking.rate_applied),
+        payment_mode=latest_payment_mode,
+        extra_charges=extra_charges,
     )
     invoice.pdf_path = pdf_path
 

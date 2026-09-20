@@ -18,3 +18,18 @@ export function RequireAdmin({ children }: { children: ReactNode }) {
   if (role !== "admin") return <Navigate to="/" replace />;
   return <>{children}</>;
 }
+
+// RBAC Phase B: for the small set of pages that stay Admin+Staff (as they
+// always were — neither route was touched in Phase B Part 1's backend
+// work) but must NOT be reachable by Manager: /staff (the HR/payroll
+// module, distinct from /operations' staff_ops) and /settings (whose
+// underlying GET /settings and GET /settings/bank were never granted to
+// Manager). Same redirect-to-dashboard behavior as RequireAdmin — this
+// mirrors the existing app convention rather than introducing a new
+// "forbidden" page/pattern.
+export function RequireNotManager({ children }: { children: ReactNode }) {
+  const { role, isInitializing } = useAuth();
+  if (isInitializing) return null;
+  if (role === "manager") return <Navigate to="/" replace />;
+  return <>{children}</>;
+}

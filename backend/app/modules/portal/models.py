@@ -7,7 +7,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
 
-REQUEST_TYPES = ("service", "complaint", "extend_stay")
+REQUEST_TYPES = (
+    "service", "complaint", "extend_stay",
+    # Staff-operational request types (Phase 18A: Staff Operations) — logged
+    # by staff on a guest's behalf (phone call, in person), distinct from
+    # the guest-self-service types above but sharing the same table/workflow
+    # so there's one request queue, not two.
+    "towels", "linens", "cleaning", "water", "maintenance", "check_in_help", "check_out_help", "other",
+)
 REQUEST_STATUSES = ("open", "in_progress", "resolved")
 REQUEST_PRIORITIES = ("low", "medium", "high", "urgent")
 

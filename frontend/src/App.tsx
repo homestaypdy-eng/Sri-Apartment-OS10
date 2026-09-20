@@ -2,10 +2,15 @@ import { Suspense, lazy } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
 import { GuestAuthProvider, useGuestAuth } from "./context/GuestAuthContext";
-import { RequireAuth, RequireAdmin } from "./components/RequireAuth";
+import { CustomerAuthProvider, useCustomerAuth } from "./context/CustomerAuthContext";
+import { RequireAuth, RequireAdmin, RequireNotManager } from "./components/RequireAuth";
 import Layout from "./components/Layout";
 import LoginPage from "./pages/LoginPage";
 import GuestLoginPage from "./pages/GuestLoginPage";
+import CustomerLoginPage from "./pages/CustomerLoginPage";
+import CustomerSignUpPage from "./pages/CustomerSignUpPage";
+import CustomerForgotPasswordPage from "./pages/CustomerForgotPasswordPage";
+import CustomerResetPasswordPage from "./pages/CustomerResetPasswordPage";
 
 // Route-level code splitting: each page becomes its own chunk, loaded on
 // demand rather than all bundled into one large file up front.
@@ -20,22 +25,35 @@ const BillingPage = lazy(() => import("./pages/BillingPage"));
 const FinancePage = lazy(() => import("./pages/FinancePage"));
 const ReportsPage = lazy(() => import("./pages/ReportsPage"));
 const ProfitSimulatorPage = lazy(() => import("./pages/ProfitSimulatorPage"));
+const AIStrategistPage = lazy(() => import("./pages/AIStrategistPage"));
 const UsersPage = lazy(() => import("./pages/UsersPage"));
 const InventoryPage = lazy(() => import("./pages/InventoryPage"));
 const StaffPage = lazy(() => import("./pages/StaffPage"));
+const StaffOperationsPage = lazy(() => import("./pages/StaffOperationsPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 const AuditPage = lazy(() => import("./pages/AuditPage"));
 const NotificationsPage = lazy(() => import("./pages/NotificationsPage"));
 const GuestRequestsPage = lazy(() => import("./pages/GuestRequestsPage"));
+const ZotelPage = lazy(() => import("./pages/ZotelPage"));
+const PromoCodesPage = lazy(() => import("./pages/PromoCodesPage"));
 const GuestDashboardPage = lazy(() => import("./pages/GuestDashboardPage"));
+const CustomerAccountPage = lazy(() => import("./pages/CustomerAccountPage"));
 
 function PageLoading() {
   return <div className="p-8 text-sm text-slate-400">Loading...</div>;
 }
 
 function RequireGuestAuth({ children }: { children: React.ReactNode }) {
-  const { isGuestAuthenticated } = useGuestAuth();
+  const { isGuestAuthenticated, isInitializing } = useGuestAuth();
+  if (isInitializing) return null;
   if (!isGuestAuthenticated) return <Navigate to="/guest/login" replace />;
+  return <>{children}</>;
+}
+
+function RequireCustomerAuth({ children }: { children: React.ReactNode }) {
+  const { isCustomerAuthenticated, isInitializing } = useCustomerAuth();
+  if (isInitializing) return null;
+  if (!isCustomerAuthenticated) return <Navigate to="/account/login" replace />;
   return <>{children}</>;
 }
 
@@ -43,6 +61,7 @@ export default function App() {
   return (
     <AuthProvider>
       <GuestAuthProvider>
+        <CustomerAuthProvider>
         <BrowserRouter>
           <Routes>
             {/* Staff/Admin app */}
@@ -63,14 +82,44 @@ export default function App() {
               <Route path="housekeeping" element={<Suspense fallback={<PageLoading />}><HousekeepingPage /></Suspense>} />
               <Route path="maintenance" element={<Suspense fallback={<PageLoading />}><MaintenancePage /></Suspense>} />
               <Route path="inventory" element={<Suspense fallback={<PageLoading />}><InventoryPage /></Suspense>} />
-              <Route path="staff" element={<Suspense fallback={<PageLoading />}><StaffPage /></Suspense>} />
+              <Route
+                path="staff"
+                element={
+                  <RequireNotManager>
+                    <Suspense fallback={<PageLoading />}>
+                      <StaffPage />
+                    </Suspense>
+                  </RequireNotManager>
+                }
+              />
+              <Route path="operations" element={<Suspense fallback={<PageLoading />}><StaffOperationsPage /></Suspense>} />
               <Route path="guest-requests" element={<Suspense fallback={<PageLoading />}><GuestRequestsPage /></Suspense>} />
               <Route path="billing" element={<Suspense fallback={<PageLoading />}><BillingPage /></Suspense>} />
               <Route path="finance" element={<Suspense fallback={<PageLoading />}><FinancePage /></Suspense>} />
               <Route path="reports" element={<Suspense fallback={<PageLoading />}><ReportsPage /></Suspense>} />
               <Route path="profit-simulator" element={<Suspense fallback={<PageLoading />}><ProfitSimulatorPage /></Suspense>} />
               <Route path="notifications" element={<Suspense fallback={<PageLoading />}><NotificationsPage /></Suspense>} />
-              <Route path="settings" element={<Suspense fallback={<PageLoading />}><SettingsPage /></Suspense>} />
+              <Route path="promo-codes" element={<Suspense fallback={<PageLoading />}><PromoCodesPage /></Suspense>} />
+              <Route
+                path="settings"
+                element={
+                  <RequireNotManager>
+                    <Suspense fallback={<PageLoading />}>
+                      <SettingsPage />
+                    </Suspense>
+                  </RequireNotManager>
+                }
+              />
+              <Route
+                path="ai-strategist"
+                element={
+                  <RequireAdmin>
+                    <Suspense fallback={<PageLoading />}>
+                      <AIStrategistPage />
+                    </Suspense>
+                  </RequireAdmin>
+                }
+              />
               <Route
                 path="audit"
                 element={
@@ -91,6 +140,16 @@ export default function App() {
                   </RequireAdmin>
                 }
               />
+              <Route
+                path="zotel"
+                element={
+                  <RequireAdmin>
+                    <Suspense fallback={<PageLoading />}>
+                      <ZotelPage />
+                    </Suspense>
+                  </RequireAdmin>
+                }
+              />
             </Route>
 
             {/* Guest Portal — entirely separate auth, separate layout, no sidebar */}
@@ -105,8 +164,27 @@ export default function App() {
                 </RequireGuestAuth>
               }
             />
+
+            {/* Customer Account — a THIRD, separate auth surface (self-
+                service Sign Up / Log In), never to be confused with staff
+                auth above or Guest Portal auth above. No sidebar. */}
+            <Route path="/account/login" element={<CustomerLoginPage />} />
+            <Route path="/account/signup" element={<CustomerSignUpPage />} />
+            <Route path="/account/forgot-password" element={<CustomerForgotPasswordPage />} />
+            <Route path="/account/reset-password" element={<CustomerResetPasswordPage />} />
+            <Route
+              path="/account"
+              element={
+                <RequireCustomerAuth>
+                  <Suspense fallback={<PageLoading />}>
+                    <CustomerAccountPage />
+                  </Suspense>
+                </RequireCustomerAuth>
+              }
+            />
           </Routes>
         </BrowserRouter>
+        </CustomerAuthProvider>
       </GuestAuthProvider>
     </AuthProvider>
   );

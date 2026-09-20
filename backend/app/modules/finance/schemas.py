@@ -310,6 +310,61 @@ class OTACommissionReport(BaseModel):
     by_channel: list[OTACommissionChannelSummary]
 
 
+class OTAPayoutReceiptRecord(BaseModel):
+    actual_received_amount: float = Field(gt=0)
+    receipt_date: date
+    status: str  # matched / partial / discrepancy — staff-declared, compared against the computed expected payout
+    reference_number: str | None = None
+    notes: str | None = None
+    expected_updated_at: datetime | None = None  # optimistic concurrency; only checked when a receipt already exists
+
+
+class OTAPayoutReceiptOut(BaseModel):
+    id: uuid.UUID
+    ota_commission_id: uuid.UUID
+    actual_received_amount: float
+    receipt_date: date
+    reference_number: str | None
+    status: str
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class OTAReconciliationLine(BaseModel):
+    ota_commission_id: uuid.UUID
+    booking_id: uuid.UUID
+    channel: str
+    guest_name: str
+    unit_name: str
+    check_in: date
+    check_out: date
+    gross_amount: float
+    commission_amount: float
+    ota_gst_amount: float
+    expected_payout: float
+    actual_received_amount: float | None
+    difference: float | None
+    receipt_date: date | None
+    reference_number: str | None
+    reconciliation_status: str  # unreconciled / matched / partial / discrepancy
+    receipt_id: uuid.UUID | None
+    receipt_updated_at: datetime | None
+
+
+class OTAMissingCommissionLine(BaseModel):
+    booking_id: uuid.UUID
+    guest_name: str
+    unit_name: str
+    check_in: date
+    check_out: date
+    source: str
+    gross_amount: float
+
+
 class OutstandingPaymentLine(BaseModel):
     booking_id: uuid.UUID
     guest_name: str
@@ -328,10 +383,12 @@ class CashFlowReport(BaseModel):
     date_to: date
     cash_in_payments: float
     cash_in_deposits: float
+    cash_in_ota_payouts: float
     cash_in_total: float
     cash_out_expenses: float
     cash_out_withdrawals: float
     cash_out_deposit_refunds: float
+    cash_out_loan_emi: float
     cash_out_total: float
     net_cash_flow: float
     cash_in_bank: float
@@ -413,6 +470,103 @@ class IncomeRegister(BaseModel):
     by_source: dict[str, float]
 
 
+class LoanCreate(BaseModel):
+    loan_name: str
+    lender_name: str
+    loan_type: str = "other"
+    principal_amount: float | None = Field(default=None, gt=0)
+    interest_rate: float | None = Field(default=None, ge=0, le=100)
+    emi_amount: float = Field(gt=0)
+    start_date: date
+    end_date: date | None = None
+    unit_id: uuid.UUID | None = None
+    notes: str | None = None
+
+    @field_validator("end_date")
+    @classmethod
+    def end_not_before_start(cls, v, info):
+        start = info.data.get("start_date")
+        if v is not None and start is not None and v < start:
+            raise ValueError("end_date cannot be before start_date")
+        return v
+
+
+class LoanUpdate(BaseModel):
+    loan_name: str | None = None
+    lender_name: str | None = None
+    loan_type: str | None = None
+    principal_amount: float | None = Field(default=None, gt=0)
+    interest_rate: float | None = Field(default=None, ge=0, le=100)
+    emi_amount: float | None = Field(default=None, gt=0)
+    start_date: date | None = None
+    end_date: date | None = None
+    status: str | None = None
+    unit_id: uuid.UUID | None = None
+    notes: str | None = None
+
+
+class LoanOut(BaseModel):
+    id: uuid.UUID
+    loan_name: str
+    lender_name: str
+    loan_type: str
+    principal_amount: float | None
+    interest_rate: float | None
+    emi_amount: float
+    start_date: date
+    end_date: date | None
+    status: str
+    unit_id: uuid.UUID | None
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LoanEmiPaymentCreate(BaseModel):
+    due_date: date
+    emi_amount: float | None = Field(default=None, gt=0)  # defaults to the loan's current emi_amount if omitted
+    notes: str | None = None
+
+
+class LoanEmiMarkPaid(BaseModel):
+    paid_date: date | None = None  # defaults to today
+    paid_amount: float | None = Field(default=None, gt=0)  # defaults to the schedule row's emi_amount
+    reference_number: str | None = None
+    notes: str | None = None
+
+
+class LoanEmiPaymentOut(BaseModel):
+    id: uuid.UUID
+    loan_id: uuid.UUID
+    due_date: date
+    emi_amount: float
+    status: str
+    paid_date: date | None
+    paid_amount: float | None
+    reference_number: str | None
+    notes: str | None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LoanSummary(BaseModel):
+    total_active_loans: int
+    total_monthly_emi_obligation: float
+    upcoming_emi_count: int
+    upcoming_emi_amount: float
+    overdue_emi_count: int
+    overdue_emi_amount: float
+    paid_this_month_count: int
+    paid_this_month_amount: float
+    outstanding_this_month_count: int
+    outstanding_this_month_amount: float
+
+
 class PropertyPnL(BaseModel):
     property_id: uuid.UUID
     property_name: str
@@ -420,5 +574,6 @@ class PropertyPnL(BaseModel):
     period_month: int
     units: list[ApartmentPnL]
     total_revenue: float
+    central_expenses: float
     total_expenses: float
     net_profit: float

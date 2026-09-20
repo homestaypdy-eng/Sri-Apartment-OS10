@@ -11,6 +11,44 @@ ATTENDANCE_STATUSES = ("present", "absent", "half_day", "on_leave")
 LEAVE_STATUSES = ("pending", "approved", "rejected")
 PAYROLL_STATUSES = ("draft", "paid")
 STAFF_ADVANCE_STATUSES = ("pending", "partially_deducted", "fully_deducted")
+# "tracked_no_pay": overtime minutes are computed and shown, never auto-paid.
+# "tracked_with_rate": same, plus overtime_rate_multiplier is set, as a data
+# hook for a future auto-bonus calculation — nothing in this phase reads it
+# to compute a bonus automatically (no rate rule has been defined yet).
+# "untracked": overtime is not computed at all for this designation.
+DESIGNATION_OVERTIME_MODES = ("untracked", "tracked_no_pay", "tracked_with_rate")
+
+
+class StaffDesignation(Base):
+    """
+    Post/designation master — the level at which default salary, shift
+    timing, lunch break, standard working hours, overtime handling, and
+    leave entitlement are configured by an Admin. An individual
+    StaffProfile's *_override fields take precedence over these defaults
+    when set (see StaffProfile below and staff/hr_policy.py for the
+    resolution order) — this table only holds what applies when nothing
+    is overridden. Soft-deactivation only, same as Property/Unit — a
+    designation already referenced by staff profiles is never hard-deleted.
+    """
+
+    __tablename__ = "staff_designations"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_staff_designation_name"),
+        CheckConstraint(f"overtime_mode IN {DESIGNATION_OVERTIME_MODES}", name="ck_designation_overtime_mode"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)  # e.g. "Manager", "Housekeeping" — admin-defined, not a fixed enum
+    default_basic_salary: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    default_shift_start: Mapped[time] = mapped_column(Time, nullable=False)
+    default_shift_end: Mapped[time] = mapped_column(Time, nullable=False)
+    default_lunch_break_minutes: Mapped[int] = mapped_column(default=60)
+    standard_working_hours: Mapped[float] = mapped_column(Numeric(4, 2), default=8.00)
+    leave_entitlement_per_month: Mapped[int] = mapped_column(default=4)
+    overtime_mode: Mapped[str] = mapped_column(String(20), default="tracked_no_pay")
+    overtime_rate_multiplier: Mapped[float | None] = mapped_column(Numeric(4, 2), nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True)  # soft-deactivation — never hard-deleted
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class Attendance(Base):
@@ -28,6 +66,18 @@ class Attendance(Base):
     status: Mapped[str] = mapped_column(String(20), default="present")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    # Computed once, at the moment both check_in_time and check_out_time
+    # are known (see staff/hr_policy.py compute_attendance_hours), using
+    # whatever policy (designation default / employee override) resolved
+    # for this user AT THAT TIME. Deliberately a snapshot, not a live
+    # computed value — if the designation's standard hours change next
+    # month, this month's already-recorded attendance must not silently
+    # change. All four stay NULL until both times are present; a missing
+    # check-out is never guessed at.
+    total_presence_minutes: Mapped[int | None] = mapped_column(nullable=True)
+    lunch_break_minutes_applied: Mapped[int | None] = mapped_column(nullable=True)
+    working_minutes: Mapped[int | None] = mapped_column(nullable=True)
+    overtime_minutes: Mapped[int | None] = mapped_column(nullable=True)
 
     user = relationship("User")
 
@@ -188,11 +238,29 @@ class StaffProfile(Base):
     weekly_off_day: Mapped[str | None] = mapped_column(String(10), nullable=True)
     supervisor_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
+    # Post/designation link + employee-specific overrides. designation
+    # (free-text, above) is kept exactly as-is for display/back-compat;
+    # designation_id is the authoritative link to StaffDesignation once
+    # set. Every *_override field below is nullable and, when NULL, falls
+    # back to the linked designation's default — same "unset = inherit
+    # parent default" convention as Unit.weekend_rate. Resolution is done
+    # by staff/hr_policy.py:resolve_employee_policy, never inline here.
+    designation_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("staff_designations.id"), nullable=True)
+    salary_override: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    shift_start_override: Mapped[time | None] = mapped_column(Time, nullable=True)
+    shift_end_override: Mapped[time | None] = mapped_column(Time, nullable=True)
+    lunch_break_override_minutes: Mapped[int | None] = mapped_column(nullable=True)
+    standard_working_hours_override: Mapped[float | None] = mapped_column(Numeric(4, 2), nullable=True)
+    leave_entitlement_override: Mapped[int | None] = mapped_column(nullable=True)
+
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", foreign_keys=[user_id])
     supervisor = relationship("User", foreign_keys=[supervisor_user_id])
+    # Named distinctly from the pre-existing free-text `designation` column
+    # above (String) to avoid a Python attribute collision on this class.
+    designation_ref = relationship("StaffDesignation", foreign_keys=[designation_id])
 
 
 class StaffAdvance(Base):

@@ -19,6 +19,22 @@ guestApi.interceptors.request.use((config) => {
   return config;
 });
 
+// Third, separate axios instance for the new self-service Customer Account
+// area (Sign Up / Log In / Forgot Password) — a THIRD distinct token
+// namespace on the backend (role="customer", see customer_auth/service.py::
+// get_current_customer), never to be confused with the staff `api` instance
+// above or the booking-guest `guestApi` instance. Same isolation reasoning:
+// one shared Authorization header across all three would let whichever
+// token was set last silently win.
+export const customerApi = axios.create({ baseURL: API_BASE_URL });
+customerApi.interceptors.request.use((config) => {
+  const token = localStorage.getItem("customer_access_token");
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
 // Attach access token to every request
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem("access_token");
@@ -112,6 +128,7 @@ export interface PropertyPnL {
   period_month: number;
   units: ApartmentPnL[];
   total_revenue: number;
+  central_expenses: number;
   total_expenses: number;
   net_profit: number;
 }
@@ -124,13 +141,33 @@ export interface UnitOut {
   max_occupancy: number;
   base_rate: number;
   weekend_rate: number | null;
+  long_stay_min_nights: number;
+  long_stay_rate: number;
   status: string;
   housekeeping_status: string;
   unit_code: string | null;
   floor: string | null;
   flat_number: string | null;
   amenities: string | null;
+  description: string | null;
   is_active: boolean;
+  bedroom_count: number | null;
+  bathroom_count: number | null;
+  house_rules: string | null;
+  checkin_time: string | null;
+  checkout_time: string | null;
+}
+
+export interface PromoCodeOut {
+  id: string;
+  code: string;
+  discount_type: "percent" | "flat";
+  value: number;
+  valid_from: string;
+  valid_to: string;
+  max_uses: number | null;
+  used_count: number;
+  active: boolean;
 }
 
 export interface UnitPhotoOut {
@@ -139,6 +176,8 @@ export interface UnitPhotoOut {
   filename: string;
   content_type: string;
   caption: string | null;
+  sort_order: number;
+  is_primary: boolean;
   uploaded_at: string;
 }
 
@@ -243,6 +282,10 @@ export interface BookingOut {
   extra_bed: boolean;
   arrival_time: string | null;
   departure_time: string | null;
+  updated_at: string;
+  is_archived: boolean;
+  archived_at: string | null;
+  archive_reason: string | null;
 }
 
 export interface HousekeepingTaskOut {
@@ -254,6 +297,62 @@ export interface HousekeepingTaskOut {
   notes: string | null;
   created_at: string;
   completed_at: string | null;
+}
+
+// --- Phase 18A: Staff Operations (aggregated view over existing bookings/
+// housekeeping/maintenance/guest-request data — see backend
+// app/modules/staff_ops for details) ---
+
+export interface StaffDashboardOut {
+  date: string;
+  check_ins_today: number;
+  check_outs_today: number;
+  occupied_units: number;
+  vacant_units: number;
+  units_needing_cleaning: number;
+  open_maintenance_tickets: number;
+  open_guest_requests: number;
+  pending_staff_tasks: number;
+}
+
+export interface CheckInLine {
+  booking_id: string;
+  guest_name: string;
+  unit_id: string;
+  unit_name: string;
+  arrival_time: string | null;
+  adults: number;
+  children: number;
+  status: string;
+  net_paid: number;
+}
+
+export interface CheckOutLine {
+  booking_id: string;
+  guest_name: string;
+  unit_id: string;
+  unit_name: string;
+  departure_time: string | null;
+  status: string;
+  housekeeping_status: string;
+}
+
+export type StaffTaskCategory = "housekeeping" | "maintenance" | "guest_request";
+
+export interface StaffTaskOut {
+  id: string;
+  category: StaffTaskCategory;
+  unit_id: string | null;
+  unit_name: string | null;
+  booking_id: string | null;
+  label: string;
+  priority: string | null;
+  status: string;
+  assigned_to: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  notes: string | null;
 }
 
 export interface HousekeepingPhotoOut {
@@ -281,6 +380,7 @@ export interface MaintenanceTicketOut {
   assigned_to: string | null;
   priority: string;
   status: string;
+  category: string | null;
   description: string;
   cost: number | null;
   created_at: string;
@@ -359,6 +459,229 @@ export interface CancellationReport {
   previous_no_show_rate_percent: number;
   cancellation_rate_change_percent: number | null;
   no_show_rate_change_percent: number | null;
+}
+
+export interface AIStrategistBusinessHealth {
+  current_period: PeriodRange;
+  previous_period: PeriodRange;
+  revenue_current: number;
+  revenue_previous: number;
+  revenue_definition: string;
+  occupancy: MetricComparison;
+  adr: MetricComparison;
+  revpar: MetricComparison;
+}
+
+export interface AIStrategistCancellations {
+  current_period: PeriodRange;
+  previous_period: PeriodRange;
+  total_bookings_in_period: number;
+  cancelled_count: number;
+  cancellation_rate_percent: number;
+  no_show_count: number;
+  no_show_rate_percent: number;
+}
+
+export interface AIStrategistOutstanding {
+  total_pending_balance: number;
+  pending_count: number;
+  overdue_count: number;
+  overdue_amount: number;
+}
+
+export interface AIStrategistUnitPerformanceLine {
+  unit_id: string;
+  unit_name: string;
+  revenue: number;
+  occupancy_rate_percent: number;
+  adr: number;
+  revpar: number;
+}
+
+export interface AIStrategistUnitPerformance {
+  current_period: PeriodRange;
+  top_units: AIStrategistUnitPerformanceLine[];
+  bottom_units: AIStrategistUnitPerformanceLine[];
+}
+
+export interface AIStrategistBookingSources {
+  current_period: PeriodRange;
+  revenue_by_source: Record<string, number>;
+  revenue_definition: string;
+}
+
+export interface AIStrategistGuestSegment {
+  guest_id: string;
+  name: string;
+  is_repeat_guest: boolean;
+  total_bookings: number;
+  total_spent: number;
+  latest_source: string | null;
+  last_stay: string | null;
+}
+
+export interface AIStrategistMaintenance {
+  current_period: PeriodRange;
+  maintenance_cost_total: number;
+}
+
+export interface AIStrategistGst {
+  current_period: PeriodRange;
+  gst_collected: number;
+  gst_input_credit_eligible: number;
+  gst_payable: number;
+}
+
+export interface AIStrategistWeeklyFact {
+  label: string;
+  value: string;
+  category: "fact" | "derived_metric";
+}
+
+// --- Phase 19F: Finance data integration (FACTS only) ---
+
+export interface AIStrategistFinancePnL {
+  period_year: number;
+  period_month: number;
+  period_note: string;
+  revenue: number;
+  operating_expenses: number | null;
+  central_expenses: number | null;
+  net_profit: number | null;
+  properties_included: number;
+}
+
+export interface AIStrategistFinanceCashFlow {
+  date_from: string;
+  date_to: string;
+  cash_in_payments: number;
+  cash_in_deposits: number;
+  cash_in_ota_payouts: number;
+  cash_in_total: number;
+  cash_out_expenses: number;
+  cash_out_withdrawals: number;
+  cash_out_deposit_refunds: number;
+  cash_out_loan_emi: number;
+  cash_out_total: number;
+  net_cash_flow: number;
+  cash_in_bank: number;
+  cash_in_hand: number;
+}
+
+export interface AIStrategistFinanceBudgetLine {
+  category: string;
+  budgeted_amount: number;
+  actual_amount: number;
+  variance: number;
+  variance_percent: number | null;
+}
+
+export interface AIStrategistFinanceBudget {
+  period_year: number;
+  period_month: number;
+  total_budgeted: number;
+  total_actual: number;
+  lines: AIStrategistFinanceBudgetLine[];
+}
+
+export interface AIStrategistFinanceLoanLine {
+  loan_id: string;
+  loan_name: string;
+  lender_name: string;
+  principal_amount: number | null;
+  emi_amount: number;
+}
+
+export interface AIStrategistFinanceLoans {
+  total_active_loans: number;
+  total_monthly_emi_obligation: number;
+  upcoming_emi_count: number;
+  upcoming_emi_amount: number;
+  overdue_emi_count: number;
+  overdue_emi_amount: number;
+  paid_this_month_count: number;
+  paid_this_month_amount: number;
+  outstanding_this_month_count: number;
+  outstanding_this_month_amount: number;
+  active_loans: AIStrategistFinanceLoanLine[];
+}
+
+export interface AIStrategistFinanceOTA {
+  commission_total: number;
+  gst_total: number;
+  expected_payout_total: number;
+  actual_received_total: number;
+  reconciled_count: number;
+  unreconciled_count: number;
+  discrepancy_count: number;
+  discrepancy_total: number;
+  missing_commission_count: number;
+  missing_commission_gross_total: number;
+}
+
+export interface AIStrategistFinanceExpenseBreakdown {
+  payroll_total: number;
+  utilities_total: number;
+  purchases_total: number;
+}
+
+export interface AIStrategistFinanceObligations {
+  emi_overdue_amount: number;
+  emi_overdue_count: number;
+  emi_due_this_month_amount: number;
+  ota_unreconciled_expected_payout: number;
+  guest_outstanding_balance: number;
+}
+
+export interface AIStrategistFinance {
+  period: PeriodRange;
+  source_note: string;
+  pnl: AIStrategistFinancePnL;
+  cash_flow: AIStrategistFinanceCashFlow;
+  budget: AIStrategistFinanceBudget;
+  loans: AIStrategistFinanceLoans;
+  ota: AIStrategistFinanceOTA;
+  expenses: AIStrategistFinanceExpenseBreakdown;
+  outstanding_obligations: AIStrategistFinanceObligations;
+}
+
+export interface AIStrategistBundle {
+  generated_at: string;
+  business_health: AIStrategistBusinessHealth;
+  needs_attention: AttentionItem[];
+  cancellations: AIStrategistCancellations;
+  outstanding_payments: AIStrategistOutstanding;
+  unit_performance: AIStrategistUnitPerformance;
+  booking_sources: AIStrategistBookingSources;
+  top_guests: AIStrategistGuestSegment[];
+  maintenance: AIStrategistMaintenance;
+  gst: AIStrategistGst;
+  weekly_facts: AIStrategistWeeklyFact[];
+  finance: AIStrategistFinance;
+}
+
+// --- Phase 13G: narrative layer (mock provider only — no real LLM) ------
+
+export interface ObservationRef {
+  text: string;
+  source_ids: string[];
+  classification: "FACT" | "DERIVED" | "SIGNAL";
+}
+
+export interface ActionRef {
+  text: string;
+  source_ids: string[];
+  requires_human_approval: boolean;
+}
+
+export interface NarrativeOutput {
+  executive_summary: string;
+  key_observations: ObservationRef[];
+  priority_actions: ActionRef[];
+  risks: ObservationRef[];
+  questions_for_management: string[];
+  generated_at: string;
+  source: "llm" | "deterministic_fallback";
 }
 
 export interface RevenuePoint {
@@ -521,12 +844,6 @@ export interface BusinessSettingsOut {
   gst_number: string;
   udyam_number: string;
   state_code: string;
-  bank_name: string;
-  bank_account_name: string;
-  bank_account_number: string;
-  bank_ifsc: string;
-  bank_branch: string;
-  upi_id: string;
   signatory_name: string;
   signatory_title: string;
   logo_path: string | null;
@@ -538,6 +855,19 @@ export interface BusinessSettingsOut {
   default_gst_rate_percent: number | null;
   theme_color: string;
   whatsapp_business_number: string | null;
+  updated_at: string;
+}
+
+// RBAC Phase A: bank/UPI fields live on their own admin-only resource,
+// separate from BusinessSettingsOut above — see backend
+// app/modules/settings/models.py's BankSettings docstring for why.
+export interface BankSettingsOut {
+  bank_name: string;
+  bank_account_name: string;
+  bank_account_number: string;
+  bank_ifsc: string;
+  bank_branch: string;
+  upi_id: string;
   updated_at: string;
 }
 
@@ -639,6 +969,12 @@ export interface AttendanceOut {
   status: string;
   notes: string | null;
   created_at: string;
+  // Computed once at check-out time from the resolved post/employee
+  // policy — null until both check_in_time and check_out_time are set.
+  total_presence_minutes: number | null;
+  lunch_break_minutes_applied: number | null;
+  working_minutes: number | null;
+  overtime_minutes: number | null;
 }
 
 export interface LeaveRequestOut {
@@ -724,6 +1060,62 @@ export interface StaffProfileOut {
   supervisor_user_id: string | null;
   notes: string | null;
   created_at: string;
+  designation_id: string | null;
+  salary_override: number | null;
+  shift_start_override: string | null;
+  shift_end_override: string | null;
+  lunch_break_override_minutes: number | null;
+  standard_working_hours_override: number | null;
+  leave_entitlement_override: number | null;
+}
+
+// Post/designation master — the defaults an employee's *_override fields
+// fall back to when unset. See ResolvedPolicyOut for what actually applies.
+export interface StaffDesignationOut {
+  id: string;
+  name: string;
+  default_basic_salary: number;
+  default_shift_start: string;
+  default_shift_end: string;
+  default_lunch_break_minutes: number;
+  standard_working_hours: number;
+  leave_entitlement_per_month: number;
+  overtime_mode: "untracked" | "tracked_no_pay" | "tracked_with_rate";
+  overtime_rate_multiplier: number | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+// The policy that actually applies to one employee right now — employee
+// override wins per field when set, else the linked designation's
+// default, else "unconfigured". Read-only/computed, never itself edited.
+export interface ResolvedPolicyOut {
+  user_id: string;
+  designation_id: string | null;
+  designation_name: string | null;
+  basic_salary: number | null;
+  shift_start: string | null;
+  shift_end: string | null;
+  lunch_break_minutes: number | null;
+  standard_working_hours: number | null;
+  leave_entitlement_per_month: number | null;
+  overtime_mode: string | null;
+  overtime_rate_multiplier: number | null;
+  source: Record<string, "override" | "designation" | "unconfigured">;
+}
+
+export interface AttendanceMonthlySummaryOut {
+  user_id: string;
+  year: number;
+  month: number;
+  days_recorded: number;
+  total_presence_minutes: number;
+  total_working_minutes: number;
+  total_overtime_minutes: number;
+  approved_leave_days_in_month: number;
+  leave_entitlement_per_month: number | null;
+  free_leave_days: number;
+  excess_leave_days: number;
 }
 
 export interface StaffAdvanceOut {
@@ -799,6 +1191,102 @@ export interface GuestProfileOut {
   name: string;
   phone: string;
   email: string | null;
+}
+
+// --- Guest OTP login (phone/email) — see backend app/modules/portal/
+// auth_router.py / auth_email_router.py. Returns the SAME guest session
+// shape (role="guest") the existing magic-link flow already produces, so
+// it's handed to the existing useGuestAuth().guestLogin() / guestApi —
+// never a new, parallel guest token store. ---
+export interface PhoneOtpRequestResponse {
+  challenge_id: string;
+  message: string;
+  // Only ever populated outside production — see auth_router.py.
+  dev_otp_code?: string | null;
+}
+
+export interface EmailOtpRequestResponse {
+  challenge_id: string;
+  message: string;
+  dev_otp_code?: string | null;
+}
+
+export interface GuestSessionToken {
+  access_token: string;
+  token_type: string;
+}
+
+export function requestPhoneOtp(phone: string): Promise<PhoneOtpRequestResponse> {
+  return guestApi.post("/portal/auth/phone/request-otp", { phone }).then((r) => r.data);
+}
+
+export function verifyPhoneOtp(challengeId: string, code: string): Promise<GuestSessionToken> {
+  return guestApi.post("/portal/auth/phone/verify-otp", { challenge_id: challengeId, code }).then((r) => r.data);
+}
+
+export function requestEmailOtp(email: string): Promise<EmailOtpRequestResponse> {
+  return guestApi.post("/portal/auth/email/request-otp", { email }).then((r) => r.data);
+}
+
+export function verifyEmailOtp(challengeId: string, code: string): Promise<GuestSessionToken> {
+  return guestApi.post("/portal/auth/email/verify-otp", { challenge_id: challengeId, code }).then((r) => r.data);
+}
+
+// --- Customer Account (self-service Sign Up / Log In / Forgot Password) —
+// see backend app/modules/customer_auth. Entirely separate trust boundary
+// from both staff Users and booking Guests — see that module's own
+// docstrings for the security boundary this mirrors on the frontend. ---
+export interface CustomerAccountOut {
+  id: string;
+  first_name: string;
+  last_name: string;
+  email: string;
+  email_verified_at: string | null;
+  created_at: string;
+}
+
+export interface CustomerLoginResponse {
+  access_token: string;
+  token_type: string;
+  customer: CustomerAccountOut;
+}
+
+export interface CustomerForgotPasswordResponse {
+  message: string;
+  // Dev/testability-only — see backend CustomerForgotPasswordResponse.
+  // Always absent/null in production; the UI must never render this.
+  dev_reset_token?: string | null;
+}
+
+export interface CustomerResetPasswordResponse {
+  message: string;
+}
+
+export function customerRegister(payload: {
+  first_name: string;
+  last_name: string;
+  email: string;
+  password: string;
+  terms_accepted: boolean;
+  privacy_accepted: boolean;
+}): Promise<CustomerAccountOut> {
+  return customerApi.post("/customer-auth/register", payload).then((r) => r.data);
+}
+
+export function customerLogin(email: string, password: string): Promise<CustomerLoginResponse> {
+  return customerApi.post("/customer-auth/login", { email, password }).then((r) => r.data);
+}
+
+export function customerLogout(): Promise<void> {
+  return customerApi.post("/customer-auth/logout").then(() => undefined);
+}
+
+export function customerForgotPassword(email: string): Promise<CustomerForgotPasswordResponse> {
+  return customerApi.post("/customer-auth/forgot-password", { email }).then((r) => r.data);
+}
+
+export function customerResetPassword(token: string, newPassword: string): Promise<CustomerResetPasswordResponse> {
+  return customerApi.post("/customer-auth/reset-password", { token, new_password: newPassword }).then((r) => r.data);
 }
 
 export interface GuestBookingOut {
@@ -885,6 +1373,51 @@ export interface OwnerWithdrawalOut {
   created_at: string;
 }
 
+export interface LoanOut {
+  id: string;
+  loan_name: string;
+  lender_name: string;
+  loan_type: string;
+  principal_amount: number | null;
+  interest_rate: number | null;
+  emi_amount: number;
+  start_date: string;
+  end_date: string | null;
+  status: string;
+  unit_id: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LoanEmiPaymentOut {
+  id: string;
+  loan_id: string;
+  due_date: string;
+  emi_amount: number;
+  status: string;
+  paid_date: string | null;
+  paid_amount: number | null;
+  reference_number: string | null;
+  notes: string | null;
+  created_at: string;
+}
+
+export interface LoanSummary {
+  total_active_loans: number;
+  total_monthly_emi_obligation: number;
+  upcoming_emi_count: number;
+  upcoming_emi_amount: number;
+  overdue_emi_count: number;
+  overdue_emi_amount: number;
+  paid_this_month_count: number;
+  paid_this_month_amount: number;
+  outstanding_this_month_count: number;
+  outstanding_this_month_amount: number;
+}
+
+export const DEFAULT_LOAN_TYPES = ["home_loan", "equipment_loan", "vehicle_loan", "personal_loan", "other"];
+
 export interface OTACommissionOut {
   id: string;
   booking_id: string;
@@ -909,6 +1442,37 @@ export interface OTACommissionReport {
   by_channel: OTACommissionChannelSummary[];
 }
 
+export interface OTAReconciliationLine {
+  ota_commission_id: string;
+  booking_id: string;
+  channel: string;
+  guest_name: string;
+  unit_name: string;
+  check_in: string;
+  check_out: string;
+  gross_amount: number;
+  commission_amount: number;
+  ota_gst_amount: number;
+  expected_payout: number;
+  actual_received_amount: number | null;
+  difference: number | null;
+  receipt_date: string | null;
+  reference_number: string | null;
+  reconciliation_status: "unreconciled" | "matched" | "partial" | "discrepancy";
+  receipt_id: string | null;
+  receipt_updated_at: string | null;
+}
+
+export interface OTAMissingCommissionLine {
+  booking_id: string;
+  guest_name: string;
+  unit_name: string;
+  check_in: string;
+  check_out: string;
+  source: string;
+  gross_amount: number;
+}
+
 export interface OutstandingPaymentLine {
   booking_id: string;
   guest_name: string;
@@ -927,6 +1491,7 @@ export interface CashFlowReport {
   date_to: string;
   cash_in_payments: number;
   cash_in_deposits: number;
+  cash_in_ota_payouts: number;
   cash_in_total: number;
   cash_out_expenses: number;
   cash_out_withdrawals: number;
@@ -982,7 +1547,13 @@ export interface LaundryMonthlySummary {
 }
 
 export const EXPENSE_CATEGORIES = ["electricity", "laundry", "internet", "salary", "maintenance", "purchases", "other"];
-export const OTA_CHANNELS = ["booking_com", "airbnb", "agoda", "direct"];
+// Mirrors backend/app/modules/maintenance/models.py::TICKET_CATEGORIES exactly — the existing backend-supported vocabulary, not a new one.
+export const MAINTENANCE_TICKET_CATEGORIES = ["ac", "electrical", "plumbing", "water", "appliance", "furniture", "internet", "other"];
+export const OTA_CHANNELS = ["booking_com", "airbnb", "agoda", "direct", "mmt"];
+// Mirrors backend OTA_RECONCILIATION_STATUSES exactly — "unreconciled" is
+// deliberately not here, since it's the absence of a receipt row, not a
+// value the receipt endpoint accepts.
+export const OTA_RECONCILIATION_STATUSES = ["matched", "partial", "discrepancy"];
 
 // --- Operational Dashboard ---
 export interface ApartmentPerformanceLine {
@@ -1208,6 +1779,84 @@ export interface IncomeRegister {
   units: IncomeRegisterUnit[];
   grand_total: number;
   by_source: Record<string, number>;
+}
+
+// --- Zotel channel-manager integration ---
+// Read-only sync from Zotel into OS10's own Booking/Unit model — see
+// backend app/modules/zotel/. Never carries API key/secret values; the
+// config-status shape below is deliberately booleans only.
+
+export interface ZotelConfigStatus {
+  configured: boolean;
+  base_url_set: boolean;
+  hotel_id_set: boolean;
+  api_key_set: boolean;
+  api_secret_set: boolean;
+}
+
+export interface ZotelCheckResult {
+  category: string;
+  passed: boolean;
+  message: string;
+}
+
+export interface ZotelConnectivityReport {
+  configured: boolean;
+  checks: ZotelCheckResult[];
+  overall_passed: boolean;
+}
+
+export interface ZotelRoomMappingOut {
+  id: string;
+  unit_id: string;
+  zotel_room_type_id: string;
+  zotel_room_type_name: string | null;
+  created_at: string;
+}
+
+export interface ZotelSyncRecordOut {
+  id: string;
+  external_reservation_id: string;
+  outcome: "imported" | "updated" | "skipped" | "unmapped" | "conflicted" | "failed";
+  booking_id: string | null;
+  detail: string | null;
+  created_at: string;
+}
+
+export interface ZotelSyncLogOut {
+  id: string;
+  sync_type: "connectivity_test" | "bookings_import" | "reconciliation";
+  status: "success" | "partial" | "failed";
+  message: string | null;
+  records_fetched: number;
+  records_imported: number;
+  records_updated: number;
+  records_skipped: number;
+  records_unmapped: number;
+  records_conflicted: number;
+  records_failed: number;
+  created_at: string;
+}
+
+export interface ZotelSyncLogDetail extends ZotelSyncLogOut {
+  records: ZotelSyncRecordOut[];
+}
+
+export interface ZotelUnmappedRoom {
+  zotel_room_type_id: string;
+  first_seen_in_reservation: string;
+}
+
+export interface ZotelReconciliationEntry {
+  external_reservation_id: string;
+  category: string;
+  detail: string;
+}
+
+export interface ZotelReconciliationReport {
+  generated_at: string;
+  entries: ZotelReconciliationEntry[];
+  summary: Record<string, number>;
 }
 
 function extractErrorMessage(err: unknown): string {

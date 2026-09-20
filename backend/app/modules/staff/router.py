@@ -1,5 +1,6 @@
+import calendar
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.modules.auth.models import User
+from app.modules.staff import hr_policy
 from app.modules.staff.models import (
     Attendance,
     Holiday,
@@ -16,12 +18,15 @@ from app.modules.staff.models import (
     Shift,
     StaffAdvance,
     StaffApartmentAssignment,
+    StaffDesignation,
     StaffPerformanceNote,
     StaffProfile,
 )
 from app.modules.staff.schemas import (
     AttendanceCreate,
+    AttendanceMonthlySummaryOut,
     AttendanceOut,
+    AttendanceUpdate,
     HolidayCreate,
     HolidayOut,
     LeaveRequestCreate,
@@ -29,6 +34,7 @@ from app.modules.staff.schemas import (
     LeaveRequestUpdate,
     PayrollCreate,
     PayrollOut,
+    ResolvedPolicyOut,
     ShiftCreate,
     ShiftOut,
     StaffAdvanceCreate,
@@ -37,6 +43,9 @@ from app.modules.staff.schemas import (
     StaffAdvanceUpdate,
     StaffApartmentAssignmentCreate,
     StaffApartmentAssignmentOut,
+    StaffDesignationCreate,
+    StaffDesignationOut,
+    StaffDesignationUpdate,
     StaffPerformanceNoteCreate,
     StaffPerformanceNoteOut,
     StaffProfileCreate,
@@ -52,6 +61,49 @@ from app.shared.rbac import get_current_user, require_role
 router = APIRouter(prefix="/api/v1/staff", tags=["staff"])
 
 
+def _resolved_policy_for_user(db: Session, user_id: uuid.UUID) -> tuple[StaffProfile | None, StaffDesignation | None, hr_policy.ResolvedPolicy]:
+    """Fetches the rows and calls the pure resolver — DB access stays here,
+    same convention as properties/pricing.py callers."""
+    profile = db.scalar(select(StaffProfile).where(StaffProfile.user_id == user_id))
+    designation = None
+    if profile and profile.designation_id:
+        designation = db.get(StaffDesignation, profile.designation_id)
+    if profile is None:
+        # No profile at all: resolver still needs a profile-shaped object
+        # with every override field None, so it correctly reports
+        # "unconfigured" rather than erroring.
+        class _EmptyProfile:
+            salary_override = shift_start_override = shift_end_override = None
+            lunch_break_override_minutes = standard_working_hours_override = None
+            leave_entitlement_override = None
+        profile_for_resolver = _EmptyProfile()
+    else:
+        profile_for_resolver = profile
+    policy = hr_policy.resolve_employee_policy(profile_for_resolver, designation)
+    return profile, designation, policy
+
+
+def _maybe_compute_attendance_hours(record: Attendance, db: Session) -> None:
+    """If both check_in_time and check_out_time are now present, resolve
+    this user's current policy and snapshot the four computed columns.
+    Called after any create/update that could have just completed the
+    pair — a no-op (all four stay None) if either time is still missing."""
+    if record.check_in_time is None or record.check_out_time is None:
+        return
+    _, _, policy = _resolved_policy_for_user(db, record.user_id)
+    computation = hr_policy.compute_attendance_hours(
+        attendance_date=record.date,
+        check_in_time=record.check_in_time,
+        check_out_time=record.check_out_time,
+        lunch_break_minutes=policy.lunch_break_minutes,
+        standard_working_hours=policy.standard_working_hours,
+    )
+    record.total_presence_minutes = computation.total_presence_minutes
+    record.lunch_break_minutes_applied = computation.lunch_break_minutes_applied
+    record.working_minutes = computation.working_minutes
+    record.overtime_minutes = computation.overtime_minutes
+
+
 # --- Attendance ---
 
 @router.post("/attendance", response_model=AttendanceOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
@@ -60,6 +112,7 @@ def mark_attendance(payload: AttendanceCreate, db: Session = Depends(get_db), us
     db.add(record)
     try:
         db.flush()
+        _maybe_compute_attendance_hours(record, db)  # both times may already be known (after-the-fact daily entry)
         record_audit_log(db, user.id, "staff.attendance.mark", entity_type="attendance", entity_id=str(record.id), details=f"{payload.status} for user {payload.user_id} on {payload.date}")
         db.commit()
     except IntegrityError:
@@ -75,6 +128,79 @@ def list_attendance(user_id: uuid.UUID | None = None, limit: int = Query(200, ge
     if user_id:
         query = query.where(Attendance.user_id == user_id)
     return db.scalars(query.offset(offset).limit(limit)).all()
+
+
+@router.patch("/attendance/{attendance_id}", response_model=AttendanceOut, dependencies=[Depends(require_role("admin", "staff"))])
+def update_attendance(attendance_id: uuid.UUID, payload: AttendanceUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Records a check-out (or corrects/backfills a missed one) on an
+    existing attendance row created earlier the same day by mark_attendance.
+    A "staff" caller may only update their own attendance; admin may
+    update anyone's. Whenever this leaves both check_in_time and
+    check_out_time set, the four computed hours columns are (re)snapshotted
+    from the resolved policy at the moment of this call.
+    """
+    record = db.get(Attendance, attendance_id)
+    if record is None:
+        raise HTTPException(404, "Attendance record not found")
+    if user.role.name != "admin" and record.user_id != user.id:
+        raise HTTPException(403, "You can only update your own attendance")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(400, "No fields to update were provided")
+    for field, value in changes.items():
+        setattr(record, field, value)
+    _maybe_compute_attendance_hours(record, db)
+    record_audit_log(db, user.id, "staff.attendance.update", entity_type="attendance", entity_id=str(record.id), details=f"Updated: {', '.join(changes.keys())}")
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@router.get("/attendance/monthly-summary", response_model=AttendanceMonthlySummaryOut, dependencies=[Depends(require_role("admin", "staff"))])
+def attendance_monthly_summary(
+    user_id: uuid.UUID = Query(...),
+    year: int = Query(...),
+    month: int = Query(..., ge=1, le=12),
+    db: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
+):
+    """
+    Read-only reference numbers for a payroll review screen: total presence/
+    working/overtime minutes recorded this month, plus approved-leave days
+    split into free (within entitlement) vs. excess. This never writes
+    anything and never computes a salary deduction — excess leave days are
+    surfaced as a count only (see hr_policy.split_free_and_excess_leave).
+    """
+    if actor.role.name != "admin" and actor.id != user_id:
+        raise HTTPException(403, "You can only view your own attendance summary")
+
+    attendance_rows = db.scalars(
+        select(Attendance).where(
+            Attendance.user_id == user_id,
+            Attendance.date >= date(year, month, 1),
+            Attendance.date <= date(year, month, calendar.monthrange(year, month)[1]),
+        )
+    ).all()
+    leave_rows = db.scalars(select(LeaveRequest).where(LeaveRequest.user_id == user_id)).all()
+
+    approved_days = hr_policy.count_approved_leave_days_in_month(leave_rows, year, month)
+    _, _, policy = _resolved_policy_for_user(db, user_id)
+    free_days, excess_days = hr_policy.split_free_and_excess_leave(approved_days, policy.leave_entitlement_per_month)
+
+    return AttendanceMonthlySummaryOut(
+        user_id=user_id,
+        year=year,
+        month=month,
+        days_recorded=len(attendance_rows),
+        total_presence_minutes=sum(r.total_presence_minutes or 0 for r in attendance_rows),
+        total_working_minutes=sum(r.working_minutes or 0 for r in attendance_rows),
+        total_overtime_minutes=sum(r.overtime_minutes or 0 for r in attendance_rows),
+        approved_leave_days_in_month=approved_days,
+        leave_entitlement_per_month=policy.leave_entitlement_per_month,
+        free_leave_days=free_days,
+        excess_leave_days=excess_days,
+    )
 
 
 # --- Leave ---
@@ -176,6 +302,120 @@ def mark_payroll_paid(payroll_id: uuid.UUID, db: Session = Depends(get_db), user
     db.commit()
     db.refresh(record)
     return record
+
+
+# --- Staff Designations (post/designation master) ---
+
+@router.post("/designations", response_model=StaffDesignationOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+def create_designation(payload: StaffDesignationCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if payload.overtime_mode not in ("untracked", "tracked_no_pay", "tracked_with_rate"):
+        raise HTTPException(400, "overtime_mode must be one of: untracked, tracked_no_pay, tracked_with_rate")
+    designation = StaffDesignation(**payload.model_dump())
+    db.add(designation)
+    try:
+        db.flush()
+        record_audit_log(db, user.id, "staff.designation.create", entity_type="staff_designation", entity_id=str(designation.id), details=f"{payload.name}, Rs.{payload.default_basic_salary}/month")
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, f"A designation named '{payload.name}' already exists")
+    db.refresh(designation)
+    return designation
+
+
+@router.get("/designations", response_model=list[StaffDesignationOut], dependencies=[Depends(require_role("admin", "staff"))])
+def list_designations(include_inactive: bool = Query(False), db: Session = Depends(get_db)):
+    query = select(StaffDesignation).order_by(StaffDesignation.name)
+    if not include_inactive:
+        query = query.where(StaffDesignation.is_active.is_(True))
+    return db.scalars(query).all()
+
+
+@router.get("/designations/{designation_id}", response_model=StaffDesignationOut, dependencies=[Depends(require_role("admin", "staff"))])
+def get_designation(designation_id: uuid.UUID, db: Session = Depends(get_db)):
+    designation = db.get(StaffDesignation, designation_id)
+    if designation is None:
+        raise HTTPException(404, "Designation not found")
+    return designation
+
+
+@router.patch("/designations/{designation_id}", response_model=StaffDesignationOut, dependencies=[Depends(require_role("admin"))])
+def update_designation(designation_id: uuid.UUID, payload: StaffDesignationUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    designation = db.get(StaffDesignation, designation_id)
+    if designation is None:
+        raise HTTPException(404, "Designation not found")
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(400, "No fields to update were provided")
+    if "overtime_mode" in changes and changes["overtime_mode"] not in ("untracked", "tracked_no_pay", "tracked_with_rate"):
+        raise HTTPException(400, "overtime_mode must be one of: untracked, tracked_no_pay, tracked_with_rate")
+    for field, value in changes.items():
+        setattr(designation, field, value)
+    # Note: this only changes what future default-resolution and future
+    # attendance snapshots see. Already-generated Payroll rows and
+    # already-recorded Attendance hour snapshots are untouched — see
+    # StaffDesignationUpdate's docstring.
+    record_audit_log(db, user.id, "staff.designation.update", entity_type="staff_designation", entity_id=str(designation.id), details=f"Updated: {', '.join(changes.keys())}")
+    db.commit()
+    db.refresh(designation)
+    return designation
+
+
+@router.patch("/designations/{designation_id}/deactivate", response_model=StaffDesignationOut, dependencies=[Depends(require_role("admin"))])
+def deactivate_designation(designation_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    designation = db.get(StaffDesignation, designation_id)
+    if designation is None:
+        raise HTTPException(404, "Designation not found")
+    if not designation.is_active:
+        raise HTTPException(409, "Designation is already deactivated")
+    designation.is_active = False
+    record_audit_log(db, user.id, "staff.designation.deactivate", entity_type="staff_designation", entity_id=str(designation.id), details=designation.name)
+    db.commit()
+    db.refresh(designation)
+    return designation
+
+
+@router.patch("/designations/{designation_id}/reactivate", response_model=StaffDesignationOut, dependencies=[Depends(require_role("admin"))])
+def reactivate_designation(designation_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    designation = db.get(StaffDesignation, designation_id)
+    if designation is None:
+        raise HTTPException(404, "Designation not found")
+    if designation.is_active:
+        raise HTTPException(409, "Designation is already active")
+    designation.is_active = True
+    record_audit_log(db, user.id, "staff.designation.reactivate", entity_type="staff_designation", entity_id=str(designation.id), details=designation.name)
+    db.commit()
+    db.refresh(designation)
+    return designation
+
+
+@router.get("/policy/{user_id}", response_model=ResolvedPolicyOut, dependencies=[Depends(require_role("admin", "staff"))])
+def get_resolved_policy(user_id: uuid.UUID, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
+    """
+    The policy that actually applies to this employee right now — post
+    default with any employee-specific override already applied, per
+    field, plus which source ("override"/"designation"/"unconfigured")
+    each field came from. Read-only; changes nothing.
+    """
+    if actor.role.name != "admin" and actor.id != user_id:
+        raise HTTPException(403, "You can only view your own resolved policy")
+    if db.get(User, user_id) is None:
+        raise HTTPException(404, "User not found")
+    _, designation, policy = _resolved_policy_for_user(db, user_id)
+    return ResolvedPolicyOut(
+        user_id=user_id,
+        designation_id=designation.id if designation else None,
+        designation_name=designation.name if designation else None,
+        basic_salary=policy.basic_salary,
+        shift_start=policy.shift_start,
+        shift_end=policy.shift_end,
+        lunch_break_minutes=policy.lunch_break_minutes,
+        standard_working_hours=policy.standard_working_hours,
+        leave_entitlement_per_month=policy.leave_entitlement_per_month,
+        overtime_mode=policy.overtime_mode,
+        overtime_rate_multiplier=policy.overtime_rate_multiplier,
+        source=policy.source,
+    )
 
 
 # --- Shifts ---
