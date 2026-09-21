@@ -30,9 +30,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.modules.bookings.models import Booking
+from app.modules.customer_auth.models import CustomerAccount
 from app.modules.notifications.models import NotificationLog
 from app.modules.payments.models import Invoice, Payment
 from app.modules.notifications.templates import render_template
+from app.modules.settings.router import get_or_create_settings
 
 logger = logging.getLogger("notifications.service")
 
@@ -260,6 +262,58 @@ def send_customer_login_otp_sms(to_phone: str, message: str, db: Session) -> Non
         raise
     db.add(NotificationLog(event_type="customer_login_otp", channel="sms", recipient=to_phone, success=True))
     db.commit()
+
+
+def dispatch_customer_login_otp_email(customer_id: uuid.UUID, subject: str, body: str) -> None:
+    """
+    Sends a customer's login OTP email, in its own DB session — same
+    background-task pattern as dispatch_booking_notifications and
+    dispatch_customer_welcome_email (see either's docstring for the full
+    reasoning). login_customer() used to call send_customer_login_otp_email
+    directly, inline, inside the request — a real production incident
+    (login OTP delivery failing with OSError: [Errno 101] Network is
+    unreachable, synchronously, inside the request) showed this could
+    delay the response past the frontend's 12s timeout, the exact same
+    class of bug already fixed for booking confirmations. Scheduled as a
+    FastAPI BackgroundTask instead, so a slow/unreachable SMTP server can
+    never again delay or fail the login response — the OTP challenge is
+    already created/persisted by the time this runs.
+
+    Reuses send_customer_login_otp_email completely unchanged — it
+    already writes the NotificationLog row (success or failure) and
+    commits before returning or raising; this wrapper only adds an outer
+    catch so a delivery failure can never crash the background task
+    itself, exactly like dispatch_booking_notifications' own outer
+    try/except.
+    """
+    db = SessionLocal()
+    try:
+        account = db.get(CustomerAccount, customer_id)
+        if account is None:
+            logger.error("Login OTP email dispatch skipped: customer %s not found", customer_id)
+            return
+        send_customer_login_otp_email(account.email, subject, body, db)
+    except Exception:
+        logger.exception("Login OTP email dispatch failed for customer %s", customer_id)
+    finally:
+        db.close()
+
+
+def dispatch_customer_login_otp_sms(customer_id: uuid.UUID, message: str) -> None:
+    """SMS counterpart to dispatch_customer_login_otp_email — see its
+    docstring for the full reasoning. Reuses send_customer_login_otp_sms
+    completely unchanged."""
+    db = SessionLocal()
+    try:
+        account = db.get(CustomerAccount, customer_id)
+        if account is None:
+            logger.error("Login OTP SMS dispatch skipped: customer %s not found", customer_id)
+            return
+        send_customer_login_otp_sms(account.phone, message, db)
+    except Exception:
+        logger.exception("Login OTP SMS dispatch failed for customer %s", customer_id)
+    finally:
+        db.close()
 
 
 def _log_and_maybe_send(
@@ -799,6 +853,106 @@ def dispatch_booking_notifications(booking_id: uuid.UUID) -> None:
         db.commit()
     except Exception:
         logger.exception("Booking notification dispatch failed for booking %s", booking_id)
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _render_customer_welcome_html(customer_name: str, login_url: str, settings_row) -> str:
+    """Same branded skeleton as _render_booking_notification_html (logo
+    banner, cream card, footer contact line) — simplified to a welcome
+    message + a login button instead of a booking-details table, since
+    there's no booking to describe yet. Kept as its own function rather
+    than overloading _render_booking_notification_html (which requires a
+    Booking/ctx this event doesn't have)."""
+    contact_line = " &middot; ".join(x for x in (settings_row.address, settings_row.contact_phone, settings_row.contact_email) if x)
+
+    return f"""\
+<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;background:#fdfaf5;
+            border:1px solid #e6ddd0;border-radius:10px;overflow:hidden;">
+  <div style="background:#1e3d32;padding:22px;text-align:center;">
+    <img src="cid:logo" alt="Sri Apartment Homestay" style="height:44px;">
+  </div>
+  <div style="padding:28px 22px;text-align:center;">
+    <h2 style="color:#1e3d32;margin:0 0 4px;font-size:20px;">Welcome to Sri Apartment Homestay</h2>
+    <p style="color:#8a7f6c;margin:0 0 20px;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;">
+      Pondicherry
+    </p>
+    <p style="color:#2b2b2b;font-size:15px;line-height:1.6;margin:0 0 8px;">Hi {customer_name},</p>
+    <p style="color:#2b2b2b;font-size:15px;line-height:1.6;margin:0 0 24px;">
+      Your Sri Apartment Homestay account has been created successfully. You can now log in any
+      time to manage your bookings.
+    </p>
+    <a href="{login_url}"
+       style="display:inline-block;background:#c9972f;color:#1e3d32;font-weight:bold;text-decoration:none;
+              padding:13px 32px;border-radius:6px;font-size:15px;">
+      Log In to Your Account
+    </a>
+    <p style="color:#8a7f6c;font-size:12px;margin:20px 0 0;">
+      Or copy this link into your browser: <a href="{login_url}" style="color:#1e6b65;">{login_url}</a>
+    </p>
+  </div>
+  <div style="background:#f1ece1;padding:14px;text-align:center;color:#8a7f6c;font-size:11px;">
+    {contact_line}
+  </div>
+</div>"""
+
+
+def dispatch_customer_welcome_email(customer_id: uuid.UUID) -> None:
+    """
+    Sends a newly registered customer's one-time welcome email, in its own
+    DB session — same background-task pattern as
+    dispatch_booking_notifications (see its own docstring for the full
+    reasoning): register_customer() schedules this as a FastAPI
+    BackgroundTask so a slow/unreachable SMTP server can never delay or
+    fail the signup HTTP response. The account is already committed by the
+    time this runs, so nothing here can undo the signup.
+
+    Delivery goes through _log_and_maybe_send's existing best-effort
+    contract (never raises, always logs success/failure as a
+    NotificationLog row) — same as every other notification in this
+    file — so a failure here is invisible to the customer and only ever
+    shows up as a logged row an operator can check.
+
+    No separate de-duplication check is needed (unlike the scheduler's
+    reminders, which re-scan periodically and must not re-send): this is
+    only ever called once, from register_customer's single success path,
+    which itself can only run once per email thanks to CustomerAccount's
+    unique constraint — the same one-shot reasoning
+    dispatch_booking_notifications already relies on for booking
+    confirmation.
+    """
+    db = SessionLocal()
+    try:
+        account = db.get(CustomerAccount, customer_id)
+        if account is None:
+            logger.error("Welcome email dispatch skipped: customer %s not found", customer_id)
+            return
+
+        business_settings = get_or_create_settings(db)
+        customer_name = f"{account.first_name} {account.last_name}".strip()
+        login_url = "https://sriapartment.in/login"
+
+        subject = "Welcome to Sri Apartment Homestay"
+        contact_line = " | ".join(
+            x for x in (business_settings.address, business_settings.contact_phone, business_settings.contact_email) if x
+        )
+        body = (
+            f"Hi {customer_name},\n\n"
+            f"Your Sri Apartment Homestay account has been created successfully.\n\n"
+            f"Log in any time to manage your bookings:\n{login_url}\n\n"
+            f"{contact_line}\n\n"
+            f"We look forward to hosting you!"
+        )
+        html_body = _render_customer_welcome_html(customer_name, login_url, business_settings)
+
+        _log_and_maybe_send(
+            db, "customer_welcome_email", account.email, subject, body,
+            html_body=html_body, inline_images={"logo": _DEFAULT_LOGO_PATH},
+        )
+        db.commit()
+    except Exception:
+        logger.exception("Welcome email dispatch failed for customer %s", customer_id)
         db.rollback()
     finally:
         db.close()

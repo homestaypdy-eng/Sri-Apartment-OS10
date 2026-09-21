@@ -63,7 +63,7 @@ import smtplib
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -105,9 +105,9 @@ from app.modules.customer_auth.service import (
 from app.core.security import create_customer_session_token, hash_password
 from app.modules.notifications.service import (
     EmailNotConfiguredError,
-    SmsNotConfiguredError,
-    send_customer_login_otp_email,
-    send_customer_login_otp_sms,
+    dispatch_customer_login_otp_email,
+    dispatch_customer_login_otp_sms,
+    dispatch_customer_welcome_email,
     send_customer_password_reset_email,
 )
 from app.modules.portal.auth_service import OTP_EXPIRY_MINUTES, hash_otp_code, normalize_email
@@ -147,7 +147,7 @@ _GENERIC_RESET_REQUEST_MESSAGE = "If that email is registered, a password reset 
 
 
 @router.post("/register", response_model=CustomerAccountOut, status_code=status.HTTP_201_CREATED)
-def register_customer(payload: CustomerRegisterRequest, request: Request, db: Session = Depends(get_db)):
+def register_customer(payload: CustomerRegisterRequest, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     ip = request.client.host if request.client else "unknown"
     ip_key = f"customer-register:ip:{ip}"
 
@@ -212,11 +212,19 @@ def register_customer(payload: CustomerRegisterRequest, request: Request, db: Se
     )
     db.commit()
 
+    # Scheduled as a BackgroundTask (runs only AFTER this response is
+    # sent) — same fix as the payment->booking-confirmation timeout bug:
+    # a slow/unreachable SMTP server must never delay or fail signup. The
+    # account above is already committed, so nothing here can undo it;
+    # see dispatch_customer_welcome_email's own docstring for the full
+    # best-effort/no-duplicate reasoning.
+    background_tasks.add_task(dispatch_customer_welcome_email, account.id)
+
     return account
 
 
 @router.post("/login", response_model=CustomerLoginOtpRequestResponse)
-def login_customer(payload: CustomerLoginRequest, request: Request, db: Session = Depends(get_db)):
+def login_customer(payload: CustomerLoginRequest, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Phase 3E step 1: verify identifier + password, and if correct, dispatch
     a one-time code to that SAME channel (email→email, phone→SMS) rather
@@ -271,35 +279,43 @@ def login_customer(payload: CustomerLoginRequest, request: Request, db: Session 
 
     challenge, raw_code = create_customer_login_otp_challenge(db, account.id, payload.channel)
 
-    # CREDENTIAL-INDEPENDENT SAFETY GATE: the check here is
-    # settings.environment, decided BEFORE any send is ever attempted —
-    # not "try sending and see if it fails". Outside production, no send
-    # is attempted at all, regardless of whether valid SMTP/SMS
-    # credentials happen to exist; dev_otp_code below is how local/
-    # automated testing completes the flow instead. Same mechanism
-    # portal/auth_router.py's request_phone_otp and auth_email_router.py's
-    # request_otp already established, reused unchanged here.
+    # CREDENTIAL-INDEPENDENT: the check here is settings.environment,
+    # decided BEFORE any send is ever attempted — not "try sending and see
+    # if it fails". Outside production, no send is attempted at all,
+    # regardless of whether valid SMTP/SMS credentials happen to exist;
+    # dev_otp_code below is how local/automated testing completes the flow
+    # instead. Same mechanism portal/auth_router.py's request_phone_otp and
+    # auth_email_router.py's request_otp already established.
+    #
+    # The actual send is scheduled as a FastAPI BackgroundTask (runs only
+    # AFTER this response is sent) rather than performed inline — a real
+    # production incident (login OTP delivery failing with OSError:
+    # [Errno 101] Network is unreachable, synchronously, inside this
+    # request) showed a slow/unreachable SMTP server could delay this
+    # response past the frontend's 12s client timeout, exactly the class
+    # of bug already fixed for booking confirmations
+    # (dispatch_booking_notifications). Because delivery now happens after
+    # the response, this endpoint can no longer report "delivery is not
+    # configured" back to the caller the way it used to — a failure is
+    # only ever visible as a NotificationLog row (dispatch_customer_login_
+    # otp_email/sms's own contract, see their docstrings), never to the
+    # customer, which is a strictly stronger form of the same
+    # anti-disclosure principle already applied to forgot-password's own
+    # 501 message.
     if settings.environment == "production":
-        try:
-            if payload.channel == "email":
-                subject = "Your Sri Apartment login code"
-                body = (
-                    f"Your Sri Apartment Homestay login verification code is {raw_code}. "
-                    f"It expires in {OTP_EXPIRY_MINUTES} minutes. Do not share this code."
-                )
-                send_customer_login_otp_email(account.email, subject, body, db)
-            else:
-                message = (
-                    f"Your Sri Apartment Homestay login code is {raw_code}. "
-                    f"It expires in {OTP_EXPIRY_MINUTES} minutes. Do not share this code."
-                )
-                send_customer_login_otp_sms(account.phone, message, db)
-        except (EmailNotConfiguredError, SmsNotConfiguredError, smtplib.SMTPException, OSError, TimeoutError) as e:
-            logger.error(f"Customer login OTP delivery failed for customer_id={account.id} channel={payload.channel}: {type(e).__name__}: {e}")
-            raise HTTPException(
-                status.HTTP_501_NOT_IMPLEMENTED,
-                "Verification code delivery is not configured. Contact your administrator.",
+        if payload.channel == "email":
+            subject = "Your Sri Apartment login code"
+            body = (
+                f"Your Sri Apartment Homestay login verification code is {raw_code}. "
+                f"It expires in {OTP_EXPIRY_MINUTES} minutes. Do not share this code."
             )
+            background_tasks.add_task(dispatch_customer_login_otp_email, account.id, subject, body)
+        else:
+            message = (
+                f"Your Sri Apartment Homestay login code is {raw_code}. "
+                f"It expires in {OTP_EXPIRY_MINUTES} minutes. Do not share this code."
+            )
+            background_tasks.add_task(dispatch_customer_login_otp_sms, account.id, message)
 
     record_audit_log(
         db, None, "customer_auth.login_otp_requested",
@@ -573,10 +589,12 @@ def forgot_customer_password(payload: CustomerForgotPasswordRequest, request: Re
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests for this email. Please try again later.")
 
     if settings.environment == "production" and not settings.smtp_host:
-        raise HTTPException(
-            status.HTTP_501_NOT_IMPLEMENTED,
-            "Password reset email delivery is not configured. Contact your administrator.",
-        )
+        # 501 status is diagnostic (ops/monitoring can alert on it); the
+        # message itself must stay generic — naming SMTP/config state here
+        # would hand an anonymous caller a fact about backend internals,
+        # the same class of leak this whole endpoint otherwise avoids by
+        # never confirming/denying a submitted email is registered.
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "Something went wrong. Please try again later.")
 
     record_attempt(ip_key)
     record_attempt(email_key)

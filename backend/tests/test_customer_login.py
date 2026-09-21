@@ -16,6 +16,7 @@ Run with: pytest tests/test_customer_login.py -v
 """
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -638,3 +639,111 @@ def test_existing_staff_authentication_still_works():
     resp = client.post("/api/v1/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
     assert resp.status_code == 200
     assert resp.json()["access_token"]
+
+
+# ---------------------------------------------------------------------------
+# Login OTP dispatch runs in the background, not inline in the request
+# (production incident fix: a slow/unreachable SMTP server used to be able
+# to delay or time out this response). TestClient runs BackgroundTasks
+# inline before client.post() returns (same assumption the customer-signup
+# welcome-email tests already rely on), so these assertions run
+# immediately after the request, no waiting needed.
+# ---------------------------------------------------------------------------
+
+def test_login_step1_never_calls_the_network_send_directly_in_production(monkeypatch, db):
+    """The router no longer imports send_customer_login_otp_email/sms at
+    all — the only way an email/SMS can go out during login is through
+    the background dispatch wrapper. Patching the actual network-touching
+    send_email and making it raise proves step 1 doesn't depend on it
+    succeeding (or even being reachable) to return successfully."""
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.notifications.service.send_email", side_effect=OSError("[Errno 101] Network is unreachable")):
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["challenge_id"]
+
+
+def test_login_schedules_background_otp_email_dispatch(monkeypatch, db):
+    email = _random_email()
+    account = _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.customer_auth.router.dispatch_customer_login_otp_email") as mock_dispatch:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        mock_dispatch.assert_called_once()
+        args = mock_dispatch.call_args[0]
+        assert str(args[0]) == account["id"]
+        assert "Sri Apartment" in args[2]  # body
+
+
+def test_login_schedules_background_otp_sms_dispatch(monkeypatch, db):
+    phone = _random_phone()
+    email = _random_email()
+    account = _register(email, phone=phone)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.customer_auth.router.dispatch_customer_login_otp_sms") as mock_dispatch:
+        resp = _login_step1("phone", phone)
+        assert resp.status_code == 200, resp.text
+        mock_dispatch.assert_called_once()
+        args = mock_dispatch.call_args[0]
+        assert str(args[0]) == account["id"]
+
+
+def test_otp_challenge_is_still_created_when_dispatch_is_backgrounded(monkeypatch, db):
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.customer_auth.router.dispatch_customer_login_otp_email"):
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200
+
+    account = db.scalar(select(CustomerAccount).where(CustomerAccount.email == email))
+    challenge = db.scalar(select(CustomerLoginOtpChallenge).where(CustomerLoginOtpChallenge.customer_id == account.id))
+    assert challenge is not None
+
+
+def test_otp_delivery_failure_does_not_fail_login_or_remove_challenge(monkeypatch, db):
+    """A background delivery failure (e.g. the real production OSError:
+    Network is unreachable) must be invisible to the caller — no 500, no
+    SMTP error text, and the already-created challenge must survive."""
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.notifications.service.send_email", side_effect=OSError("[Errno 101] Network is unreachable")):
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        body_text = resp.text.lower()
+        assert "smtp" not in body_text
+        assert "unreachable" not in body_text
+        assert "detail" not in resp.json()
+
+    account = db.scalar(select(CustomerAccount).where(CustomerAccount.email == email))
+    challenge = db.scalar(select(CustomerLoginOtpChallenge).where(CustomerLoginOtpChallenge.customer_id == account.id))
+    assert challenge is not None
+
+
+def test_otp_delivery_failure_is_logged_via_notification_log(monkeypatch, db):
+    from app.modules.notifications.models import NotificationLog
+
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.notifications.service.send_email", side_effect=OSError("[Errno 101] Network is unreachable")):
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200
+
+    row = db.scalar(
+        select(NotificationLog).where(NotificationLog.event_type == "customer_login_otp", NotificationLog.recipient == email)
+    )
+    assert row is not None
+    assert row.success is False
+    # Internal admin-only log — never contains the OTP code itself.
+    assert "Errno 101" in (row.error_message or "")

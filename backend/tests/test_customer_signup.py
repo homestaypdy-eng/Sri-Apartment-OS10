@@ -9,6 +9,7 @@ both the happy path and every security boundary from the Phase 3B task.
 Run with: pytest tests/test_customer_signup.py -v
 """
 import uuid
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -399,3 +400,109 @@ def test_customer_account_separate_from_staff_user_table(db):
     assert db.scalar(select(User).where(User.email == email)) is None
     assert CustomerAccount.__tablename__ != User.__tablename__
     assert not hasattr(User, "terms_accepted_at")
+
+
+# ---------------------------------------------------------------------------
+# 20: signup welcome email — dispatched via BackgroundTask, best-effort,
+# never blocks or fails signup. TestClient runs BackgroundTasks inline
+# before client.post() returns (same assumption test_public_booking_
+# payment_gate.py's dispatch_booking_notifications tests already rely on),
+# so these assertions run immediately after the request, no waiting needed.
+# ---------------------------------------------------------------------------
+
+WELCOME_SEND_PATH = "app.modules.notifications.service.send_email"
+
+
+def test_successful_signup_triggers_one_welcome_email(db):
+    email = _random_email()
+    with patch(WELCOME_SEND_PATH) as mock_send:
+        resp = client.post(REGISTER_URL, json=_valid_payload(email=email))
+        assert resp.status_code == 201, resp.text
+        mock_send.assert_called_once()
+
+
+def test_welcome_email_addressed_to_new_customer():
+    email = _random_email()
+    with patch(WELCOME_SEND_PATH) as mock_send:
+        resp = client.post(REGISTER_URL, json=_valid_payload(email=email))
+        assert resp.status_code == 201
+        to_email = mock_send.call_args[0][0]
+        assert to_email == email
+
+
+def test_welcome_email_contains_customer_name():
+    with patch(WELCOME_SEND_PATH) as mock_send:
+        resp = client.post(REGISTER_URL, json=_valid_payload(first_name="Grace", last_name="Hopper"))
+        assert resp.status_code == 201
+        args, kwargs = mock_send.call_args
+        body = args[2]
+        html_body = kwargs.get("html_body") or ""
+        assert "Grace Hopper" in body
+        assert "Grace Hopper" in html_body
+
+
+def test_welcome_email_subject_is_exact():
+    with patch(WELCOME_SEND_PATH) as mock_send:
+        resp = client.post(REGISTER_URL, json=_valid_payload())
+        assert resp.status_code == 201
+        subject = mock_send.call_args[0][1]
+        assert subject == "Welcome to Sri Apartment Homestay"
+
+
+def test_welcome_email_login_url_is_production_domain():
+    with patch(WELCOME_SEND_PATH) as mock_send:
+        resp = client.post(REGISTER_URL, json=_valid_payload())
+        assert resp.status_code == 201
+        args, kwargs = mock_send.call_args
+        body = args[2]
+        html_body = kwargs.get("html_body") or ""
+        assert "https://sriapartment.in/login" in body
+        assert "https://sriapartment.in/login" in html_body
+        assert "localhost" not in html_body
+
+
+def test_welcome_email_contains_logo_reference():
+    with patch(WELCOME_SEND_PATH) as mock_send:
+        resp = client.post(REGISTER_URL, json=_valid_payload())
+        assert resp.status_code == 201
+        args, kwargs = mock_send.call_args
+        html_body = kwargs.get("html_body") or ""
+        inline_images = kwargs.get("inline_images") or {}
+        assert "cid:logo" in html_body
+        assert "logo" in inline_images
+
+
+def test_failed_welcome_email_delivery_does_not_roll_back_account(db):
+    email = _random_email()
+    with patch(WELCOME_SEND_PATH, side_effect=OSError("smtp unreachable")):
+        resp = client.post(REGISTER_URL, json=_valid_payload(email=email))
+        assert resp.status_code == 201, resp.text
+
+    account = db.scalar(select(CustomerAccount).where(CustomerAccount.email == email))
+    assert account is not None
+
+
+def test_failed_welcome_email_delivery_does_not_expose_smtp_error_to_customer():
+    email = _random_email()
+    with patch(WELCOME_SEND_PATH, side_effect=OSError("smtp unreachable")):
+        resp = client.post(REGISTER_URL, json=_valid_payload(email=email))
+        assert resp.status_code == 201, resp.text
+        body_text = resp.text.lower()
+        assert "smtp" not in body_text
+        assert "unreachable" not in body_text
+        body = resp.json()
+        assert "detail" not in body  # a real CustomerAccountOut, not an error response
+        assert body["email"] == email
+
+
+def test_duplicate_signup_does_not_send_welcome_email():
+    email = _random_email()
+    with patch(WELCOME_SEND_PATH) as mock_send:
+        first = client.post(REGISTER_URL, json=_valid_payload(email=email))
+        assert first.status_code == 201
+        mock_send.assert_called_once()
+
+        mock_send.reset_mock()
+        second = client.post(REGISTER_URL, json=_valid_payload(email=email))
+        assert second.status_code == 409
+        mock_send.assert_not_called()

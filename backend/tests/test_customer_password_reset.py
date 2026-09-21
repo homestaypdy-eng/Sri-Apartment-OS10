@@ -428,10 +428,16 @@ def test_audit_logs_contain_no_secrets(db):
 def test_dev_mode_never_sends_real_email(db):
     """Defense-in-depth, mirrors test_phone_otp_auth.py's own proof of the
     identical pattern: send_email is patched here specifically to assert
-    it is NEVER CALLED in non-production."""
+    it is NEVER CALLED in non-production.
+
+    _register happens BEFORE the patch is active (same convention the
+    very next test already uses) — registration now also dispatches its
+    own, separately tested, welcome email in the background; patching
+    only around _forgot keeps this assertion scoped to forgot-password's
+    own send behavior, not signup's."""
+    email = _random_email()
+    _register(email)
     with patch("app.modules.notifications.service.send_email") as mock_send:
-        email = _random_email()
-        _register(email)
         resp = _forgot(email)
         assert resp.status_code == 200
         mock_send.assert_not_called()
@@ -466,12 +472,37 @@ def test_production_forgot_password_sends_email_when_configured(monkeypatch, db)
 def test_production_forgot_password_fails_closed_when_smtp_not_configured(monkeypatch):
     """Production's not-configured check runs BEFORE the account lookup —
     identical 501 whether the email is known or unknown, so it can never
-    be used to enumerate accounts."""
+    be used to enumerate accounts. The response body must stay generic:
+    naming SMTP/config state to an anonymous caller is itself a real
+    information leak, the same class this endpoint otherwise avoids by
+    never confirming/denying a submitted email is registered."""
     monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
     monkeypatch.setattr("app.modules.customer_auth.router.settings.smtp_host", "")
 
     resp = _forgot(_random_email())
     assert resp.status_code == 501
+    detail = resp.json()["detail"]
+    assert "SMTP" not in detail
+    assert "email delivery is not configured" not in detail
+    assert detail == "Something went wrong. Please try again later."
+
+
+def test_production_smtp_not_configured_response_identical_across_emails(monkeypatch, db):
+    """Same status + same body regardless of which email was submitted
+    (registered, unregistered, or malformed-but-schema-valid) while SMTP
+    is unavailable — the fix must not introduce any way to distinguish
+    accounts via this response."""
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.smtp_host", "")
+
+    known_email = _random_email()
+    _register(known_email)
+
+    known_resp = _forgot(known_email)
+    unknown_resp = _forgot(_random_email())
+
+    assert known_resp.status_code == unknown_resp.status_code == 501
+    assert known_resp.json() == unknown_resp.json()
 
 
 def test_notification_log_records_reset_email_delivery(monkeypatch, db):
