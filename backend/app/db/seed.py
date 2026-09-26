@@ -28,6 +28,7 @@ from app.modules.payment_gateway.models import GatewayOrder, WebhookEvent, Refun
 from app.modules.ota.models import OTAChannelConfig, OTAListingMapping, OTASyncLog  # noqa: F401
 from app.modules.zotel.models import ZotelRoomMapping, ZotelSyncLog, ZotelSyncRecord  # noqa: F401
 from app.modules.portal.models import GuestRequest  # noqa: F401
+from app.modules.messaging.models import Conversation, ConversationMessage  # noqa: F401
 # Phase 1 of the guest-auth redesign — additive foundation only, not yet
 # wired to any endpoint (see auth_models.py's module docstring).
 from app.modules.portal.auth_models import OtpChallenge, GuestIdentity, GuestSession  # noqa: F401

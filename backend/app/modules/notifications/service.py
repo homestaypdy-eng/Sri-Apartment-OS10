@@ -527,24 +527,18 @@ def _render_booking_notification_html(db: Session, booking: Booking, ctx: dict, 
 </div>"""
 
 
-def trigger_booking_confirmation(db: Session, booking: Booking, pdf_path: str | None = None) -> bool | None:
+def render_booking_confirmation_message(db: Session, booking: Booking) -> dict:
     """
-    Sends the guest their ONE booking confirmation email — branded HTML
-    (logo + the booked unit's actual cover photo, never a hard-coded flat)
-    with the full booking/payment breakdown, plus the invoice PDF attached
-    when pdf_path is given. Booking-finalization audit fix: this used to be
-    a separate plain-text email, with the invoice sent as a SECOND, distinct
-    trigger_invoice_delivery email — the guest now gets exactly one
-    confirmation, matching the "do not send duplicate client confirmation
-    emails" requirement the same way the business owner email already
-    works (see trigger_website_booking_owner_notification). Plain-text
-    fallback still describes the same core facts for any client that can't
-    render the HTML alternative.
+    Pure rendering of the guest's ONE booking confirmation — subject,
+    plain-text body, and branded HTML body — with zero side effects (no
+    send, no log write). Extracted out of trigger_booking_confirmation so
+    the OS10 admin Messages/Booking Details "Confirmation Message" preview
+    can show the guest the EXACT SAME wording the real email uses, instead
+    of a second, competing template that could silently drift from it.
+    Does not require guest.email to be set — the preview must still work
+    before/without one.
     """
     guest = booking.guest
-    if not guest or not guest.email:
-        return None  # nothing to send to — not a failure, just no channel available
-
     invoice = db.scalar(select(Invoice).where(Invoice.booking_id == booking.id))
     ctx = _booking_notification_context(db, booking, invoice)
     unit = ctx["unit"]
@@ -570,10 +564,32 @@ def trigger_booking_confirmation(db: Session, booking: Booking, pdf_path: str | 
         intro_html=f'<p style="text-align:center;color:#2b2b2b;">Hi {guest.name}, thank you for booking directly with us — see your stay details below.</p>',
         cover_photo_path=cover_photo_path,
     )
+    return {"subject": subject, "body": body, "html_body": html_body, "cover_photo_path": cover_photo_path, "ctx": ctx}
+
+
+def trigger_booking_confirmation(db: Session, booking: Booking, pdf_path: str | None = None) -> bool | None:
+    """
+    Sends the guest their ONE booking confirmation email — branded HTML
+    (logo + the booked unit's actual cover photo, never a hard-coded flat)
+    with the full booking/payment breakdown, plus the invoice PDF attached
+    when pdf_path is given. Booking-finalization audit fix: this used to be
+    a separate plain-text email, with the invoice sent as a SECOND, distinct
+    trigger_invoice_delivery email — the guest now gets exactly one
+    confirmation, matching the "do not send duplicate client confirmation
+    emails" requirement the same way the business owner email already
+    works (see trigger_website_booking_owner_notification). Plain-text
+    fallback still describes the same core facts for any client that can't
+    render the HTML alternative.
+    """
+    guest = booking.guest
+    if not guest or not guest.email:
+        return None  # nothing to send to — not a failure, just no channel available
+
+    rendered = render_booking_confirmation_message(db, booking)
     return _log_and_maybe_send(
-        db, "booking_confirmation", guest.email, subject, body, booking_id=booking.id,
-        attachment_path=pdf_path, html_body=html_body,
-        inline_images={"logo": _DEFAULT_LOGO_PATH, "flat_photo": cover_photo_path},
+        db, "booking_confirmation", guest.email, rendered["subject"], rendered["body"], booking_id=booking.id,
+        attachment_path=pdf_path, html_body=rendered["html_body"],
+        inline_images={"logo": _DEFAULT_LOGO_PATH, "flat_photo": rendered["cover_photo_path"]},
     )
 
 

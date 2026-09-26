@@ -33,6 +33,7 @@ const StaffOperationsPage = lazy(() => import("./pages/StaffOperationsPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 const AuditPage = lazy(() => import("./pages/AuditPage"));
 const NotificationsPage = lazy(() => import("./pages/NotificationsPage"));
+const MessagesPage = lazy(() => import("./pages/MessagesPage"));
 const GuestRequestsPage = lazy(() => import("./pages/GuestRequestsPage"));
 const ZotelPage = lazy(() => import("./pages/ZotelPage"));
 const PromoCodesPage = lazy(() => import("./pages/PromoCodesPage"));
@@ -99,6 +100,7 @@ export default function App() {
               <Route path="reports" element={<Suspense fallback={<PageLoading />}><ReportsPage /></Suspense>} />
               <Route path="profit-simulator" element={<Suspense fallback={<PageLoading />}><ProfitSimulatorPage /></Suspense>} />
               <Route path="notifications" element={<Suspense fallback={<PageLoading />}><NotificationsPage /></Suspense>} />
+              <Route path="messages" element={<Suspense fallback={<PageLoading />}><MessagesPage /></Suspense>} />
               <Route path="promo-codes" element={<Suspense fallback={<PageLoading />}><PromoCodesPage /></Suspense>} />
               <Route
                 path="settings"

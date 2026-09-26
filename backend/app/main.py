@@ -29,6 +29,7 @@ from app.modules.housekeeping.router import router as housekeeping_router
 from app.modules.inquiries.router import router as inquiries_router
 from app.modules.inventory.router import router as inventory_router
 from app.modules.maintenance.router import router as maintenance_router
+from app.modules.messaging.router import router as messaging_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.scheduler import start_scheduler, stop_scheduler
 from app.modules.ota.router import router as ota_router
@@ -189,6 +190,7 @@ app.include_router(guest_requests_router)
 app.include_router(public_booking_router)
 app.include_router(promo_admin_router)
 app.include_router(finance_router)
+app.include_router(messaging_router)
 
 
 @app.get("/health")
