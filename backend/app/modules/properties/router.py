@@ -11,7 +11,7 @@ from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
 from app.modules.bookings.schemas import UnitCreate, UnitOut, UnitPricingUpdate, UnitUpdate
-from app.modules.properties.models import LongStayDiscountTier, Property, PropertyFile, SeasonalRate, Unit, UnitPhoto
+from app.modules.properties.models import UNIT_STATUSES, LongStayDiscountTier, Property, PropertyFile, SeasonalRate, Unit, UnitPhoto
 from app.modules.properties.pricing import calculate_price
 from app.modules.properties.schemas import (
     LongStayDiscountTierCreate,
@@ -29,6 +29,7 @@ from app.modules.properties.schemas import (
 from app.modules.notifications.service import trigger_property_created
 from app.shared.file_upload import read_and_validate_upload, IMAGE_CONTENT_TYPES
 from app.shared.rbac import get_current_user, require_role
+from app.shared.availability import lock_unit_for_reservation
 
 router = APIRouter(prefix="/api/v1", tags=["properties"])
 
@@ -187,6 +188,15 @@ def update_unit(unit_id: uuid.UUID, payload: UnitUpdate, db: Session = Depends(g
     if unit is None:
         raise HTTPException(404, "Unit not found")
     changes = payload.model_dump(exclude_unset=True)
+    if "max_occupancy" in changes:
+        # Serialize capacity changes against booking/hold writers, so no
+        # reservation can commit using a stale configured limit.
+        lock_unit_for_reservation(db, unit_id)
+    # Phase 5A: unit.status now drives app.shared.availability directly —
+    # an unvalidated typo here would previously be stored silently and
+    # could make a unit wrongly (un)bookable with no error anywhere.
+    if "status" in changes and changes["status"] not in UNIT_STATUSES:
+        raise HTTPException(400, f"Invalid status '{changes['status']}'. Must be one of: {', '.join(UNIT_STATUSES)}")
     for field, value in changes.items():
         setattr(unit, field, value)
     if changes:

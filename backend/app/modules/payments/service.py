@@ -3,9 +3,10 @@ import os
 import uuid
 
 from fpdf import FPDF
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.payments.models import InvoiceCounter
+from app.modules.payments.models import CreditNote, Invoice, InvoiceCounter, Payment
 
 INVOICE_STORAGE_DIR = os.environ.get("INVOICE_STORAGE_DIR", "/tmp/sri_apartment_invoices")
 os.makedirs(INVOICE_STORAGE_DIR, exist_ok=True)
@@ -146,6 +147,28 @@ def calculate_gst(subtotal: float, tariff_per_night: float, guest_state: str | N
     result["gst_rate_percent"] = gst_rate_percent
     result["itc_available"] = itc_available
     return result
+
+
+def credit_note_gst_breakdown(invoice: Invoice, net_amount: float) -> dict:
+    """
+    Proportional CGST/SGST/IGST breakdown for a credit note against
+    `invoice`, for a given NET (pre-tax, "excluding GST") amount being
+    credited — a partial credit against a part-CGST/SGST invoice reduces
+    each tax component in the same ratio it was originally charged, not
+    just today's rate or a flat split.
+
+    Extracted so there is exactly one place this proportionality rule is
+    computed: both the manual admin "create credit note" endpoint
+    (payments/router.py::create_credit_note) and the automatic
+    cancellation-refund flow (bookings/router.py) call this same function,
+    rather than each having its own copy that could silently drift.
+    """
+    ratio = net_amount / float(invoice.subtotal) if invoice.subtotal else 0
+    cgst = round(float(invoice.cgst) * ratio, 2)
+    sgst = round(float(invoice.sgst) * ratio, 2)
+    igst = round(float(invoice.igst) * ratio, 2)
+    total = round(net_amount + cgst + sgst + igst, 2)
+    return {"cgst": cgst, "sgst": sgst, "igst": igst, "total": total}
 
 
 def generate_invoice_pdf(
@@ -410,6 +433,76 @@ def generate_invoice_pdf(
     return filepath
 
 
+def generate_invoice_pdf_for_booking(db: Session, booking, invoice: Invoice) -> str:
+    """
+    OS10 Phase 3 Step 3A: regenerates the invoice PDF fresh from current
+    database data, rather than depending on a previously-generated file
+    still being present on disk. This is the exact same approach already
+    proven in production by the customer-portal invoice download
+    (portal/router.py::download_my_invoice, unchanged) — extracted here so
+    the staff download endpoint (payments/router.py::download_invoice_pdf)
+    can use the identical logic instead of a second, hand-copied version.
+
+    Closes the read-only Phase 3 storage audit's finding: the staff
+    endpoint used to read Invoice.pdf_path directly via FileResponse, with
+    no os.path.exists() check — a silent 500 once the file is gone (e.g.
+    after a Railway redeploy wiped the ephemeral filesystem it was written
+    to). Every field generate_invoice_pdf() needs is already sourced from
+    Invoice/Booking/Guest/Payment/BusinessSettings/BankSettings rows, so
+    there is nothing about an invoice's content that lives only in the
+    file — regenerating it is not a lossy fallback, it produces the same
+    output the original generation call would.
+
+    invoice_no is read from the existing Invoice row, never re-allocated —
+    this must never call next_invoice_number() or create a new sequential
+    number; it is regenerating a document for an invoice that already
+    exists, not creating a new one.
+    """
+    from app.modules.bookings.models import Guest
+    from app.modules.properties.models import Property, Unit
+    from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
+
+    guest = db.get(Guest, booking.guest_id)
+    unit = db.get(Unit, booking.unit_id)
+    property_ = db.get(Property, unit.property_id) if unit else None
+
+    business_settings = get_or_create_settings(db)
+    bank_settings = get_or_create_bank_settings(db)
+    bank_details = {
+        "bank_name": bank_settings.bank_name,
+        "bank_account_name": bank_settings.bank_account_name,
+        "bank_account_number": bank_settings.bank_account_number,
+        "bank_ifsc": bank_settings.bank_ifsc,
+        "bank_branch": bank_settings.bank_branch,
+        "upi_id": bank_settings.upi_id,
+        "signatory_name": business_settings.signatory_name,
+        "signatory_title": business_settings.signatory_title,
+    }
+
+    payments = db.scalars(select(Payment).where(Payment.booking_id == booking.id)).all()
+    payment_received = round(sum(float(p.amount) for p in payments), 2)
+    balance_due = round(float(invoice.total) - payment_received, 2)
+
+    return generate_invoice_pdf(
+        invoice_no=invoice.invoice_no,
+        property_name=property_.name if property_ else "Sri Apartment Homestay",
+        property_gst_number=property_.gst_number if property_ else None,
+        guest_name=guest.name if guest else "Guest",
+        guest_gst_number=guest.gst_number if guest else None,
+        unit_name=unit.name if unit else "-",
+        check_in=booking.check_in, check_out=booking.check_out, subtotal=float(invoice.subtotal),
+        cgst=float(invoice.cgst), sgst=float(invoice.sgst), igst=float(invoice.igst), total=float(invoice.total),
+        hsn_code=invoice.hsn_code, gst_rate_percent=float(invoice.gst_rate_percent), itc_available=invoice.itc_available,
+        bank_details=bank_details, qr_path=business_settings.qr_code_path,
+        payment_received=payment_received, balance_due=balance_due,
+        guest_phone=guest.phone if guest else None, guest_email=guest.email if guest else None,
+        guest_address=guest.address if guest else None,
+        num_guests=booking.adults + booking.children, rate_per_night=float(booking.rate_applied),
+        payment_mode=payments[-1].mode if payments else None,
+        extra_charges=float(booking.extra_guest_charge),
+    )
+
+
 CREDIT_NOTE_STORAGE_DIR = os.environ.get("CREDIT_NOTE_STORAGE_DIR", "/tmp/sri_apartment_credit_notes")
 os.makedirs(CREDIT_NOTE_STORAGE_DIR, exist_ok=True)
 
@@ -426,10 +519,20 @@ def generate_credit_note_pdf(
     igst: float,
     total: float,
     reason: str,
+    issue_date: dt.date,
 ) -> str:
     """A GST-compliant credit note PDF — references the original invoice
     it reduces, states the reason, and shows the same CGST/SGST/IGST
-    breakdown structure as the invoice it's correcting."""
+    breakdown structure as the invoice it's correcting.
+
+    issue_date is a required, explicit argument (no today()-default) on
+    purpose — OS10 Phase 4 Step 4C: this function is called both at
+    original creation (today's date is correct) and by
+    generate_credit_note_pdf_for_credit_note below when regenerating an
+    already-issued credit note (the ORIGINAL issue date, from
+    CreditNote.issued_at, must be printed — never the regeneration date,
+    or a reprinted document would misstate when the credit was actually
+    issued)."""
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
@@ -446,7 +549,7 @@ def generate_credit_note_pdf(
 
     pdf.cell(0, 6, f"Credit Note No: {credit_note_no}", ln=True)
     pdf.cell(0, 6, f"Against Invoice: {invoice_no}", ln=True)
-    pdf.cell(0, 6, f"Issue Date: {dt.date.today().isoformat()}", ln=True)
+    pdf.cell(0, 6, f"Issue Date: {issue_date.isoformat()}", ln=True)
     pdf.ln(3)
 
     pdf.cell(0, 6, f"Issued To: {guest_name}", ln=True)
@@ -482,3 +585,52 @@ def generate_credit_note_pdf(
     filepath = os.path.join(CREDIT_NOTE_STORAGE_DIR, filename)
     pdf.output(filepath)
     return filepath
+
+
+def generate_credit_note_pdf_for_credit_note(db: Session, credit_note: CreditNote) -> str:
+    """
+    OS10 Phase 4 Step 4C: regenerates a credit note PDF fresh from current
+    database data, the same approach already proven by
+    generate_invoice_pdf_for_booking — so download_credit_note_pdf no
+    longer depends on CreditNote.pdf_path surviving on disk.
+
+    HISTORICAL-INTEGRITY: every financial figure and identifier is read
+    directly from the existing CreditNote row and passed through
+    unchanged — credit_note_no, the invoice reference, amount, cgst, sgst,
+    igst, total, and reason are never recomputed here (recomputing e.g.
+    the GST breakdown from the invoice's CURRENT state could silently
+    diverge from what was actually issued if the invoice changed since).
+    issue_date comes from CreditNote.issued_at (set once, at creation,
+    and never modified) rather than today's date, so a regenerated PDF
+    states the same issue date as the original.
+
+    guest_name and property_name are looked up live (not stored on
+    CreditNote) — this is the same non-snapshot behavior
+    generate_invoice_pdf_for_booking already has for invoices, not a new
+    limitation introduced here.
+    """
+    from app.modules.bookings.models import Booking, Guest
+    from app.modules.properties.models import Property, Unit
+
+    invoice = db.get(Invoice, credit_note.invoice_id)
+    if invoice is None:
+        raise ValueError(f"Credit note {credit_note.id} references a missing invoice {credit_note.invoice_id}")
+    booking = db.get(Booking, invoice.booking_id)
+    guest = db.get(Guest, booking.guest_id) if booking else None
+    unit = db.get(Unit, booking.unit_id) if booking else None
+    property_ = db.get(Property, unit.property_id) if unit else None
+
+    return generate_credit_note_pdf(
+        credit_note_no=credit_note.credit_note_no,
+        invoice_no=invoice.invoice_no,
+        property_name=property_.name if property_ else "Sri Apartment Homestay",
+        property_gst_number=property_.gst_number if property_ else None,
+        guest_name=guest.name if guest else "Guest",
+        amount=float(credit_note.amount),
+        cgst=float(credit_note.cgst),
+        sgst=float(credit_note.sgst),
+        igst=float(credit_note.igst),
+        total=float(credit_note.total),
+        reason=credit_note.reason,
+        issue_date=credit_note.issued_at.date(),
+    )

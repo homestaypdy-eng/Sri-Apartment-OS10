@@ -24,6 +24,7 @@ WHAT'S HONESTLY GATED:
 """
 import hashlib
 import hmac
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from app.core.config import settings
 
@@ -110,3 +111,53 @@ def create_refund(payment_gateway_id: str, amount_rupees: float) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def fetch_payment(razorpay_payment_id: str) -> dict:
+    """Fetch the provider's canonical payment state before booking conversion.
+
+    A valid Checkout signature binds an order ID to a payment ID, but does
+    not by itself prove the payment is captured or that the provider-recorded
+    amount/currency match our hold. Network/API failures intentionally
+    propagate so callers leave the hold unconverted and can retry/reconcile.
+    """
+    if not settings.razorpay_key_id or not settings.razorpay_key_secret:
+        raise GatewayNotConfiguredError(
+            "Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET as environment variables."
+        )
+
+    import requests
+
+    resp = requests.get(
+        f"https://api.razorpay.com/v1/payments/{razorpay_payment_id}",
+        auth=(settings.razorpay_key_id, settings.razorpay_key_secret),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def payment_matches_order(payment: dict, *, order_id: str, amount_rupees: float, currency: str) -> bool:
+    """Validate provider payment fields against the immutable local order."""
+    try:
+        expected_paise = int((Decimal(str(amount_rupees)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        actual_decimal = Decimal(str(payment.get("amount")))
+        if not actual_decimal.is_finite() or actual_decimal != actual_decimal.to_integral_value():
+            return False
+        actual_amount = int(actual_decimal)
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return (
+        payment.get("id") is not None
+        and payment.get("order_id") == order_id
+        and payment.get("status") == "captured"
+        and actual_amount == expected_paise
+        and str(payment.get("currency", "")).upper() == currency.upper()
+    )
+
+
+def verify_provider_payment(razorpay_payment_id: str, *, order_id: str, amount_rupees: float, currency: str) -> bool:
+    payment = fetch_payment(razorpay_payment_id)
+    return payment.get("id") == razorpay_payment_id and payment_matches_order(
+        payment, order_id=order_id, amount_rupees=amount_rupees, currency=currency
+    )

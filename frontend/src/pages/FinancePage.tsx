@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useState, type FormEvent } from "react";
 import {
   api,
   extractErrorMessage,
@@ -13,6 +13,7 @@ import {
   type DailyCashbook,
   type DailyClosingOut,
   type ExpenseOut,
+  type ExpensePaymentOut,
   type GstDashboardReport,
   type IncomeRegister,
   type LaundryEntryOut,
@@ -87,7 +88,7 @@ export default function FinancePage() {
             key={t.key}
             onClick={() => setTab(t.key)}
             className={`px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 -mb-px ${
-              tab === t.key ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400 hover:text-slate-600"
+              tab === t.key ? "border-brand-green text-brand-green" : "border-transparent text-slate-400 hover:text-slate-600"
             }`}
           >
             {t.label}
@@ -107,7 +108,7 @@ export default function FinancePage() {
       {tab === "commissions" && <CommissionsTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "outstanding" && <OutstandingTab setError={setError} setSuccess={setSuccess} />}
       {tab === "cashflow" && <CashFlowTab setError={setError} />}
-      {tab === "expenses" && <ExpensesTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
+      {tab === "expenses" && <ExpensesTab isAdmin={isAdmin} isManager={isManager} setError={setError} setSuccess={setSuccess} />}
       {tab === "budget" && <BudgetTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "utility" && <UtilityTab setError={setError} setSuccess={setSuccess} />}
       {tab === "purchases" && <PurchasesTab setError={setError} setSuccess={setSuccess} />}
@@ -1362,10 +1363,10 @@ function UtilityTab({ setError, setSuccess }: { setError: (e: string | null) => 
           {totalAmount > 0 && <p className="text-xs text-slate-500">Bill total: <span className="font-semibold text-slate-800">₹{totalAmount.toLocaleString()}</span></p>}
 
           <div className="flex gap-2 pt-2 border-t border-slate-100">
-            <button type="button" onClick={() => setBillingMode("single")} className={`flex-1 rounded-lg border px-3 py-1.5 text-xs font-medium ${billingMode === "single" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 text-slate-600"}`}>
+            <button type="button" onClick={() => setBillingMode("single")} className={`flex-1 rounded-lg border px-3 py-1.5 text-xs font-medium ${billingMode === "single" ? "border-brand-green bg-brand-green text-white" : "border-slate-300 text-slate-600"}`}>
               Single Apartment
             </button>
-            <button type="button" onClick={() => setBillingMode("split")} className={`flex-1 rounded-lg border px-3 py-1.5 text-xs font-medium ${billingMode === "split" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 text-slate-600"}`}>
+            <button type="button" onClick={() => setBillingMode("split")} className={`flex-1 rounded-lg border px-3 py-1.5 text-xs font-medium ${billingMode === "split" ? "border-brand-green bg-brand-green text-white" : "border-slate-300 text-slate-600"}`}>
               Split Across Apartments
             </button>
           </div>
@@ -1381,7 +1382,7 @@ function UtilityTab({ setError, setSuccess }: { setError: (e: string | null) => 
             <div className="space-y-3">
               <div className="flex gap-2">
                 {(["equal", "percentage", "manual"] as const).map((m) => (
-                  <button key={m} type="button" onClick={() => setSplitMode(m)} className={`flex-1 rounded-lg border px-3 py-1.5 text-xs font-medium capitalize ${splitMode === m ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 text-slate-600"}`}>
+                  <button key={m} type="button" onClick={() => setSplitMode(m)} className={`flex-1 rounded-lg border px-3 py-1.5 text-xs font-medium capitalize ${splitMode === m ? "border-brand-green bg-brand-green text-white" : "border-slate-300 text-slate-600"}`}>
                     {m}
                   </button>
                 ))}
@@ -1610,7 +1611,7 @@ function ExportButtons({ report, params }: { report: string; params?: Record<str
 // --- Expenses (search, filter, sort, bulk approval) ---
 type ExpenseSortKey = "expense_date" | "amount" | "category";
 
-function ExpensesTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+function ExpensesTab({ isAdmin, isManager, setError, setSuccess }: { isAdmin: boolean; isManager: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [expenses, setExpenses] = useState<ExpenseOut[]>([]);
   const [units, setUnits] = useState<UnitOut[]>([]);
   const [search, setSearch] = useState("");
@@ -1621,7 +1622,16 @@ function ExpensesTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setE
   const [sortKey, setSortKey] = useState<ExpenseSortKey>("expense_date");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [form, setForm] = useState({ category: "electricity", amount: "", expense_date: todayStr(), unit_id: "", notes: "" });
+  const [paymentTarget, setPaymentTarget] = useState<ExpenseOut | null>(null);
+  const [paymentIdempotencyKey, setPaymentIdempotencyKey] = useState<string | null>(null);
+  const [paymentSubmitting, setPaymentSubmitting] = useState(false);
+  const [paymentForm, setPaymentForm] = useState({ amount: "", payment_date: todayStr(), payment_method: "cash" as ExpensePaymentOut["payment_method"], reference_no: "" });
+  const [expandedPaymentsFor, setExpandedPaymentsFor] = useState<string | null>(null);
+  const [paymentHistory, setPaymentHistory] = useState<ExpensePaymentOut[]>([]);
+  const canRecordPayments = isAdmin || isManager;
+  const [form, setForm] = useState({ category: "electricity", amount: "", expense_date: todayStr(), unit_id: "", notes: "", approval_status: "approved" });
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState({ category: "", amount: "", expense_date: "", unit_id: "", notes: "" });
 
   async function load() {
     try {
@@ -1674,6 +1684,53 @@ function ExpensesTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setE
   function sortIndicator(key: ExpenseSortKey) {
     if (sortKey !== key) return "";
     return sortDir === "asc" ? " ▲" : " ▼";
+  }
+
+  function beginPayment(expense: ExpenseOut) {
+    setPaymentTarget(expense);
+    setPaymentIdempotencyKey(crypto.randomUUID());
+    setPaymentForm({ amount: expense.remaining_amount.toFixed(2), payment_date: todayStr(), payment_method: "cash", reference_no: "" });
+  }
+
+  async function togglePaymentHistory(expense: ExpenseOut) {
+    if (expandedPaymentsFor === expense.id) {
+      setExpandedPaymentsFor(null);
+      return;
+    }
+    try {
+      const { data } = await api.get<ExpensePaymentOut[]>(`/finance/expenses/${expense.id}/payments`);
+      setPaymentHistory(data);
+      setExpandedPaymentsFor(expense.id);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function submitExpensePayment(e: FormEvent) {
+    e.preventDefault();
+    if (!paymentTarget || !paymentIdempotencyKey || paymentSubmitting) return;
+    setError(null);
+    setPaymentSubmitting(true);
+    try {
+      await api.post(`/finance/expenses/${paymentTarget.id}/payments`, {
+        amount: paymentForm.amount,
+        payment_date: paymentForm.payment_date,
+        payment_method: paymentForm.payment_method,
+        reference_no: paymentForm.reference_no || null,
+      }, { headers: { "Idempotency-Key": paymentIdempotencyKey } });
+      setSuccess("Expense payment recorded.");
+      setPaymentTarget(null);
+      setPaymentIdempotencyKey(null);
+      await load();
+      if (expandedPaymentsFor === paymentTarget.id) {
+        const { data } = await api.get<ExpensePaymentOut[]>(`/finance/expenses/${paymentTarget.id}/payments`);
+        setPaymentHistory(data);
+      }
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    } finally {
+      setPaymentSubmitting(false);
+    }
   }
 
   function toggleSelect(id: string) {
@@ -1729,9 +1786,39 @@ function ExpensesTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setE
       await api.post("/finance/expenses", {
         category: form.category, amount: Number(form.amount), expense_date: form.expense_date,
         unit_id: form.unit_id || undefined, notes: form.notes || undefined,
+        approval_status: form.approval_status,
       });
       setSuccess("Expense recorded.");
       setForm({ ...form, amount: "", notes: "" });
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  function beginEdit(expense: ExpenseOut) {
+    setEditingId(expense.id);
+    setEditForm({ category: expense.category, amount: String(expense.amount), expense_date: expense.expense_date, unit_id: expense.unit_id ?? "", notes: expense.notes ?? "" });
+  }
+
+  async function handleEdit(e: FormEvent) {
+    e.preventDefault();
+    if (!editingId) return;
+    try {
+      await api.patch(`/finance/expenses/${editingId}`, { ...editForm, amount: Number(editForm.amount), unit_id: editForm.unit_id || null, notes: editForm.notes || null });
+      setEditingId(null);
+      setSuccess("Pending expense updated.");
+      load();
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleDelete(expense: ExpenseOut) {
+    if (!window.confirm(`Delete pending expense “${expense.category}” for ₹${expense.amount}?`)) return;
+    try {
+      await api.delete(`/finance/expenses/${expense.id}`);
+      setSuccess("Pending expense deleted.");
       load();
     } catch (err) {
       setError(extractErrorMessage(err));
@@ -1762,7 +1849,48 @@ function ExpensesTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setE
               {units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
             </select>
             <input placeholder="Notes (optional)" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <select value={form.approval_status} onChange={(e) => setForm({ ...form, approval_status: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+              <option value="approved">Record as approved (historical expense)</option>
+              <option value="pending">Submit for approval</option>
+            </select>
             <Button type="submit">Record Expense</Button>
+          </form>
+        </Card>
+      )}
+
+      {isAdmin && editingId && (
+        <Card className="mb-6 max-w-lg">
+          <h2 className="text-sm font-semibold text-slate-900 mb-4">Edit Pending Expense</h2>
+          <form onSubmit={handleEdit} className="space-y-3">
+            <input required maxLength={50} value={editForm.category} onChange={(e) => setEditForm({ ...editForm, category: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <div className="grid grid-cols-2 gap-3">
+              <input required min="0.01" step="0.01" type="number" value={editForm.amount} onChange={(e) => setEditForm({ ...editForm, amount: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+              <input required type="date" value={editForm.expense_date} onChange={(e) => setEditForm({ ...editForm, expense_date: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            </div>
+            <select value={editForm.unit_id} onChange={(e) => setEditForm({ ...editForm, unit_id: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+              <option value="">Central / shared expense</option>
+              {units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
+            <input value={editForm.notes} onChange={(e) => setEditForm({ ...editForm, notes: e.target.value })} placeholder="Notes (optional)" className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <div className="flex gap-2"><Button type="submit">Save Changes</Button><Button type="button" variant="secondary" onClick={() => setEditingId(null)}>Cancel</Button></div>
+          </form>
+        </Card>
+      )}
+
+      {canRecordPayments && paymentTarget && (
+        <Card className="mb-6 max-w-lg">
+          <h2 className="text-sm font-semibold text-slate-900 mb-3">Record Expense Payment — {paymentTarget.category}</h2>
+          <p className="text-xs text-slate-500 mb-3">Remaining balance: ₹{paymentTarget.remaining_amount.toLocaleString()}</p>
+          <form onSubmit={submitExpensePayment} className="space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <input required type="number" min="0.01" step="0.01" max={paymentTarget.remaining_amount} value={paymentForm.amount} onChange={(e) => setPaymentForm({ ...paymentForm, amount: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" aria-label="Payment amount" />
+              <input required type="date" value={paymentForm.payment_date} onChange={(e) => setPaymentForm({ ...paymentForm, payment_date: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" aria-label="Payment date" />
+            </div>
+            <select value={paymentForm.payment_method} onChange={(e) => setPaymentForm({ ...paymentForm, payment_method: e.target.value as ExpensePaymentOut["payment_method"] })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+              <option value="cash">Cash</option><option value="bank_transfer">Bank Transfer</option><option value="upi">UPI</option><option value="card">Card</option><option value="cheque">Cheque</option>
+            </select>
+            <input maxLength={100} placeholder="Reference number (optional)" value={paymentForm.reference_no} onChange={(e) => setPaymentForm({ ...paymentForm, reference_no: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <div className="flex gap-2"><Button type="submit" disabled={paymentSubmitting}>{paymentSubmitting ? "Recording…" : "Record Payment"}</Button><Button type="button" variant="secondary" disabled={paymentSubmitting} onClick={() => { setPaymentTarget(null); setPaymentIdempotencyKey(null); }}>Cancel</Button></div>
           </form>
         </Card>
       )}
@@ -1818,14 +1946,18 @@ function ExpensesTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setE
                   <th className="py-2 pr-4 cursor-pointer select-none" onClick={() => toggleSort("category")}>Category{sortIndicator("category")}</th>
                   <th className="py-2 pr-4">Apartment</th>
                   <th className="py-2 pr-4 cursor-pointer select-none" onClick={() => toggleSort("amount")}>Amount{sortIndicator("amount")}</th>
+                  <th className="py-2 pr-4">Paid</th>
+                  <th className="py-2 pr-4">Remaining</th>
+                  <th className="py-2 pr-4">Payment</th>
                   <th className="py-2 pr-4">Status</th>
                   <th className="py-2 pr-4">Notes</th>
-                  {isAdmin && <th className="py-2">Actions</th>}
+                  {(isAdmin || isManager) && <th className="py-2">Actions</th>}
                 </tr>
               </thead>
               <tbody>
                 {filtered.map((e) => (
-                  <tr key={e.id} className="border-b border-slate-50">
+                  <Fragment key={e.id}>
+                  <tr className="border-b border-slate-50">
                     {isAdmin && (
                       <td className="py-2 pr-2">
                         <input type="checkbox" checked={selected.has(e.id)} onChange={() => toggleSelect(e.id)} />
@@ -1835,19 +1967,40 @@ function ExpensesTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setE
                     <td className="py-2 pr-4 font-medium text-slate-800">{e.category}</td>
                     <td className="py-2 pr-4 text-slate-500">{unitName(e.unit_id)}</td>
                     <td className="py-2 pr-4 text-slate-500">₹{e.amount.toLocaleString()}</td>
+                    <td className="py-2 pr-4 text-slate-500">₹{e.paid_amount.toLocaleString()}</td>
+                    <td className="py-2 pr-4 text-slate-500">₹{e.remaining_amount.toLocaleString()}</td>
+                    <td className="py-2 pr-4"><Badge tone={e.payment_status === "paid" ? "green" : e.payment_status === "partially_paid" ? "amber" : "slate"}>{e.payment_status.replace("_", " ")}</Badge></td>
                     <td className="py-2 pr-4"><Badge tone={approvalTone(e.approval_status)}>{e.approval_status}</Badge></td>
                     <td className="py-2 pr-4 text-slate-400 max-w-[200px] truncate">{e.notes ?? "—"}</td>
-                    {isAdmin && (
+                    {(isAdmin || isManager) && (
                       <td className="py-2 space-x-2 whitespace-nowrap">
+                        <button onClick={() => togglePaymentHistory(e)} className="text-xs text-slate-700 hover:underline">{expandedPaymentsFor === e.id ? "Hide payments" : "Payments"}</button>
+                        {canRecordPayments && e.remaining_amount > 0 && <button onClick={() => beginPayment(e)} className="text-xs text-sky-700 hover:underline">Record payment</button>}
+                        {isAdmin && <>
                         {e.approval_status !== "approved" && (
                           <button onClick={() => handleSingleAction(e.id, true)} className="text-xs text-emerald-600 hover:underline">Approve</button>
                         )}
                         {e.approval_status !== "rejected" && (
                           <button onClick={() => handleSingleAction(e.id, false)} className="text-xs text-red-500 hover:underline">Reject</button>
                         )}
+                        {e.approval_status === "pending" && <button onClick={() => beginEdit(e)} className="text-xs text-sky-700 hover:underline">Edit</button>}
+                        {e.approval_status === "pending" && <button onClick={() => handleDelete(e)} className="text-xs text-red-700 hover:underline">Delete</button>}
+                        </>}
                       </td>
                     )}
                   </tr>
+                  {expandedPaymentsFor === e.id && (
+                    <tr className="bg-slate-50">
+                      <td colSpan={(isAdmin ? 1 : 0) + 9 + ((isAdmin || isManager) ? 1 : 0)} className="p-3">
+                        {paymentHistory.length === 0 ? <span className="text-xs text-slate-500">No payments recorded.</span> : (
+                          <div className="space-y-1">{paymentHistory.map((payment) => (
+                            <p key={payment.id} className="text-xs text-slate-600">{payment.payment_date} · ₹{payment.amount.toLocaleString()} · {payment.payment_method.replace("_", " ")}{payment.reference_no ? ` · Ref ${payment.reference_no}` : ""}{payment.created_by_name ? ` · ${payment.created_by_name}` : ""}</p>
+                          ))}</div>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>

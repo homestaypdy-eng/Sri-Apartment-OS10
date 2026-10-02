@@ -36,6 +36,15 @@ class Property(Base):
 # stored as-is, never rejected.
 UNIT_TYPES = ("apartment", "villa", "suite", "room", "cottage", "resort", "other")
 
+# Unlike UNIT_TYPES above, this IS enforced (Phase 5A) — app.shared.availability
+# and every booking-creation path branch on unit.status being exactly one of
+# these three, so an unvalidated typo here would silently make a unit
+# unbookable (or worse, leave it bookable when it shouldn't be) with no
+# error surfaced anywhere. Validated at the app layer (properties/router.py's
+# update_unit), not a DB CHECK constraint — same pattern as
+# maintenance.models.TICKET_STATUSES/TICKET_PRIORITIES.
+UNIT_STATUSES = ("available", "maintenance", "blocked")
+
 
 class Unit(Base):
     __tablename__ = "units"

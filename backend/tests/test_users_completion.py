@@ -140,7 +140,7 @@ def test_forgot_password_smtp_unconfigured_unknown_email_matches_known_email_res
     assert known_resp.json() == unknown_resp.json()
 
 
-@patch("smtplib.SMTP")
+@patch("app.modules.notifications.service._PreferIPv6SMTP")
 def test_forgot_password_logs_delivery_failure_without_exposing_token(mock_smtp_class, headers, caplog):
     """
     SMTP is configured, but the actual send raises smtplib.SMTPException —
@@ -149,6 +149,12 @@ def test_forgot_password_logs_delivery_failure_without_exposing_token(mock_smtp_
     enumeration), the token must still exist (it was created before the
     send attempt), the failure must be logged, and neither the raw token
     nor its hash may appear anywhere in the logged message.
+
+    Patches notifications.service._PreferIPv6SMTP (the class send_email()
+    actually constructs) rather than smtplib.SMTP directly: _PreferIPv6SMTP
+    only overrides _get_socket and is referenced by its own name at the
+    call site, so patching the base class name no longer reaches it — see
+    that class's own docstring for the full reasoning.
     """
     from app.modules.auth import router as auth_router
 

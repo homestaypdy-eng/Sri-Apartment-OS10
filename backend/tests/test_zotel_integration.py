@@ -513,8 +513,17 @@ def test_sync_propagates_zotel_cancellation_to_still_confirmed_os10_booking(head
              patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="created")):
             zotel_service.sync_bookings(db)
 
+        # OS10 Phase 2B: a propagated cancellation now dispatches
+        # notifications (cancellation_service.cancel_booking ->
+        # dispatch_cancellation_notifications) — mocked here, same
+        # required pattern as test_public_booking_payment_gate.py uses for
+        # its own notification-reaching paths, since this container's live
+        # EMAIL_PROVIDER=resend has a real key.
         with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
-             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="cancelled")):
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="cancelled")), \
+             patch("app.modules.notifications.service.send_email", return_value=None), \
+             patch("app.modules.notifications.service.send_whatsapp", return_value=None), \
+             patch("app.modules.notifications.service.send_sms", return_value=None):
             second_run = zotel_service.sync_bookings(db)
 
         assert second_run.records_updated == 1

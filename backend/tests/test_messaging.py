@@ -46,14 +46,14 @@ def headers():
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
-def _make_available_unit(headers, base_rate=2000):
+def _make_available_unit(headers, base_rate=2000, max_occupancy=2):
     prop = client.post(
         "/api/v1/properties", headers=headers,
         json={"name": f"MsgTest {uuid.uuid4().hex[:6]}", "address": "Test", "state_code": "34"},
     ).json()
     unit = client.post(
         "/api/v1/units", headers=headers,
-        json={"property_id": prop["id"], "name": f"UMsgTest {uuid.uuid4().hex[:6]}", "base_rate": base_rate},
+        json={"property_id": prop["id"], "name": f"UMsgTest {uuid.uuid4().hex[:6]}", "base_rate": base_rate, "max_occupancy": max_occupancy},
     ).json()
     return unit["id"]
 
@@ -62,7 +62,7 @@ def _make_confirmed_booking(headers, adults, check_in_offset=200):
     """Real hold -> real payment-verified -> real confirmed Booking, same
     proven path test_public_booking_payment_gate.py already uses — not a
     second, parallel way of faking a confirmed booking."""
-    unit_id = _make_available_unit(headers)
+    unit_id = _make_available_unit(headers, max_occupancy=max(2, adults))
     check_in = date.today() + timedelta(days=check_in_offset)
     check_out = check_in + timedelta(days=2)
     phone = f"90{uuid.uuid4().int % 10**8:08d}"

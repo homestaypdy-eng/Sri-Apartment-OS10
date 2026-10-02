@@ -12,13 +12,14 @@ Kept entirely separate from BOTH existing auth surfaces:
     "manager", so it can never satisfy any existing RBAC check.
 
   - app.modules.portal.auth_models (booking-side guest identity/session:
-    GuestIdentity/GuestSession) — a CustomerAccount has no booking access
-    of its own by construction. Nothing in this file links it to a Guest,
-    and no endpoint exists yet (Phase 3B+) that would. Any future linking
-    must be a deliberate action (mirroring Phase 2A's admin-only
-    GuestIdentity-linking endpoint), never an automatic email match.
+    GuestIdentity/GuestSession) — these sessions remain independent from
+    customer sessions. CustomerAccount now has a deliberate nullable
+    guest_id association for Main Guest identity verification; it is
+    resolved server-side only from verified, unambiguous contact evidence,
+    never from a caller-supplied id or name match.
 
-Three tables:
+CustomerAccount, CustomerSession, CustomerPasswordResetToken, and
+CustomerLoginOtpChallenge are dedicated customer-auth tables:
 
   CustomerAccount — one row per self-service registered customer.
                     password_hash uses the SAME argon2 CryptContext as
@@ -84,6 +85,7 @@ class CustomerAccount(Base):
         # in the additive migration) so a completely fresh database created
         # via create_all() ends up with the identical constraint.
         Index("ix_customer_accounts_phone_unique", "phone", unique=True, postgresql_where=text("phone IS NOT NULL")),
+        Index("ux_customer_accounts_guest_id", "guest_id", unique=True, postgresql_where=text("guest_id IS NOT NULL")),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -104,6 +106,13 @@ class CustomerAccount(Base):
     # Unique via a partial index (WHERE phone IS NOT NULL) rather than a
     # plain unique column, so multiple legacy NULLs remain legal.
     phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    phone_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Explicit, durable association to the booking-side Guest record.
+    # This is never inferred from a name or an unverified contact value;
+    # customer_auth.identity_service owns the verified/unambiguous linking
+    # rule. A partial unique index makes this one-to-one while preserving
+    # all existing accounts as unlinked until a customer completes that flow.
+    guest_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("guests.id"), nullable=True)
     # Argon2 via app.core.security.pwd_context — the exact CryptContext
     # staff passwords already use. Never a raw/plaintext password.
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)

@@ -1,12 +1,14 @@
 import os
+import json
+import hashlib
 import uuid
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
@@ -30,6 +32,7 @@ from app.modules.finance.models import (
     DailyClosing,
     Expense,
     ExpenseAttachment,
+    ExpensePayment,
     LaundryEntry,
     Loan,
     LoanEmiPayment,
@@ -57,6 +60,9 @@ from app.modules.finance.schemas import (
     BulkApprovalResult,
     ExpenseCreate,
     ExpenseOut,
+    ExpenseUpdate,
+    ExpensePaymentCreate,
+    ExpensePaymentOut,
     GstDashboardReport,
     IncomeRegister,
     LaundryEntryCreate,
@@ -100,15 +106,57 @@ def _default_range(date_from: date | None, date_to: date | None) -> tuple[date, 
     return today.replace(day=1), today
 
 
+def _expense_values(expense: Expense) -> dict[str, str | None]:
+    """Stable audit representation; excludes actor/session/attachment data."""
+    return {
+        "category": expense.category,
+        "amount": str(expense.amount),
+        "expense_date": expense.expense_date.isoformat(),
+        "unit_id": str(expense.unit_id) if expense.unit_id else None,
+        "notes": expense.notes,
+        "approval_status": expense.approval_status,
+    }
+
+
+def _expense_paid_amount(db: Session, expense_id: uuid.UUID):
+    return db.scalar(
+        select(func.coalesce(func.sum(ExpensePayment.amount), 0)).where(ExpensePayment.expense_id == expense_id)
+    )
+
+
+def _expense_payment_fingerprint(expense_id: uuid.UUID, payload: ExpensePaymentCreate) -> str:
+    canonical = {
+        "expense_id": str(expense_id),
+        "amount": format(payload.amount, ".2f"),
+        "payment_date": payload.payment_date.isoformat(),
+        "payment_method": payload.payment_method,
+        "reference_no": payload.reference_no,
+    }
+    serialized = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _payment_for_idempotency_key(db: Session, key: str, fingerprint: str) -> ExpensePayment | None:
+    existing = db.scalar(select(ExpensePayment).where(ExpensePayment.idempotency_key == key))
+    if existing is not None and existing.request_fingerprint != fingerprint:
+        raise HTTPException(409, "Idempotency key was already used for a different payment")
+    return existing
+
+
 @router.post("/expenses", response_model=ExpenseOut, status_code=201, dependencies=[Depends(require_role("admin"))])
 def create_expense(payload: ExpenseCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    if not payload.category or not payload.category.strip():
-        raise HTTPException(400, "category cannot be empty")
     expense = Expense(**payload.model_dump(), created_by=user.id)
     db.add(expense)
     db.flush()
-    record_audit_log(db, user.id, "finance.expense.create", entity_type="expense", entity_id=str(expense.id), details=f"{payload.category}: Rs.{payload.amount} on {payload.expense_date}")
-    db.commit()
+    record_audit_log(
+        db, user.id, "finance.expense.create", entity_type="expense", entity_id=str(expense.id),
+        details="Expense created", new_value=json.dumps(_expense_values(expense), sort_keys=True),
+    )
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(expense)
     return expense
 
@@ -125,19 +173,35 @@ def list_expense_categories(db: Session = Depends(get_db)):
 
 @router.post("/expenses/{expense_id}/approval", response_model=ExpenseOut, dependencies=[Depends(require_role("admin"))])
 def approve_or_reject_expense(expense_id: uuid.UUID, payload: ExpenseApprovalAction, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    expense = db.get(Expense, expense_id)
+    expense = db.scalar(select(Expense).where(Expense.id == expense_id).with_for_update())
     if expense is None:
         raise HTTPException(404, "Expense not found")
 
-    expense.approval_status = "approved" if payload.approve else "rejected"
+    target_status = "approved" if payload.approve else "rejected"
+    if expense.approval_status == target_status:
+        return expense
+    if expense.approval_status != "pending":
+        raise HTTPException(409, "Only pending expenses can be approved or rejected")
+
+    old_values = _expense_values(expense)
+    expense.approval_status = target_status
     expense.approved_by = user.id
     expense.approved_at = datetime.now(timezone.utc)
     if payload.notes:
-        expense.notes = f"{expense.notes or ''}\n[{'Approved' if payload.approve else 'Rejected'}] {payload.notes}".strip()
+        expense.notes = f"{expense.notes or ''}\n[{target_status.capitalize()}] {payload.notes}".strip()
 
-    record_audit_log(db, user.id, "finance.expense.approval", entity_type="expense", entity_id=str(expense.id), details=f"{expense.approval_status}: {payload.notes or 'no notes'}")
+    record_audit_log(
+        db, user.id, f"finance.expense.{target_status}", entity_type="expense", entity_id=str(expense.id),
+        details=payload.notes or f"Expense {target_status}",
+        previous_value=json.dumps(old_values, sort_keys=True),
+        new_value=json.dumps(_expense_values(expense), sort_keys=True),
+    )
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     trigger_expense_approval(db, expense, payload.approve)
-    db.commit()
     db.refresh(expense)
     return expense
 
@@ -151,26 +215,112 @@ def bulk_approve_or_reject_expenses(payload: BulkExpenseApprovalAction, db: Sess
     silently different from doing the same thing one at a time.
     """
     new_status = "approved" if payload.approve else "rejected"
+    expenses = {}
+    for expense_id in sorted(set(payload.expense_ids), key=str):
+        expense = db.scalar(select(Expense).where(Expense.id == expense_id).with_for_update())
+        if expense is not None:
+            expenses[expense_id] = expense
+    invalid = [e for e in expenses.values() if e.approval_status not in ("pending", new_status)]
+    if invalid:
+        raise HTTPException(409, "Only pending expenses can be approved or rejected")
+
     found_ids = set()
     for expense_id in payload.expense_ids:
-        expense = db.get(Expense, expense_id)
+        expense = expenses.get(expense_id)
         if expense is None:
             continue
         found_ids.add(expense_id)
+        if expense.approval_status == new_status:
+            continue
+        old_values = _expense_values(expense)
         expense.approval_status = new_status
         expense.approved_by = user.id
         expense.approved_at = datetime.now(timezone.utc)
         if payload.notes:
-            expense.notes = f"{expense.notes or ''}\n[{'Approved' if payload.approve else 'Rejected'}] {payload.notes}".strip()
-        record_audit_log(db, user.id, "finance.expense.approval", entity_type="expense", entity_id=str(expense.id), details=f"{new_status} (bulk): {payload.notes or 'no notes'}")
+            expense.notes = f"{expense.notes or ''}\n[{new_status.capitalize()}] {payload.notes}".strip()
+        record_audit_log(
+            db, user.id, f"finance.expense.{new_status}", entity_type="expense", entity_id=str(expense.id),
+            details=payload.notes or f"Expense {new_status} (bulk)",
+            previous_value=json.dumps(old_values, sort_keys=True),
+            new_value=json.dumps(_expense_values(expense), sort_keys=True),
+        )
 
     not_found = [eid for eid in payload.expense_ids if eid not in found_ids]
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {
         "approved_count": len(found_ids) if payload.approve else 0,
         "rejected_count": len(found_ids) if not payload.approve else 0,
         "not_found_ids": not_found,
     }
+
+
+@router.patch("/expenses/{expense_id}", response_model=ExpenseOut, dependencies=[Depends(require_role("admin"))])
+def update_expense(expense_id: uuid.UUID, payload: ExpenseUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    expense = db.scalar(select(Expense).where(Expense.id == expense_id).with_for_update())
+    if expense is None:
+        raise HTTPException(404, "Expense not found")
+    if expense.approval_status != "pending":
+        raise HTTPException(409, "Only pending expenses can be edited")
+    paid_amount = _expense_paid_amount(db, expense_id)
+    if payload.amount < paid_amount:
+        raise HTTPException(409, "Expense amount cannot be less than the amount already paid")
+    old_values = _expense_values(expense)
+    for field, value in payload.model_dump().items():
+        setattr(expense, field, value)
+    new_values = _expense_values(expense)
+    if old_values != new_values:
+        record_audit_log(
+            db, user.id, "finance.expense.edit", entity_type="expense", entity_id=str(expense.id),
+            details="Pending expense edited", previous_value=json.dumps(old_values, sort_keys=True),
+            new_value=json.dumps(new_values, sort_keys=True),
+        )
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(expense)
+    return expense
+
+
+@router.delete("/expenses/{expense_id}", status_code=204, dependencies=[Depends(require_role("admin"))])
+def delete_expense(expense_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    expense = db.scalar(select(Expense).where(Expense.id == expense_id).with_for_update())
+    if expense is None:
+        # Idempotent retry: the intended pending record is already absent.
+        return None
+    if expense.approval_status != "pending":
+        raise HTTPException(409, "Only pending expenses can be deleted")
+    if db.scalar(select(ExpensePayment.id).where(ExpensePayment.expense_id == expense_id).limit(1)) is not None:
+        raise HTTPException(409, "An expense with recorded payments cannot be deleted")
+    previous = json.dumps(_expense_values(expense), sort_keys=True)
+    attachments = db.scalars(select(ExpenseAttachment).where(ExpenseAttachment.expense_id == expense_id)).all()
+    for attachment in attachments:
+        db.delete(attachment)
+    record_audit_log(
+        db, user.id, "finance.expense.delete", entity_type="expense", entity_id=str(expense.id),
+        details="Pending expense deleted", previous_value=previous,
+    )
+    db.delete(expense)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    for attachment in attachments:
+        try:
+            os.remove(attachment.file_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Keep the financial deletion committed; orphan cleanup is an
+            # operational concern and must not cause a false API failure.
+            pass
+    return None
 
 
 @router.post("/expenses/{expense_id}/attachments", response_model=ExpenseAttachmentOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
@@ -232,7 +382,102 @@ def list_expenses(
     if date_to:
         query = query.where(Expense.expense_date <= date_to)
     query = query.offset(offset).limit(limit)
-    return db.scalars(query).all()
+    return db.scalars(query.options(selectinload(Expense.payments))).all()
+
+
+@router.post(
+    "/expenses/{expense_id}/payments",
+    response_model=ExpensePaymentOut,
+    status_code=201,
+    dependencies=[Depends(require_role("admin", "manager"))],
+)
+def record_expense_payment(
+    expense_id: uuid.UUID,
+    payload: ExpensePaymentCreate,
+    response: Response,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not 16 <= len(idempotency_key) <= 128 or any(ord(char) < 33 or ord(char) > 126 for char in idempotency_key):
+        raise HTTPException(400, "Idempotency-Key must be 16–128 printable characters")
+    fingerprint = _expense_payment_fingerprint(expense_id, payload)
+    # Lock the parent row first. Every payment writer for this expense must
+    # acquire this lock before summing, which serializes concurrent attempts.
+    expense = db.scalar(select(Expense).where(Expense.id == expense_id).with_for_update())
+    if expense is None:
+        raise HTTPException(404, "Expense not found")
+
+    existing = _payment_for_idempotency_key(db, idempotency_key, fingerprint)
+    if existing is not None:
+        response.status_code = 200
+        return existing
+
+    paid_amount = _expense_paid_amount(db, expense_id)
+    remaining_amount = expense.amount - paid_amount
+    if payload.amount > remaining_amount:
+        raise HTTPException(409, "Payment exceeds the remaining expense balance")
+
+    payment = ExpensePayment(
+        expense_id=expense_id,
+        amount=payload.amount,
+        payment_date=payload.payment_date,
+        payment_method=payload.payment_method,
+        reference_no=payload.reference_no,
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+        created_by=user.id,
+    )
+    db.add(payment)
+    try:
+        db.flush()
+        record_audit_log(
+            db,
+            user.id,
+            "finance.expense.payment.create",
+            entity_type="expense_payment",
+            entity_id=str(payment.id),
+            details=f"Expense {expense_id}: Rs.{payload.amount} via {payload.payment_method} on {payload.payment_date}",
+            new_value=json.dumps({
+                "expense_id": str(expense_id),
+                "payment_id": str(payment.id),
+                "amount": str(payload.amount),
+                "payment_method": payload.payment_method,
+                "payment_date": payload.payment_date.isoformat(),
+                "reference_no": payload.reference_no,
+            }, sort_keys=True),
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # Concurrent retries can race on different Expense row locks; the
+        # unique index arbitrates globally and makes this lookup authoritative.
+        existing = _payment_for_idempotency_key(db, idempotency_key, fingerprint)
+        if existing is None:
+            raise
+        response.status_code = 200
+        return existing
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(payment)
+    return payment
+
+
+@router.get(
+    "/expenses/{expense_id}/payments",
+    response_model=list[ExpensePaymentOut],
+    dependencies=[Depends(require_role("admin", "staff", "manager"))],
+)
+def list_expense_payments(expense_id: uuid.UUID, db: Session = Depends(get_db)):
+    if db.get(Expense, expense_id) is None:
+        raise HTTPException(404, "Expense not found")
+    return db.scalars(
+        select(ExpensePayment)
+        .options(selectinload(ExpensePayment.creator))
+        .where(ExpensePayment.expense_id == expense_id)
+        .order_by(ExpensePayment.payment_date, ExpensePayment.created_at, ExpensePayment.id)
+    ).all()
 
 
 @router.post("/budgets", response_model=BudgetOut, status_code=201, dependencies=[Depends(require_role("admin"))])

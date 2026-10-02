@@ -151,6 +151,11 @@ def test_production_startup_allows_real_domain_alongside_local_origins(monkeypat
     monkeypatch.setattr(settings, "environment", "production")
     monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-production-secret")
     monkeypatch.setattr(settings, "cors_allowed_origins", "http://localhost:5173,https://sriapartmenthomestay.com")
+    # This test isolates CORS behavior while still satisfying the independent
+    # production requirement for durable private ID-document storage.
+    monkeypatch.setattr("app.modules.bookings.document_storage.STORAGE_BACKEND", "s3")
+    monkeypatch.setattr("app.modules.bookings.document_storage.S3_BUCKET", "unit-test-private-documents")
+    monkeypatch.setattr("app.modules.bookings.document_storage.S3_REGION", "ap-south-1")
     _validate_production_config()  # must not raise
 
 

@@ -14,7 +14,7 @@ export default defineConfig({
         name: 'Sri Apartment OS',
         short_name: 'Sri Apartment OS',
         description: 'Sri Apartment Homestay — operations, bookings, and guest portal',
-        theme_color: '#0f172a',
+        theme_color: '#0f3d3a',
         background_color: '#ffffff',
         display: 'standalone',
         start_url: '/',
@@ -39,5 +39,10 @@ export default defineConfig({
   ],
   server: {
     port: 5173,
+    strictPort: true,
+    // Bind all interfaces (not just localhost) so the dev server is also
+    // reachable via the machine's LAN IP from another device on the same
+    // network, not only from this machine itself.
+    host: true,
   },
 })

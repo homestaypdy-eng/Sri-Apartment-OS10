@@ -25,7 +25,7 @@ def headers():
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
-def _make_unit(headers, rate=2000):
+def _make_unit(headers, rate=2000, max_occupancy=2):
     prop = client.post("/api/v1/properties", headers=headers, json={
         "name": f"V8Prop {uuid.uuid4().hex[:6]}", "address": "Test", "state_code": "34",
         "property_code": "V8-01", "property_type": "homestay", "owner_name": "Test Owner",
@@ -33,6 +33,7 @@ def _make_unit(headers, rate=2000):
     unit = client.post("/api/v1/units", headers=headers, json={
         "property_id": prop["id"], "name": f"V8Unit {uuid.uuid4().hex[:6]}", "base_rate": rate,
         "unit_code": "U-01", "floor": "1", "flat_number": "1A", "amenities": "AC, WiFi",
+        "max_occupancy": max_occupancy,
     }).json()
     return unit["id"]
 
@@ -69,8 +70,15 @@ def test_guest_update_previously_impossible(headers):
 
 
 def test_guest_document_upload_list_download_delete(headers):
+    # OS10 Phase 3 Step 3A: guest document uploads now verify the actual
+    # file bytes match the declared Content-Type (real JPEG magic bytes
+    # required for image/jpeg) — this fixture uses a real JPEG signature
+    # instead of arbitrary text, matching that new, intentionally stricter
+    # validation. See test_guest_document_security.py for focused
+    # coverage of the validation itself.
     guest = client.post("/api/v1/guests", headers=headers, json={"name": "V8 Doc Guest", "phone": f"92{uuid.uuid4().int % 10**8:08d}"}).json()
-    fake_file = io.BytesIO(b"fake aadhaar front image bytes")
+    jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 20
+    fake_file = io.BytesIO(jpeg_bytes)
     upload = client.post(
         f"/api/v1/guests/{guest['id']}/documents",
         headers=headers,
@@ -87,7 +95,7 @@ def test_guest_document_upload_list_download_delete(headers):
 
     download = client.get(f"/api/v1/guests/{guest['id']}/documents/{doc['id']}/download", headers=headers)
     assert download.status_code == 200
-    assert download.content == b"fake aadhaar front image bytes"
+    assert download.content == jpeg_bytes
 
     delete_resp = client.delete(f"/api/v1/guests/{guest['id']}/documents/{doc['id']}", headers=headers)
     assert delete_resp.status_code == 204
@@ -129,7 +137,7 @@ def test_guest_merge_rejects_already_merged_guest(headers):
 
 
 def test_booking_accepts_guest_count_and_timing_fields(headers):
-    unit_id = _make_unit(headers)
+    unit_id = _make_unit(headers, max_occupancy=3)
     guest = client.post("/api/v1/guests", headers=headers, json={"name": "V8 Booking Guest", "phone": f"98{uuid.uuid4().int % 10**8:08d}"}).json()
     resp = client.post("/api/v1/bookings", headers=headers, json={
         "unit_id": unit_id, "guest_id": guest["id"],
@@ -145,7 +153,7 @@ def test_booking_accepts_guest_count_and_timing_fields(headers):
 
 
 def test_booking_edit_can_update_guest_count(headers):
-    unit_id = _make_unit(headers)
+    unit_id = _make_unit(headers, max_occupancy=3)
     guest = client.post("/api/v1/guests", headers=headers, json={"name": "V8 Edit Count Guest", "phone": f"89{uuid.uuid4().int % 10**8:08d}"}).json()
     booking = client.post("/api/v1/bookings", headers=headers, json={
         "unit_id": unit_id, "guest_id": guest["id"],

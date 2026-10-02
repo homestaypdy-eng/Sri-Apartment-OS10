@@ -230,3 +230,69 @@ def _fail_fast_on_real_smtp_connections(monkeypatch):
             raise OSError("[test-environment] Connection refused — real SMTP is intentionally fast-failed in tests, see tests/conftest.py")
 
     monkeypatch.setattr(smtplib, "SMTP", _FastFailSMTP)
+
+    # notifications.service._PreferIPv6SMTP (the IPv6-first connection
+    # optimization) subclasses the REAL smtplib.SMTP at import time, and
+    # only overrides _get_socket with its own raw socket.socket()/.connect()
+    # calls — it never calls smtplib.SMTP(...) by name, so the patch above
+    # does not reach it. Patch its _get_socket directly for the identical
+    # fast-fail guarantee, so send_email() still can't make a real,
+    # multi-second network connection attempt in any test, through either
+    # code path.
+    from app.modules.notifications.service import _PreferIPv6SMTP
+
+    def _fast_fail_get_socket(self, host, port, timeout):
+        raise OSError("[test-environment] Connection refused — real SMTP is intentionally fast-failed in tests, see tests/conftest.py")
+
+    monkeypatch.setattr(_PreferIPv6SMTP, "_get_socket", _fast_fail_get_socket)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_public_booking_rate_limit_buckets():
+    """Give each test a fresh anonymous-booking rate-limit window.
+
+    Public rate limiting is intentionally persisted in PostgreSQL and stays
+    enabled in the application. TestClient gives every test the same peer
+    address, however, so the suite's many independent hold scenarios shared
+    one production-shaped bucket and began returning 429 after ten requests.
+    Clear only the test database's rate-limit rows before each test; tests
+    that verify the limiter still exercise multiple requests within their
+    own test and retain the real configured limits.
+    """
+    from app.db.session import SessionLocal
+    from app.modules.public_booking.models import PublicRateLimitBucket
+
+    db = SessionLocal()
+    try:
+        db.query(PublicRateLimitBucket).delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.fixture(autouse=True)
+def _safe_fake_razorpay_configuration(monkeypatch):
+    """Provide deterministic fake gateway configuration without network IO.
+
+    Successful hold tests replace the provider function themselves. The
+    defaults below let the route reach those mocks; explicit
+    "not configured" tests still override these settings. Any test that
+    forgets to mock an order/refund call fails closed instead of reaching
+    Razorpay.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "razorpay_key_id", "rzp_test_os10_mock")
+    monkeypatch.setattr(settings, "razorpay_key_secret", "test_key_secret_for_unit_tests")
+
+    monkeypatch.setattr("app.modules.public_booking.router.verify_provider_payment", lambda *args, **kwargs: True)
+
+    # Keep the provider's own configuration checks intact while making any
+    # missed request mock fail before it can leave the test process.
+    import requests
+
+    def _provider_http_must_be_mocked(*_args, **_kwargs):
+        raise AssertionError("Razorpay HTTP call must be mocked in tests")
+
+    monkeypatch.setattr(requests, "post", _provider_http_must_be_mocked)
+    monkeypatch.setattr(requests, "get", _provider_http_must_be_mocked)

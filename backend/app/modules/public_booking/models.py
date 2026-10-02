@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Numeric, String
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.schema import DDL
@@ -72,6 +72,31 @@ class BookingHold(Base):
     guest_name: Mapped[str] = mapped_column(String(150), nullable=False)
     guest_phone: Mapped[str] = mapped_column(String(20), nullable=False)
     guest_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # GST place-of-supply: 2-letter state code, if the guest provided one at
+    # hold creation. Feeds calculate_gst() for THIS hold's own CGST/SGST vs
+    # IGST split (see create_hold), and is applied to the matched/created
+    # Guest row on conversion — never overwriting an existing Guest's known
+    # state with NULL. Unset -> existing "unknown state -> IGST" fallback.
+    guest_state: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    # Total guest count as selected on the public website's own guest
+    # selector (a single number, not an adult/child split — the site has
+    # no such distinction anywhere) — copied onto Booking.adults at
+    # conversion (see _convert_hold_to_booking). Matches BookingCreate's
+    # own adults field default/bound (default=1, ge=1) for consistency;
+    # existing pre-migration holds get 1, the same default Booking.adults
+    # itself already had, so no historical data changes meaning.
+    adults: Mapped[int] = mapped_column(default=1)
+    # Free-text billing address as entered on the public website — same
+    # single-field shape as Guest.address (never split into city/country/
+    # PIN columns; the website combines those into one formatted string
+    # before sending, per the approved design). Applied to the matched/
+    # created Guest row on conversion, same non-destructive "never
+    # overwrite an existing value with NULL" rule as guest_state above.
+    guest_address: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Optional GSTIN, applied to Guest.gst_number on conversion — already
+    # rendered on invoices via generate_invoice_pdf's existing
+    # guest_gst_number parameter, so no invoice-side change is needed.
+    guest_gstin: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Dates
     check_in: Mapped[date] = mapped_column(Date, nullable=False)
@@ -141,3 +166,19 @@ _add_hold_range_and_exclude = DDL(
 @listens_for(BookingHold.__table__, "after_create")
 def _apply_hold_overlap_constraint(target, connection, **kw):
     connection.execute(_add_hold_range_and_exclude)
+
+
+class PublicRateLimitBucket(Base):
+    """Shared per-client counters for anonymous booking mutations.
+
+    Only a one-way hash of the client IP and endpoint is stored; raw IP
+    addresses are never persisted in this table.
+    """
+
+    __tablename__ = "public_rate_limit_buckets"
+    __table_args__ = (Index("ix_public_rate_limit_buckets_updated_at", "updated_at"),)
+
+    bucket_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

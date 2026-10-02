@@ -1,6 +1,24 @@
 @import "tailwindcss";
 
 /*
+ * Brand tokens — carried over verbatim from the public Sri Apartment
+ * Homestay website (src/index.css there) so OS10 Admin uses the exact
+ * same dark-green brand palette, not an invented one. Only the green
+ * ramp is ported here: OS10's neutral surfaces/text/borders already use
+ * Tailwind's slate scale, which is close in character to the website's
+ * own neutral ink/border tokens — recoloring those too would tint every
+ * card/table/border green, contradicting the "clean white/light
+ * surfaces" brand direction. Only primary actions and brand chrome
+ * (buttons, active nav, sidebar) use these.
+ */
+@theme {
+  --color-brand-green: #0f3d3a;
+  --color-brand-green-2: #165c57;
+  --color-brand-green-3: #0a2a28;
+  --color-brand-green-4: #1e6b65;
+}
+
+/*
  * Accessibility: consistent, visible keyboard-focus indicator across every
  * interactive element. Tailwind's utility classes handle hover/active
  * states per-component, but a global :focus-visible rule is what makes
@@ -15,6 +33,6 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 [tabindex]:focus-visible {
-  outline: 2px solid #0f172a;
+  outline: 2px solid var(--color-brand-green);
   outline-offset: 2px;
 }

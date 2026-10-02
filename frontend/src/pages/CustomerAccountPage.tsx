@@ -1,19 +1,43 @@
+import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useCustomerAuth } from "../context/CustomerAuthContext";
+import { extractErrorMessage, initializeCustomerIdentityProfile, type CustomerIdentityStatusOut } from "../lib/api";
 
-// Minimal landing page after a successful customer login/signup — just
-// enough to prove the login/logout loop end-to-end. A full account/
-// booking-history experience for CustomerAccount is separate, later work
-// (see the K item in the Phase 3 architecture report: "How a newly
-// registered account can later become associated with a Guest record").
+// Customer account landing page with the server-resolved Main Guest
+// identity setup. Booking history remains a separate future feature.
 export default function CustomerAccountPage() {
   const { customer, customerLogout } = useCustomerAuth();
   const navigate = useNavigate();
+  const [identity, setIdentity] = useState<CustomerIdentityStatusOut | null>(null);
+  const [identityError, setIdentityError] = useState<string | null>(null);
+  const [identityLoading, setIdentityLoading] = useState(false);
 
   function handleLogout() {
     customerLogout();
     navigate("/account/login");
   }
+
+  async function handleInitializeIdentity() {
+    setIdentityLoading(true);
+    setIdentityError(null);
+    try {
+      // The API intentionally receives no guest_id. The authenticated
+      // customer identity and verified contacts are resolved server-side.
+      setIdentity(await initializeCustomerIdentityProfile());
+    } catch (error) {
+      setIdentityError(extractErrorMessage(error));
+    } finally {
+      setIdentityLoading(false);
+    }
+  }
+
+  const identityTone = identity?.status === "verified"
+    ? "bg-emerald-50 text-emerald-800"
+    : identity?.status === "rejected"
+      ? "bg-red-50 text-red-700"
+      : identity?.status === "pending" || identity?.status === "submitted"
+        ? "bg-amber-50 text-amber-800"
+        : "bg-slate-100 text-slate-700";
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -40,6 +64,39 @@ export default function CustomerAccountPage() {
             Your customer account is now active. Booking-related features for registered accounts (linking a stay,
             viewing history) will be available in a future update.
           </div>
+
+          <section aria-labelledby="customer-identity-heading" className="mt-6 rounded-xl border border-slate-200 p-5">
+            <h2 id="customer-identity-heading" className="text-base font-semibold text-slate-900">
+              Identity Verification
+            </h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Set up your Main Guest identity profile using a verified email or phone on your account.
+            </p>
+
+            {identity ? (
+              <div className="mt-4">
+                <span className={`inline-flex rounded-full px-3 py-1 text-sm font-medium capitalize ${identityTone}`}>
+                  {identity.status.replaceAll("_", " ")}
+                </span>
+                {identity.message && <p className="mt-2 text-sm text-slate-600">{identity.message}</p>}
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={handleInitializeIdentity}
+                disabled={identityLoading}
+                className="mt-4 rounded-lg bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-800 disabled:opacity-50"
+              >
+                {identityLoading ? "Setting up…" : "Set up identity verification"}
+              </button>
+            )}
+
+            {identityError && (
+              <p role="alert" className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
+                {identityError}
+              </p>
+            )}
+          </section>
         </div>
       </main>
     </div>

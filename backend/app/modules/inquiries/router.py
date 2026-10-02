@@ -42,6 +42,8 @@ from app.modules.payments.models import Payment
 from app.modules.properties.models import Unit
 from app.modules.properties.router import get_unit_price_quote
 from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
+from app.shared.availability import lock_unit_for_reservation, unit_is_available
+from app.shared.occupancy import enforce_unit_max_occupancy
 from app.shared.rbac import get_current_user, require_role
 
 router = APIRouter(prefix="/api/v1/inquiries", tags=["inquiries"])
@@ -454,6 +456,16 @@ def convert_to_booking(
             "Change the unit status to 'available' before converting this inquiry.",
         )
 
+    # Inquiry conversion is another booking writer. Serialize it with public
+    # holds, staff bookings, edits, and Zotel imports before checking both
+    # booking and hold tables; table-local exclusion constraints alone do
+    # not protect the cross-table race.
+    lock_unit_for_reservation(db, unit_id)
+    db.refresh(unit)
+    enforce_unit_max_occupancy(unit, inquiry.num_guests, 0)
+    if not unit_is_available(db, unit_id, inquiry.check_in_date, inquiry.check_out_date):
+        raise HTTPException(409, "This unit is already booked or held for overlapping dates")
+
     # Reuse an existing guest by phone number rather than creating a
     # duplicate for a repeat client — phone is the most reliable natural key
     # available on the inquiry (email is optional).
@@ -476,6 +488,7 @@ def convert_to_booking(
         status="confirmed",
         source="direct",
         rate_applied=inquiry.rate_per_night,
+        adults=inquiry.num_guests,
         extra_guest_charge=inquiry.extra_charges,
         created_by=user.id,
     )

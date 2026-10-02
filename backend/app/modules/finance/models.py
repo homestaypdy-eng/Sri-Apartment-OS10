@@ -7,8 +7,9 @@ that never feed into the revenue/profit calculations in reports/service.py.
 """
 import uuid
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,12 +20,18 @@ DEFAULT_EXPENSE_CATEGORIES = ("electricity", "water", "laundry", "cleaning", "in
 # on Expense.category below: this is now a suggested list, not an enforced constraint.
 EXPENSE_CATEGORIES = DEFAULT_EXPENSE_CATEGORIES
 EXPENSE_APPROVAL_STATUSES = ("pending", "approved", "rejected")
+EXPENSE_PNL_STATUSES = ("pending", "approved")
+EXPENSE_PAYMENT_METHODS = ("cash", "bank_transfer", "upi", "card", "cheque")
 DEPOSIT_STATUSES = ("held", "refunded", "partially_refunded")
 OTA_CHANNELS_FOR_COMMISSION = ("booking_com", "airbnb", "agoda", "direct", "mmt")
 
 
 class Expense(Base):
     __tablename__ = "expenses"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_expenses_amount_positive"),
+        CheckConstraint("approval_status IN ('pending', 'approved', 'rejected')", name="ck_expenses_approval_status"),
+    )
     # NOTE: deliberately no CheckConstraint on category anymore. The
     # business asked for custom expense categories — DEFAULT_EXPENSE_CATEGORIES
     # above is what the UI offers as quick-pick suggestions, but any
@@ -35,7 +42,7 @@ class Expense(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     category: Mapped[str] = mapped_column(String(50), nullable=False)
-    amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     expense_date: Mapped[date] = mapped_column(Date, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Null = a central/common expense not tied to one apartment (matches
@@ -52,6 +59,56 @@ class Expense(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     unit = relationship("Unit")
+    payments: Mapped[list["ExpensePayment"]] = relationship(
+        back_populates="expense", order_by="ExpensePayment.payment_date", lazy="selectin"
+    )
+
+    @property
+    def paid_amount(self) -> Decimal:
+        return sum((payment.amount for payment in self.payments), Decimal("0.00"))
+
+    @property
+    def remaining_amount(self) -> Decimal:
+        return max(Decimal(self.amount) - self.paid_amount, Decimal("0.00"))
+
+    @property
+    def payment_status(self) -> str:
+        if self.paid_amount <= 0:
+            return "unpaid"
+        if self.remaining_amount > 0:
+            return "partially_paid"
+        return "paid"
+
+
+class ExpensePayment(Base):
+    __tablename__ = "expense_payments"
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_expense_payments_amount_positive"),
+        CheckConstraint(
+            "payment_method IN ('cash', 'bank_transfer', 'upi', 'card', 'cheque')",
+            name="ck_expense_payments_method",
+        ),
+        Index("ix_expense_payments_expense_date", "expense_id", "payment_date"),
+        Index("uq_expense_payments_idempotency_key", "idempotency_key", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    expense_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("expenses.id"), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    payment_date: Mapped[date] = mapped_column(Date, nullable=False)
+    payment_method: Mapped[str] = mapped_column(String(20), nullable=False)
+    reference_no: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    expense: Mapped[Expense] = relationship(back_populates="payments")
+    creator = relationship("User")
+
+    @property
+    def created_by_name(self) -> str | None:
+        return self.creator.name if self.creator is not None else None
 
 
 class ExpenseAttachment(Base):

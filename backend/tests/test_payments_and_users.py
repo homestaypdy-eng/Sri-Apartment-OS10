@@ -393,3 +393,94 @@ def test_unrelated_self_update_still_allowed(headers):
     resp = client.patch(f"/api/v1/users/{user_id}", headers=own_headers, json={"role": "admin"})
     assert resp.status_code == 200
     assert resp.json()["role"] == "admin"
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: explicit self-promotion / cross-role IDOR checks on /users.
+# require_role("admin") on BOTH endpoints already makes these impossible by
+# construction (the dependency runs before the handler body, so a non-admin
+# never reaches the role-change logic regardless of payload) — the existing
+# test_staff_cannot_access_user_management only exercises GET, though, so
+# these prove the exact self-promotion/other-user scenarios Phase 8 names,
+# for staff AND manager (added later, in Phase B).
+# ---------------------------------------------------------------------------
+
+def _register_and_login(headers, role: str, label: str) -> tuple[str, dict]:
+    email = f"{label}_{uuid.uuid4().hex[:8]}@sriapartmenthomestay.com"
+    password = "Pass12345!"
+    reg = client.post("/api/v1/auth/register", headers=headers, json={"name": label, "email": email, "password": password, "role": role})
+    assert reg.status_code == 201, reg.text
+    user_id = reg.json()["id"]
+    login = client.post("/api/v1/auth/login", json={"email": email, "password": password})
+    assert login.status_code == 200, login.text
+    return user_id, {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+
+def test_staff_cannot_promote_self_to_admin(headers):
+    user_id, own_headers = _register_and_login(headers, "staff", "SelfPromoteStaff")
+    resp = client.patch(f"/api/v1/users/{user_id}", headers=own_headers, json={"role": "admin"})
+    assert resp.status_code == 403
+
+    listing = {u["id"]: u for u in client.get("/api/v1/users", headers=headers).json()}
+    assert listing[user_id]["role"] == "staff"
+
+
+def test_staff_cannot_modify_another_user(headers):
+    actor_id, actor_headers = _register_and_login(headers, "staff", "OtherModStaffActor")
+    target_id, _ = _register_and_login(headers, "staff", "OtherModStaffTarget")
+    resp = client.patch(f"/api/v1/users/{target_id}", headers=actor_headers, json={"role": "admin"})
+    assert resp.status_code == 403
+
+    listing = {u["id"]: u for u in client.get("/api/v1/users", headers=headers).json()}
+    assert listing[target_id]["role"] == "staff"
+
+
+def test_manager_cannot_promote_self_or_others_via_users_endpoint(headers):
+    """Manager (added in RBAC Phase B) must not have gained /users access
+    the way it gained booking/pricing access — this endpoint stays
+    admin-only for every non-admin role, manager included."""
+    user_id, own_headers = _register_and_login(headers, "manager", "SelfPromoteManager")
+    self_promote = client.patch(f"/api/v1/users/{user_id}", headers=own_headers, json={"role": "admin"})
+    assert self_promote.status_code == 403
+
+    other_id, _ = _register_and_login(headers, "manager", "OtherPromoteManagerTarget")
+    other_promote = client.patch(f"/api/v1/users/{other_id}", headers=own_headers, json={"role": "admin"})
+    assert other_promote.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 concurrency: the update_user endpoint now locks the target row
+# (with_for_update) and, when the change could remove admin status, also
+# locks the shared 'admin' Role row as a serialization gate — closing a
+# TOCTOU race where two concurrent requests demoting/deactivating two
+# DIFFERENT admins could each see the other as still active and both
+# commit, leaving zero active admins system-wide. That exact zero-admin
+# outcome can't be safely reproduced end-to-end here: the seed admin
+# (ADMIN_EMAIL) is a permanent bystander that every other file in this
+# suite depends on staying active, and driving the true race requires a
+# world with no such bystander. This test instead proves the lock adds no
+# regression: two concurrent, individually-legitimate admin status changes
+# (each still leaves other admins active) complete correctly with no
+# deadlock, no lost update, and no spurious rejection.
+# ---------------------------------------------------------------------------
+
+def test_concurrent_legitimate_admin_updates_do_not_deadlock_or_lose_updates(headers):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    target_a_id, _ = _register_admin(headers, "ConcurrentAdminA")
+    target_b_id, _ = _register_admin(headers, "ConcurrentAdminB")
+    barrier = Barrier(2)
+
+    def deactivate(target_id):
+        with TestClient(app) as concurrent_client:
+            barrier.wait(timeout=5)
+            return concurrent_client.patch(f"/api/v1/users/{target_id}", headers=headers, json={"is_active": False})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(deactivate, [target_a_id, target_b_id]))
+
+    assert [r.status_code for r in responses] == [200, 200], [r.text for r in responses]
+    listing = {u["id"]: u for u in client.get("/api/v1/users", headers=headers).json()}
+    assert listing[target_a_id]["is_active"] is False
+    assert listing[target_b_id]["is_active"] is False

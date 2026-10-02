@@ -12,7 +12,7 @@ class InquiryCreate(BaseModel):
 
     unit_id: uuid.UUID | None = None
     flat_room_label: str
-    num_guests: int = 1
+    num_guests: int = Field(default=1, ge=1)
     check_in_date: date
     check_in_time: str = "12:30 PM"
     check_out_date: date
@@ -60,7 +60,7 @@ class InquiryUpdate(BaseModel):
     client_address: str | None = None
     unit_id: uuid.UUID | None = None
     flat_room_label: str | None = None
-    num_guests: int | None = None
+    num_guests: int | None = Field(default=None, ge=1)
     check_in_date: date | None = None
     check_in_time: str | None = None
     check_out_date: date | None = None

@@ -6,14 +6,19 @@ import { CustomerAuthProvider } from "../context/CustomerAuthContext";
 import CustomerLoginPage from "../pages/CustomerLoginPage";
 import CustomerSignUpPage from "../pages/CustomerSignUpPage";
 import CustomerForgotPasswordPage from "../pages/CustomerForgotPasswordPage";
+import CustomerAccountPage from "../pages/CustomerAccountPage";
 
 const customerRegister = vi.fn();
 const customerLogin = vi.fn();
+const customerVerifyLoginOtp = vi.fn();
 const customerForgotPassword = vi.fn();
+const initializeCustomerIdentityProfile = vi.fn();
 
 vi.mock("../lib/api", () => ({
   customerRegister: (...args: unknown[]) => customerRegister(...args),
   customerLogin: (...args: unknown[]) => customerLogin(...args),
+  customerVerifyLoginOtp: (...args: unknown[]) => customerVerifyLoginOtp(...args),
+  initializeCustomerIdentityProfile: (...args: unknown[]) => initializeCustomerIdentityProfile(...args),
   customerLogout: vi.fn().mockResolvedValue(undefined),
   customerForgotPassword: (...args: unknown[]) => customerForgotPassword(...args),
   customerResetPassword: vi.fn(),
@@ -99,10 +104,17 @@ describe("CustomerLoginPage", () => {
   beforeEach(() => {
     localStorage.clear();
     customerLogin.mockReset();
+    customerVerifyLoginOtp.mockReset();
   });
 
-  it("logs in and stores the customer session token", async () => {
+  it("requires OTP verification before storing the customer session token", async () => {
     customerLogin.mockResolvedValue({
+      challenge_id: "challenge-1",
+      message: "We've sent a verification code to your email.",
+      dev_otp_code: "123456",
+      otp_delivery_status: "dev_code",
+    });
+    customerVerifyLoginOtp.mockResolvedValue({
       access_token: "tok123",
       token_type: "bearer",
       customer: { id: "1", first_name: "Ada", last_name: "Lovelace", email: "ada@example.com", email_verified_at: null, created_at: "now" },
@@ -114,6 +126,13 @@ describe("CustomerLoginPage", () => {
     await user.click(screen.getByRole("button", { name: "Log In" }));
 
     await waitFor(() => expect(customerLogin).toHaveBeenCalledWith("ada@example.com", "Passw0rd1"));
+    expect(await screen.findByText("123456")).toBeInTheDocument();
+    expect(localStorage.getItem("customer_access_token")).toBeNull();
+
+    await user.type(screen.getByLabelText("Verification code"), "123456");
+    await user.click(screen.getByRole("button", { name: "Verify code" }));
+
+    await waitFor(() => expect(customerVerifyLoginOtp).toHaveBeenCalledWith("challenge-1", "123456"));
     await waitFor(() => expect(localStorage.getItem("customer_access_token")).toBe("tok123"));
   });
 
@@ -126,6 +145,21 @@ describe("CustomerLoginPage", () => {
     await user.click(screen.getByRole("button", { name: "Log In" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Incorrect email or password");
+    expect(localStorage.getItem("customer_access_token")).toBeNull();
+  });
+
+  it("does not create a session when OTP verification fails", async () => {
+    customerLogin.mockResolvedValue({ challenge_id: "challenge-1", message: "Code sent", otp_delivery_status: "sent" });
+    customerVerifyLoginOtp.mockRejectedValue(new Error("Invalid or expired verification code"));
+    const user = userEvent.setup();
+    renderWithProviders(<CustomerLoginPage />);
+    await user.type(screen.getByLabelText("Email"), "ada@example.com");
+    await user.type(screen.getByLabelText("Password"), "Passw0rd1");
+    await user.click(screen.getByRole("button", { name: "Log In" }));
+    await user.type(await screen.findByLabelText("Verification code"), "000000");
+    await user.click(screen.getByRole("button", { name: "Verify code" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Invalid or expired verification code");
     expect(localStorage.getItem("customer_access_token")).toBeNull();
   });
 
@@ -145,6 +179,25 @@ describe("CustomerLoginPage", () => {
     renderWithProviders(<CustomerLoginPage />);
     expect(screen.getByRole("link", { name: /create an account/i })).toBeInTheDocument();
     expect(screen.getAllByRole("link", { name: /guest login/i }).length).toBeGreaterThan(0);
+  });
+});
+
+describe("CustomerAccountPage identity setup", () => {
+  beforeEach(() => {
+    initializeCustomerIdentityProfile.mockReset();
+  });
+
+  it("initializes the server-resolved Main Guest profile and displays its status", async () => {
+    initializeCustomerIdentityProfile.mockResolvedValue({
+      status: "not_required", document_type: null, document_id: null, verified_at: null, message: null,
+    });
+    const user = userEvent.setup();
+    renderWithProviders(<CustomerAccountPage />);
+    await user.click(screen.getByRole("button", { name: "Set up identity verification" }));
+
+    expect(await screen.findByText("not required")).toBeInTheDocument();
+    expect(initializeCustomerIdentityProfile).toHaveBeenCalledWith();
+    expect(screen.queryByRole("button", { name: /verify|reject/i })).not.toBeInTheDocument();
   });
 });
 

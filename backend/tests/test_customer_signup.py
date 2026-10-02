@@ -306,8 +306,10 @@ def test_matching_guest_email_does_not_link_customer_account(db):
     assert reloaded_guest.email == shared_email
     assert reloaded_guest.name == "Existing Guest"
 
-    # Nothing on CustomerAccount references a Guest at all.
-    assert not hasattr(CustomerAccount, "guest_id")
+    # The explicit link is nullable and signup never guesses an existing
+    # Guest from matching email/name alone.
+    account = db.query(CustomerAccount).filter(CustomerAccount.email == shared_email).one()
+    assert account.guest_id is None
 
 
 def test_signup_creates_no_guest_identity(db):

@@ -438,7 +438,7 @@ export default function ReportsPage() {
               <XAxis dataKey="date" tick={{ fontSize: 11 }} />
               <YAxis tick={{ fontSize: 11 }} />
               <Tooltip />
-              <Line type="monotone" dataKey="revenue" stroke="#0f172a" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="revenue" stroke="#0f3d3a" strokeWidth={2} dot={false} />
             </LineChart>
           </ResponsiveContainer>
         </Card>
@@ -451,7 +451,7 @@ export default function ReportsPage() {
               <XAxis dataKey="unit_name" tick={{ fontSize: 10 }} interval={0} angle={-20} textAnchor="end" height={60} />
               <YAxis tick={{ fontSize: 11 }} />
               <Tooltip />
-              <Bar dataKey="revenue" fill="#0f172a" radius={[4, 4, 0, 0]} />
+              <Bar dataKey="revenue" fill="#0f3d3a" radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </Card>
@@ -609,7 +609,7 @@ export default function ReportsPage() {
                 <button
                   key={p}
                   onClick={() => setScorecardPeriod(p)}
-                  className={`px-3 py-1.5 ${scorecardPeriod === p ? "bg-slate-900 text-white" : "bg-white text-slate-600 hover:bg-slate-50"}`}
+                  className={`px-3 py-1.5 ${scorecardPeriod === p ? "bg-brand-green text-white" : "bg-white text-slate-600 hover:bg-slate-50"}`}
                 >
                   {p === "this" ? "This Period" : p === "last" ? "Last Period" : "All Time"}
                 </button>

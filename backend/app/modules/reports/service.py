@@ -41,7 +41,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.modules.bookings.models import Booking
-from app.modules.finance.models import Expense
+from app.modules.finance.models import EXPENSE_PNL_STATUSES, Expense
 from app.modules.finance.service import outstanding_payments
 from app.modules.housekeeping.models import HousekeepingTask
 from app.modules.inquiries.models import LEAD_STATUSES, Inquiry
@@ -81,7 +81,6 @@ def gst_totals(db: Session, date_from: date, date_to: date, property_id: uuid.UU
         func.coalesce(func.sum(Invoice.cgst), 0),
         func.coalesce(func.sum(Invoice.sgst), 0),
         func.coalesce(func.sum(Invoice.igst), 0),
-        func.coalesce(func.sum(Invoice.total), 0),
         func.count(Invoice.id),
     ).join(Booking, Invoice.booking_id == Booking.id).where(
         Invoice.issued_at >= start,
@@ -90,12 +89,20 @@ def gst_totals(db: Session, date_from: date, date_to: date, property_id: uuid.UU
     if property_id:
         query = query.join(Unit, Booking.unit_id == Unit.id).where(Unit.property_id == property_id)
 
-    cgst, sgst, igst, total, count = db.execute(query).one()
+    cgst, sgst, igst, count = db.execute(query).one()
+    # "total" here means total GST collected (cgst+sgst+igst), NOT
+    # Invoice.total (which is the gross subtotal+tax amount) — every
+    # consumer of this dict (GET /reports/gst, the Reports UI KPI, the
+    # Summary PDF/Excel, and the GST Excel export) displays this field
+    # under a "GST Collected"/"Total GST" label, so it must never be the
+    # gross invoice total. See finance/service.py::gst_dashboard() for the
+    # same arithmetic on the Finance side.
+    cgst, sgst, igst = float(cgst), float(sgst), float(igst)
     return {
-        "cgst": float(cgst),
-        "sgst": float(sgst),
-        "igst": float(igst),
-        "total": float(total),
+        "cgst": cgst,
+        "sgst": sgst,
+        "igst": igst,
+        "total": round(cgst + sgst + igst, 2),
         "invoice_count": count,
     }
 
@@ -113,6 +120,7 @@ def _maintenance_cost_total(db: Session, date_from: date, date_to: date, propert
         Expense.category == "maintenance",
         Expense.expense_date >= date_from,
         Expense.expense_date < date_to,
+        Expense.approval_status.in_(EXPENSE_PNL_STATUSES),
     )
     if property_id:
         query = query.join(Unit, Expense.unit_id == Unit.id).where(Unit.property_id == property_id)
@@ -581,12 +589,12 @@ def operational_dashboard(db: Session) -> dict:
 
     today_bookings = [b for b in all_bookings if b.check_in <= today < b.check_out]
     today_revenue = round(sum(float(b.rate_applied) for b in today_bookings), 2)  # one night's worth, per booking active today
-    today_expenses = round(sum(float(e.amount) for e in db.scalars(select(Expense).where(Expense.expense_date == today)).all()), 2)
+    today_expenses = round(sum(float(e.amount) for e in db.scalars(select(Expense).where(Expense.expense_date == today, Expense.approval_status.in_(EXPENSE_PNL_STATUSES))).all()), 2)
     today_profit = round(today_revenue - today_expenses, 2)
 
     month_bookings = [b for b in all_bookings if b.check_in >= month_start and b.check_in <= today]
     month_revenue = round(_revenue_for_bookings(month_bookings), 2)
-    month_expenses = round(sum(float(e.amount) for e in db.scalars(select(Expense).where(Expense.expense_date >= month_start, Expense.expense_date <= today)).all()), 2)
+    month_expenses = round(sum(float(e.amount) for e in db.scalars(select(Expense).where(Expense.expense_date >= month_start, Expense.expense_date <= today, Expense.approval_status.in_(EXPENSE_PNL_STATUSES))).all()), 2)
     month_profit = round(month_revenue - month_expenses, 2)
 
     apartment_performance = []
@@ -596,7 +604,7 @@ def operational_dashboard(db: Session) -> dict:
     # shared expenses with no unit_id are excluded from any one apartment's
     # figure here too, for the same reason).
     month_expenses_by_unit: dict = defaultdict(float)
-    for e in db.scalars(select(Expense).where(Expense.expense_date >= month_start, Expense.expense_date <= today, Expense.unit_id.isnot(None))).all():
+    for e in db.scalars(select(Expense).where(Expense.expense_date >= month_start, Expense.expense_date <= today, Expense.unit_id.isnot(None), Expense.approval_status.in_(EXPENSE_PNL_STATUSES))).all():
         month_expenses_by_unit[e.unit_id] += float(e.amount)
 
     # Group month_bookings by unit_id ONCE (O(bookings)) instead of
@@ -641,7 +649,7 @@ def operational_dashboard(db: Session) -> dict:
         m_end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
         m_bookings = db.scalars(select(Booking).where(Booking.status.in_(active_statuses), Booking.check_in >= m_start, Booking.check_in < m_end)).all()
         m_revenue = round(_revenue_for_bookings(m_bookings), 2)
-        m_expenses = round(sum(float(e.amount) for e in db.scalars(select(Expense).where(Expense.expense_date >= m_start, Expense.expense_date < m_end)).all()), 2)
+        m_expenses = round(sum(float(e.amount) for e in db.scalars(select(Expense).where(Expense.expense_date >= m_start, Expense.expense_date < m_end, Expense.approval_status.in_(EXPENSE_PNL_STATUSES))).all()), 2)
         monthly_trend.append({"year": year, "month": month, "revenue": m_revenue, "expenses": m_expenses, "profit": round(m_revenue - m_expenses, 2)})
 
     attention_items = build_attention_items(
@@ -713,19 +721,39 @@ def build_attention_items(
     a short, actionable list rather than a restatement of every open row
     in the system.
     """
-    from app.modules.bookings.models import Guest
+    from app.modules.bookings.models import Booking, Guest
 
     items: list[dict] = []
+
+    # Finance's outstanding-payments rows intentionally omit booking status
+    # (they are also returned through a public response schema). Fetch the
+    # bounded set of statuses here so wording never infers an actual check-in
+    # from the calendar date alone.
+    outstanding_booking_ids = [o["booking_id"] for o in outstanding]
+    booking_status_by_id = {
+        booking.id: booking.status
+        for booking in db.scalars(
+            select(Booking).where(Booking.id.in_(outstanding_booking_ids))
+        ).all()
+    } if outstanding_booking_ids else {}
 
     # --- Unpaid balances: only overdue, or check-in within 3 days ---
     for o in outstanding:
         days_to_checkin = (o["check_in"] - today).days
+        booking_status = booking_status_by_id.get(o["booking_id"])
         if o["is_overdue"]:
             severity = "critical"
             reason = f"Payment was due {o['due_date']} and is still pending."
         elif days_to_checkin <= 0:
             severity = "critical"
-            reason = f"Guest has checked in (or checks in today) with ₹{o['pending_balance']:,.0f} still unpaid."
+            if booking_status == "checked_in":
+                reason = f"Guest is checked in with ₹{o['pending_balance']:,.0f} still unpaid."
+            elif booking_status == "confirmed" and days_to_checkin == 0:
+                reason = f"Confirmed booking is due to check in today with ₹{o['pending_balance']:,.0f} still unpaid."
+            elif booking_status == "confirmed":
+                reason = f"Confirmed booking has a past check-in date with ₹{o['pending_balance']:,.0f} still unpaid; review booking status."
+            else:
+                reason = f"Booking check-in date has passed with ₹{o['pending_balance']:,.0f} still unpaid; review booking status."
         elif days_to_checkin <= 3:
             severity = "warning"
             reason = f"Guest arrives in {days_to_checkin} day(s) with ₹{o['pending_balance']:,.0f} still unpaid."

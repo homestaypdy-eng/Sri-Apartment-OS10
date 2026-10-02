@@ -113,8 +113,30 @@ class CreateHoldRequest(BaseModel):
     # than a raw DB truncation error.
     guest_name: str = Field(min_length=1, max_length=150)
     guest_phone: str = Field(min_length=6, max_length=20)
-    guest_email: EmailStr | None = None
+    # Required (Correction 5): the public website's own guest-details step
+    # now requires a valid email before checkout can proceed — the booking
+    # confirmation is sent here, so a hold with no way to reach the guest
+    # by email is no longer a valid submission. EmailStr already rejects a
+    # malformed address; required (no `| None`) rejects a missing one.
+    guest_email: EmailStr
+    # GST place-of-supply: optional 2-letter Indian state/UT GST code. Not
+    # collected at quote time (state isn't known yet then) — only here, at
+    # hold creation. Unset -> existing "unknown -> IGST" behavior, unchanged.
+    guest_state: str | None = Field(default=None, min_length=2, max_length=2)
     promo_code: str | None = None
+    # Total guest count from the website's own guest selector — a single
+    # number (the site has no adult/child distinction anywhere), copied to
+    # Booking.adults on conversion. Same default/bound as the admin-side
+    # BookingCreate.adults for consistency.
+    adults: int = Field(default=1, ge=1)
+    # Free-text billing address, combined by the website into one
+    # formatted string (Address Line 1/2, city, state, country, PIN) —
+    # mirrors Guest.address's own single-field shape, so no new structured
+    # columns are needed. Applied to Guest.address on conversion.
+    guest_address: str | None = Field(default=None, max_length=500)
+    # Optional GSTIN, applied to Guest.gst_number on conversion — already
+    # rendered on invoices via the existing guest_gst_number parameter.
+    guest_gstin: str | None = Field(default=None, max_length=20)
 
 
 class QuoteSummaryOut(BaseModel):

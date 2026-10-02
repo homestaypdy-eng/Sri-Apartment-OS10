@@ -19,23 +19,29 @@ from app.modules.auth.models import User
 router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
 
 
-def get_or_create_settings(db: Session) -> BusinessSettings:
+def get_or_create_settings(db: Session, *, commit_if_created: bool = True) -> BusinessSettings:
     settings = db.get(BusinessSettings, SETTINGS_SINGLETON_ID)
     if settings is None:
         settings = BusinessSettings(id=SETTINGS_SINGLETON_ID)
         db.add(settings)
-        db.commit()
-        db.refresh(settings)
+        if commit_if_created:
+            db.commit()
+            db.refresh(settings)
+        else:
+            db.flush()
     return settings
 
 
-def get_or_create_bank_settings(db: Session) -> BankSettings:
+def get_or_create_bank_settings(db: Session, *, commit_if_created: bool = True) -> BankSettings:
     bank = db.get(BankSettings, BANK_SETTINGS_SINGLETON_ID)
     if bank is None:
         bank = BankSettings(id=BANK_SETTINGS_SINGLETON_ID)
         db.add(bank)
-        db.commit()
-        db.refresh(bank)
+        if commit_if_created:
+            db.commit()
+            db.refresh(bank)
+        else:
+            db.flush()
     return bank
 
 

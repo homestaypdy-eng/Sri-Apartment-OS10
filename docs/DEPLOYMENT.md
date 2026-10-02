@@ -87,21 +87,51 @@ For managed Postgres (RDS, Cloud SQL, etc.), use the provider's automated snapsh
 
 **Backup schedule recommendation:** at minimum, run the backup command above weekly via cron once real guest/financial data exists, and after any major batch operation (bulk imports, mass edits). Store the `.sql` file somewhere other than the same disk as the database itself.
 
-**Uploaded files (attachments, photos, generated PDFs)** are stored on local disk in named Docker volumes (`uploads_reports`, `uploads_attachments`, `uploads_hk_photos`, `uploads_maint_photos`, `uploads_expense_attachments` — see `docker-compose.yml`). `pg_dump` does **not** back these up — they need a separate file-level backup (e.g. `docker run --rm -v uploads_attachments:/data -v $(pwd):/backup alpine tar czf /backup/attachments_backup.tar.gz /data`, repeated per volume) or, for real production durability, migrating to S3-compatible object storage instead of local volumes (see "Known Limitations" in the README).
+**Uploaded files (attachments, photos, generated PDFs, and guest ID documents)** are stored on local disk in named Docker volumes (`uploads_reports`, `uploads_attachments`, `uploads_hk_photos`, `uploads_maint_photos`, `uploads_expense_attachments`, `uploads_guest_docs` — see `docker-compose.yml`). `pg_dump` does **not** back these up — they need a separate file-level backup (e.g. `docker run --rm -v uploads_attachments:/data -v $(pwd):/backup alpine tar czf /backup/attachments_backup.tar.gz /data`, repeated per volume) or, for real production durability, migrating to S3-compatible object storage instead of local volumes (see "Known Limitations" in the README).
 
 ## Rollback Procedure
 
 If a deployment introduces a problem:
 
-1. **Application code rollback** (no schema changes involved): redeploy the previous Docker image / git commit. Since this project has no destructive migrations (see `app/db/additive_migrations.py` — every migration is an additive `ADD COLUMN IF NOT EXISTS`, never a `DROP COLUMN` or data-rewriting migration), an older application version will simply ignore any newer columns it doesn't know about; it will not crash from their presence.
+1. **Application code rollback** (no schema changes involved): redeploy the previous Docker image / git commit. The current schema migration does not drop columns or rewrite business rows, but it does replace selected constraints and the policy audit trigger. Review those schema definitions before a rollback; an older application version should not be assumed compatible with every newer constraint.
 2. **Database rollback** (if a bad migration or bulk operation corrupted data): restore from the most recent backup taken before the problem, following the Restore procedure above, into a new database, verify it, then repoint the application's `DATABASE_URL` at it.
 3. **Never** roll back application code to a version *older* than your most recent schema change if that change removed or renamed a column the old code doesn't expect — check `app/db/additive_migrations.py`'s history first. In practice this hasn't happened in this project's migration history (every change so far has been purely additive), but it's the one rollback scenario worth checking before assuming "redeploy the old version" is safe.
 
-## Upgrade Procedure
+## Railway Schema Migration Procedure
+
+For Railway, use the one-off **Pre-deploy Command** for schema work:
+
+```text
+python -m app.db.migrate
+```
+
+Leave Railway's custom **Start Command unset**. The image `CMD` in
+`backend/Dockerfile` starts Uvicorn directly, and should remain responsible
+only for serving the application. Do not use `python -m app.db.seed` as a
+Railway pre-deploy or start command: it also bootstraps users/RBAC and runs
+legacy data migrations. Do not use the Compose `command` as evidence for
+Railway behavior; Compose overrides apply only to Compose.
+
+The migration command registers ORM metadata, creates the required
+PostgreSQL extensions, creates missing tables, applies reviewed indexes and
+the schema statements in `app.db.additive_migrations`, and exits non-zero
+on failure. PostgreSQL runs the DDL in a transaction. The additive migration
+set includes some schema-level constraint and trigger replacements; it is
+not literally limited to `ADD COLUMN`. It does not run the separate
+business-settings defaults, legacy bank-settings copy, customer phone
+normalization, user bootstrap, or RBAC/reference-data seed paths. Review the
+schema preflight and take a provider snapshot before configuring or running
+this command in a Railway environment.
+
+The repository does not configure Railway. After a reviewed staging rehearsal,
+set only the Pre-deploy Command above and keep Start Command unset. Keep
+`ENABLE_SCHEDULER=false` or unset during the migration/deployment.
+
+## Local Upgrade Procedure
 
 1. Pull the new code / image.
 2. Take a real backup first (see above) — this costs a few minutes and is the difference between "annoying" and "catastrophic" if something goes wrong.
-3. `docker compose up --build` — the backend's startup command runs `python -m app.db.seed` before starting uvicorn, which applies any new additive migrations automatically (idempotent — safe to run against a database that already has some or all of the new columns/tables).
+3. `docker compose up --build` — the local Compose override runs the full development bootstrap (`python -m app.db.seed`) before Uvicorn. This is for local development, not Railway deployment.
 4. Run the health check (`curl http://localhost:8000/health`) and spot-check one real workflow (e.g., view an existing booking) before considering the upgrade complete.
 
 ## Monitoring & Logging
@@ -116,7 +146,7 @@ If a deployment introduces a problem:
 - [ ] Set real `SMTP_*` and `RAZORPAY_*` credentials if using those features
 - [ ] Put the API and frontend behind HTTPS (terminate TLS at a load balancer/reverse proxy — not handled by the app or its bundled nginx config itself; add HSTS at that layer once TLS is live, not before)
 - [x] Rate limiting on login is implemented (in-memory, single-process — see `app/shared/rate_limit.py`'s own docstring for the honest limitation: it resets on restart and doesn't share state across multiple backend replicas; a multi-replica deployment should replace it with a Redis-backed limiter)
-- [ ] Add Alembic migrations before making further *destructive* schema changes in production (current additive-only migrations via `create_all` + `additive_migrations.py` are safe for adding columns/tables, but were never designed for renaming or dropping columns safely)
+- [ ] Add Alembic migrations before making further *destructive* schema changes in production (`create_all` plus the current migration-only command can add schema and replace reviewed constraints/triggers, but are not designed for column renames/drops)
 - [ ] Add refresh-token revocation (Redis-backed) if compromised-token scenarios matter for your risk profile
 - [ ] Set up file-level backup for the upload volumes (see Backup & Restore above) — `pg_dump` alone does not cover these
 - [ ] Enable the reminder scheduler (`ENABLE_SCHEDULER=true`) only after confirming SMTP delivery works

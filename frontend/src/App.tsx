@@ -15,6 +15,7 @@ import CustomerResetPasswordPage from "./pages/CustomerResetPasswordPage";
 // Route-level code splitting: each page becomes its own chunk, loaded on
 // demand rather than all bundled into one large file up front.
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
+const AvailabilityCalendarPage = lazy(() => import("./pages/AvailabilityCalendarPage"));
 const PropertiesPage = lazy(() => import("./pages/PropertiesPage"));
 const GuestsPage = lazy(() => import("./pages/GuestsPage"));
 const BookingsPage = lazy(() => import("./pages/BookingsPage"));
@@ -23,7 +24,9 @@ const HousekeepingPage = lazy(() => import("./pages/HousekeepingPage"));
 const MaintenancePage = lazy(() => import("./pages/MaintenancePage"));
 const BillingPage = lazy(() => import("./pages/BillingPage"));
 const FinancePage = lazy(() => import("./pages/FinancePage"));
+const PaymentReconciliationPage = lazy(() => import("./pages/PaymentReconciliationPage"));
 const ReportsPage = lazy(() => import("./pages/ReportsPage"));
+const RevenueDashboardPage = lazy(() => import("./pages/RevenueDashboardPage"));
 const ProfitSimulatorPage = lazy(() => import("./pages/ProfitSimulatorPage"));
 const AIStrategistPage = lazy(() => import("./pages/AIStrategistPage"));
 const UsersPage = lazy(() => import("./pages/UsersPage"));
@@ -76,6 +79,7 @@ export default function App() {
               }
             >
               <Route index element={<Suspense fallback={<PageLoading />}><DashboardPage /></Suspense>} />
+              <Route path="availability" element={<Suspense fallback={<PageLoading />}><AvailabilityCalendarPage /></Suspense>} />
               <Route path="properties" element={<Suspense fallback={<PageLoading />}><PropertiesPage /></Suspense>} />
               <Route path="guests" element={<Suspense fallback={<PageLoading />}><GuestsPage /></Suspense>} />
               <Route path="bookings" element={<Suspense fallback={<PageLoading />}><BookingsPage /></Suspense>} />
@@ -97,7 +101,9 @@ export default function App() {
               <Route path="guest-requests" element={<Suspense fallback={<PageLoading />}><GuestRequestsPage /></Suspense>} />
               <Route path="billing" element={<Suspense fallback={<PageLoading />}><BillingPage /></Suspense>} />
               <Route path="finance" element={<Suspense fallback={<PageLoading />}><FinancePage /></Suspense>} />
+              <Route path="payment-reconciliation" element={<Suspense fallback={<PageLoading />}><PaymentReconciliationPage /></Suspense>} />
               <Route path="reports" element={<Suspense fallback={<PageLoading />}><ReportsPage /></Suspense>} />
+              <Route path="revenue-dashboard" element={<Suspense fallback={<PageLoading />}><RevenueDashboardPage /></Suspense>} />
               <Route path="profit-simulator" element={<Suspense fallback={<PageLoading />}><ProfitSimulatorPage /></Suspense>} />
               <Route path="notifications" element={<Suspense fallback={<PageLoading />}><NotificationsPage /></Suspense>} />
               <Route path="messages" element={<Suspense fallback={<PageLoading />}><MessagesPage /></Suspense>} />

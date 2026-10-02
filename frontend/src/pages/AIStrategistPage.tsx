@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   api,
   extractErrorMessage,
+  type AttentionItem,
   type AIStrategistBundle,
   type MetricComparison,
   type NarrativeOutput,
@@ -9,12 +11,32 @@ import {
 } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, Button, Table, Badge, EmptyState, Spinner } from "../components/ui";
 
-function firstOfMonth(): string {
-  const d = new Date();
-  return new Date(d.getFullYear(), d.getMonth(), 1).toISOString().slice(0, 10);
+function localDateValue(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
+
+export function firstOfMonth(d = new Date()): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+}
+export function today(d = new Date()): string {
+  return localDateValue(d);
+}
+export function toExclusiveDate(inclusiveDate: string): string {
+  const [year, month, day] = inclusiveDate.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day + 1)).toISOString().slice(0, 10);
+}
+function fromExclusiveDate(exclusiveDate: string): string {
+  const [year, month, day] = exclusiveDate.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day - 1)).toISOString().slice(0, 10);
+}
+function formatDate(dateValue: string): string {
+  const [year, month, day] = dateValue.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day, 12)).toLocaleDateString("en-GB", {
+    day: "numeric", month: "short", year: "numeric", timeZone: "UTC",
+  });
+}
+export function formatPeriod(dateFrom: string, dateToExclusive: string): string {
+  return `${formatDate(dateFrom)} – ${formatDate(fromExclusiveDate(dateToExclusive))}`;
 }
 
 // Presentation-only formatting — never recomputes a value, only displays
@@ -22,7 +44,7 @@ function today(): string {
 // always rendered as "—", distinct from an actual 0 the backend returned.
 function fmtMoney(v: number | null | undefined): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
-  return `₹${v.toLocaleString()}`;
+  return `₹${v.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 }
 function fmtPercent(v: number | null | undefined): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
@@ -49,6 +71,54 @@ function StatBox({ label, value, sub }: { label: string; value: string; sub?: st
   );
 }
 
+const ATTENTION_LIMIT = 5;
+const ATTENTION_CATEGORY: Record<AttentionItem["category"], string> = {
+  unpaid_balance: "Payments",
+  low_stock: "Inventory",
+  guest_request: "Operations",
+  maintenance: "Operations",
+};
+
+export function NeedsAttentionPanel({ items }: { items: AttentionItem[] }) {
+  const [showAll, setShowAll] = useState(false);
+  const visibleItems = showAll ? items : items.slice(0, ATTENTION_LIMIT);
+
+  return (
+    <Card className="mb-6 border-amber-200 bg-amber-50/60">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-slate-900">Needs Attention <span className="ml-1 text-xs font-normal text-slate-500">· current operational alerts</span></h2>
+          <p className="mt-1 text-xs text-slate-500">Portfolio-wide current alerts, independent of period/property filters. Ordered by existing OS10 priority; links open records for review only.</p>
+        </div>
+        {items.length > ATTENTION_LIMIT && (
+          <button type="button" aria-expanded={showAll} onClick={() => setShowAll((value) => !value)} className="shrink-0 rounded-md px-2 py-1 text-xs font-semibold text-brand-green hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand-green">
+            {showAll ? "Show top 5" : `View all (${items.length})`}
+          </button>
+        )}
+      </div>
+      {items.length === 0 ? (
+        <p role="status" className="rounded-lg border border-slate-200 bg-white/70 px-3 py-3 text-sm text-slate-600">No current items need attention.</p>
+      ) : (
+        <ul className="space-y-2">
+          {visibleItems.map((item) => (
+            <li key={`${item.category}-${item.reference_id}`}>
+              <Link to={item.link} aria-label={`Review ${ATTENTION_CATEGORY[item.category]}: ${item.title}`} className="flex min-w-0 items-start gap-2 rounded-lg border border-slate-200/80 bg-white px-3 py-2.5 transition hover:border-brand-green/30 hover:bg-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand-green">
+                <span className={`mt-0.5 shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase ${item.severity === "critical" ? "bg-red-50 text-red-700" : "bg-amber-100 text-amber-800"}`}>{item.severity}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="mr-2 inline-block rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">{ATTENTION_CATEGORY[item.category]}</span>
+                  <span className="break-words text-xs font-semibold text-slate-800">{item.title}</span>
+                  <span className="mt-1 block break-words text-xs leading-5 text-slate-500">{item.reason} {item.action}</span>
+                </span>
+                <span className="mt-1 shrink-0 text-[11px] font-semibold text-brand-green">Review →</span>
+              </Link>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
+  );
+}
+
 export default function AIStrategistPage() {
   const [dateFrom, setDateFrom] = useState(firstOfMonth());
   const [dateTo, setDateTo] = useState(today());
@@ -67,7 +137,7 @@ export default function AIStrategistPage() {
     setError(null);
     setLoading(true);
     try {
-      const params: Record<string, string> = { date_from: dateFrom, date_to: dateTo };
+      const params: Record<string, string> = { date_from: dateFrom, date_to: toExclusiveDate(dateTo) };
       if (propertyId) params.property_id = propertyId;
       const { data } = await api.get("/reports/ai-strategist", { params });
       setBundle(data);
@@ -85,7 +155,7 @@ export default function AIStrategistPage() {
     setNarrativeError(null);
     setNarrativeLoading(true);
     try {
-      const params: Record<string, string> = { date_from: dateFrom, date_to: dateTo };
+      const params: Record<string, string> = { date_from: dateFrom, date_to: toExclusiveDate(dateTo) };
       if (propertyId) params.property_id = propertyId;
       const { data } = await api.get("/reports/ai-strategist/narrative", { params });
       setNarrative(data);
@@ -122,21 +192,21 @@ export default function AIStrategistPage() {
       <Card className="mb-6 bg-amber-50 border-amber-200">
         <p className="text-xs font-semibold text-amber-900">READ-ONLY — NOT AUTOMATED</p>
         <p className="text-xs text-amber-800 mt-1">
-          Every figure below is computed by the same deterministic reports/finance calculations used elsewhere in
-          OS10 — nothing here is generated, predicted, or recalculated in the browser. This page cannot change any
-          booking, price, payment, or send any message.
+          Figures and alerts come from OS10 reporting rules; this page does not forecast business results or execute
+          operational changes. Links open records for review only. Nothing here changes bookings, prices, payments,
+          inventory, or guest communications.
         </p>
       </Card>
 
       <Card className="mb-6">
         <div className="flex flex-wrap items-end gap-4">
           <div>
-            <label className="block text-xs text-slate-500 mb-1">From</label>
-            <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <label htmlFor="strategist-date-from" className="block text-xs text-slate-500 mb-1">From (inclusive)</label>
+            <input id="strategist-date-from" type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
           </div>
           <div>
-            <label className="block text-xs text-slate-500 mb-1">To</label>
-            <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <label htmlFor="strategist-date-to" className="block text-xs text-slate-500 mb-1">Through (inclusive)</label>
+            <input id="strategist-date-to" type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
           </div>
           <div>
             <label className="block text-xs text-slate-500 mb-1">Property</label>
@@ -168,8 +238,11 @@ export default function AIStrategistPage() {
           {/* A. Business Health */}
           <Card className="mb-6">
             <h2 className="text-sm font-semibold text-slate-900 mb-1">Business Health</h2>
+            <p className="text-xs text-slate-500 mb-1">
+              Current period: {formatPeriod(bundle.business_health.current_period.date_from, bundle.business_health.current_period.date_to)} · {propertyId ? properties.find((property) => property.id === propertyId)?.name ?? "Selected property" : "All properties"}
+            </p>
             <p className="text-xs text-slate-400 mb-4">
-              Revenue definition: {bundle.business_health.revenue_definition}
+              Revenue definition: {bundle.business_health.revenue_definition} Metrics use bookings whose check-in falls in the selected period; full-stay revenue and nights are counted.
             </p>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
               <StatBox
@@ -182,29 +255,12 @@ export default function AIStrategistPage() {
               <StatBox label="RevPAR" value={fmtMoney(bundle.business_health.revpar.current)} sub={fmtChange(bundle.business_health.revpar, { currency: true })} />
             </div>
             <p className="text-xs text-slate-400 mt-3">
-              Compared to {bundle.business_health.previous_period.date_from} to {bundle.business_health.previous_period.date_to}
+              Compared with {formatPeriod(bundle.business_health.previous_period.date_from, bundle.business_health.previous_period.date_to)}.
             </p>
           </Card>
 
           {/* G. Attention */}
-          {bundle.needs_attention.length > 0 && (
-            <Card className="mb-6 border-amber-300 bg-amber-50">
-              <h2 className="text-sm font-semibold text-amber-900 mb-2">Needs Attention</h2>
-              <ul className="text-xs text-amber-900 space-y-2">
-                {bundle.needs_attention.map((item, i) => (
-                  <li key={i} className="flex items-start gap-2">
-                    <span className={`mt-0.5 shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase ${item.severity === "critical" ? "bg-red-600 text-white" : "bg-amber-500 text-white"}`}>
-                      {item.severity}
-                    </span>
-                    <span>
-                      <span className="font-medium">{item.title}</span>
-                      <span className="block text-amber-800">{item.reason} {item.action}</span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </Card>
-          )}
+          <NeedsAttentionPanel items={bundle.needs_attention} />
 
           {/* B. Cancellations */}
           <Card className="mb-6">
@@ -215,15 +271,15 @@ export default function AIStrategistPage() {
               <StatBox label="Firm Bookings in Period" value={String(bundle.cancellations.total_bookings_in_period)} />
               <StatBox
                 label="Previous Period"
-                value={`${bundle.cancellations.previous_period.date_from}`}
-                sub={`to ${bundle.cancellations.previous_period.date_to}`}
+                value={formatPeriod(bundle.cancellations.previous_period.date_from, bundle.cancellations.previous_period.date_to)}
               />
             </div>
           </Card>
 
           {/* C. Unit Performance */}
           <Card className="mb-6">
-            <h2 className="text-sm font-semibold text-slate-900 mb-4">Unit Performance</h2>
+            <h2 className="text-sm font-semibold text-slate-900 mb-1">Unit Performance</h2>
+            <p className="text-xs text-slate-400 mb-4">Selected period: {formatPeriod(bundle.unit_performance.current_period.date_from, bundle.unit_performance.current_period.date_to)}</p>
             <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Top Units</h3>
             {bundle.unit_performance.top_units.length === 0 ? (
               <EmptyState message="No unit data for this period." />
@@ -261,6 +317,7 @@ export default function AIStrategistPage() {
           {/* D. Booking Sources */}
           <Card className="mb-6">
             <h2 className="text-sm font-semibold text-slate-900 mb-1">Booking Sources</h2>
+            <p className="text-xs text-slate-400 mb-1">Selected period: {formatPeriod(bundle.booking_sources.current_period.date_from, bundle.booking_sources.current_period.date_to)}</p>
             <p className="text-xs text-slate-400 mb-4">Revenue definition: {bundle.booking_sources.revenue_definition}</p>
             {Object.keys(bundle.booking_sources.revenue_by_source).length === 0 ? (
               <EmptyState message="No booking-source data for this period." />
@@ -411,7 +468,7 @@ export default function AIStrategistPage() {
 
           {/* I. Weekly Facts */}
           <Card className="mb-6">
-            <h2 className="text-sm font-semibold text-slate-900 mb-4">This Week — Facts</h2>
+            <h2 className="text-sm font-semibold text-slate-900 mb-4">Selected-period facts</h2>
             {bundle.weekly_facts.length === 0 ? (
               <EmptyState message="No facts available for this period." />
             ) : (

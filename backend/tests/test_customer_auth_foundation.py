@@ -240,12 +240,20 @@ def test_customer_token_rejected_by_guest_endpoint(db):
 # ---------------------------------------------------------------------------
 
 def test_customer_account_has_no_automatic_booking_access(db):
+    import uuid
+
+    from app.core.security import decode_token
+    from app.modules.customer_auth.models import CustomerAccount
+
     token = _customer_token(db)
     resp = client.get("/api/v1/portal/bookings", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 403
-    # Structural guarantee, not just a behavioral one: nothing on
-    # CustomerAccount references a Guest at all.
-    assert not hasattr(CustomerAccount, "guest_id")
+    # The explicit association exists for the customer-scoped identity
+    # feature, but signup does not silently attach a Guest or grant booking
+    # portal access.
+    account = db.get(CustomerAccount, uuid.UUID(decode_token(token, expected_type="access")["sub"]))
+    assert hasattr(CustomerAccount, "guest_id")
+    assert account.guest_id is None
 
 
 # ---------------------------------------------------------------------------

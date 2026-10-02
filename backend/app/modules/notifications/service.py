@@ -15,10 +15,12 @@ plumbing for it, but no SMS provider is integrated (same reason: no
 provider account, no credentials, and the network egress here is
 allowlisted to package registries only, not SMS gateways).
 """
+import base64
 import logging
 import mimetypes
 import os
 import smtplib
+import socket
 import uuid
 import httpx
 from datetime import datetime, timedelta, timezone
@@ -33,6 +35,7 @@ from app.modules.bookings.models import Booking
 from app.modules.customer_auth.models import CustomerAccount
 from app.modules.notifications.models import NotificationLog
 from app.modules.payments.models import Invoice, Payment
+from app.modules.payments.service import generate_invoice_pdf_for_booking
 from app.modules.notifications.templates import render_template
 from app.modules.settings.router import get_or_create_settings
 
@@ -43,15 +46,103 @@ logger = logging.getLogger("notifications.service")
 # than importing their private constants, matching that existing precedent.
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "assets")
 _DEFAULT_LOGO_PATH = os.path.join(ASSETS_DIR, "logo.png")
+# Email-only, size-optimized copy of the logo above (144x144, ~28KB vs the
+# original 2048x2048 ~1.55MB) — logo.png itself is shared with PDF
+# generation (payments/service.py, inquiries/service.py) and is
+# deliberately left untouched; this is a separate asset, used only for
+# the customer login OTP email (see send_customer_login_otp_email_now).
+# The original's full resolution is unnecessary at this email's 72px
+# display height and was, combined with the inline-image handling below,
+# the root cause of a real Gmail "Message clipped" incident.
+_DEFAULT_EMAIL_LOGO_PATH = os.path.join(ASSETS_DIR, "logo-email.png")
 
 
 class EmailNotConfiguredError(Exception):
     pass
 
 
+class _PreferIPv6SMTP(smtplib.SMTP):
+    """
+    Identical to smtplib.SMTP in every respect except which address it
+    connects to first. Root-cause fix for a real production incident:
+    Railway's outbound network could not reach Gmail's SMTP frontend over
+    IPv4 (connection attempts timed out rather than failing fast), while
+    IPv6 to the exact same hostname worked immediately once IPv6 egress
+    was enabled — but Python's synchronous socket API has no Happy-
+    Eyeballs-style racing, so smtplib.SMTP's default _get_socket() always
+    tried every getaddrinfo() result in DNS's own order (IPv4 first here),
+    burning the full connect timeout on the failing address before ever
+    reaching the one that works.
+
+    _get_socket is smtplib's own documented extension point for exactly
+    this kind of change — its docstring/comment in the stdlib says "this
+    makes it simpler for SMTP_SSL to use the SMTP connect code and just
+    alter the socket connection bit", and SMTP_SSL itself is implemented
+    by overriding this same method. Overriding it here only changes the
+    ORDER addresses already returned by DNS are tried (IPv6 first) — it
+    never excludes IPv4, so an environment with no IPv6 egress at all
+    (every local/dev machine, most CI) falls through to IPv4 exactly as
+    smtplib would have done by default, with identical behavior and
+    identical timeout. host/port are never resolved to a literal IP
+    outside this one connection attempt — getaddrinfo() is called fresh
+    every time send_email() runs, so a hostname whose DNS answer changes
+    (as Gmail's routinely does) is handled correctly with no caching.
+
+    Deliberately does NOT override __init__/connect()/starttls() — those
+    stay 100% smtplib default, so self._host remains the original
+    hostname string (e.g. "smtp.gmail.com") throughout, and starttls()'s
+    own server_hostname=self._host TLS verification is completely
+    unaffected: the certificate is checked against the real hostname
+    regardless of which literal address the socket connected to.
+    """
+
+    def _get_socket(self, host, port, timeout):
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        # Stable sort: IPv6 entries first, otherwise DNS's own order is
+        # preserved within each family — never a hardcoded address, only
+        # a reordering of whatever this specific call to getaddrinfo just
+        # returned.
+        infos.sort(key=lambda info: 0 if info[0] == socket.AF_INET6 else 1)
+
+        last_err: OSError | None = None
+        for family, socktype, proto, _canonname, sockaddr in infos:
+            candidate = socket.socket(family, socktype, proto)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                candidate.settimeout(timeout)
+            try:
+                candidate.connect(sockaddr)
+                return candidate
+            except OSError as e:
+                candidate.close()
+                last_err = e
+        if last_err is not None:
+            raise last_err
+        raise OSError(f"getaddrinfo returned no usable address for {host}:{port}")
+
+
+class ResendNotConfiguredError(EmailNotConfiguredError):
+    """Subclasses EmailNotConfiguredError deliberately — every existing
+    caller that already catches EmailNotConfiguredError (e.g.
+    customer_auth/router.py's forgot_customer_password) keeps working
+    unchanged if email_provider is ever switched to "resend" for that
+    call site, with no changes needed there."""
+
+
+class ResendAPIError(Exception):
+    """A Resend API call was made (i.e. config was present) but failed —
+    distinct from ResendNotConfiguredError, which means no call was ever
+    attempted. Never constructed with the API key in its message; only
+    Resend's own (non-secret) response body/status or the underlying
+    network error type/message."""
+
+
 def send_email(
     to_email: str, subject: str, body: str, attachment_path: str | None = None,
     html_body: str | None = None, inline_images: dict[str, str] | None = None,
+    timeout: int = 15,
 ) -> None:
     """
     Plain-text-only when called the way every existing caller already does
@@ -64,7 +155,35 @@ def send_email(
     flat's cover photo) render without needing any public URL — this is a
     local dev environment with no public asset host, so a real, publicly
     reachable image URL isn't an option here.
+
+    Provider selection (settings.email_provider) happens here and ONLY
+    here — every caller above this function is completely unaware of
+    which provider is active; the signature/contract is identical either
+    way. Default is "gmail_smtp", which is the pre-existing implementation
+    below, byte-for-byte unchanged.
     """
+    if settings.email_provider == "resend":
+        _send_email_via_resend(
+            to_email, subject, body, attachment_path=attachment_path,
+            html_body=html_body, inline_images=inline_images, timeout=timeout,
+        )
+        return
+
+    _send_email_via_gmail_smtp(
+        to_email, subject, body, attachment_path=attachment_path,
+        html_body=html_body, inline_images=inline_images, timeout=timeout,
+    )
+
+
+def _send_email_via_gmail_smtp(
+    to_email: str, subject: str, body: str, attachment_path: str | None = None,
+    html_body: str | None = None, inline_images: dict[str, str] | None = None,
+    timeout: int = 15,
+) -> None:
+    """The pre-existing (pre-Resend) implementation, extracted unchanged
+    from send_email() so the provider branch above can select it — no
+    behavior, exception type, or code path here is any different from
+    before this function existed."""
     if not settings.smtp_host:
         raise EmailNotConfiguredError(
             "Email sending is not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD as environment variables."
@@ -93,12 +212,95 @@ def send_email(
         with open(attachment_path, "rb") as f:
             msg.add_attachment(f.read(), maintype="application", subtype="pdf", filename=os.path.basename(attachment_path))
 
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as server:
+    with _PreferIPv6SMTP(settings.smtp_host, settings.smtp_port, timeout=timeout) as server:
         if settings.smtp_use_tls:
             server.starttls()
         if settings.smtp_user:
             server.login(settings.smtp_user, settings.smtp_password)
         server.send_message(msg)
+
+
+def _send_email_via_resend(
+    to_email: str, subject: str, body: str, attachment_path: str | None = None,
+    html_body: str | None = None, inline_images: dict[str, str] | None = None,
+    timeout: int = 15,
+) -> None:
+    """Resend HTTP API implementation — POST https://api.resend.com/emails,
+    same pattern this file already uses for send_sms/send_whatsapp (a
+    plain httpx.post + raise_for_status(), no new SDK dependency).
+
+    Sender is ALWAYS settings.resend_from_email — never
+    settings.smtp_from_email (a different, unverified-with-Resend domain).
+
+    inline_images: CORRECTED — Resend's attachments[] array DOES have a
+    real content_id field for exactly this (their own docs: "include the
+    ID in the src attribute of the img tag, e.g. <img src=\"cid:...\">"),
+    the same cid: convention MIME uses. html_body is passed through
+    completely unmodified — no substitution, no base64 data: URI inlined
+    into the HTML text. Each inline image instead becomes its own
+    attachments[] entry with content_id set to its cid, exactly mirroring
+    how _send_email_via_gmail_smtp's msg.add_related(...) already keeps
+    the image out of the HTML body as a separate MIME part. (An earlier
+    version of this function inlined images as base64 data: URIs instead,
+    believing there was no attachment-based option — measured, on a real
+    send, to produce a >2MB HTML body that Gmail clipped. Root cause was
+    two-fold: that incorrect translation, and a ~1.55MB source logo file;
+    both are fixed as of this version.)
+    """
+    if not settings.resend_api_key:
+        raise ResendNotConfiguredError("Resend is not configured. Set RESEND_API_KEY as an environment variable.")
+    if not settings.resend_from_email:
+        raise ResendNotConfiguredError("Resend is not configured. Set RESEND_FROM_EMAIL as an environment variable.")
+
+    payload: dict = {
+        "from": settings.resend_from_email,
+        "to": [to_email],
+        "subject": subject,
+        "text": body,
+    }
+
+    if html_body:
+        payload["html"] = html_body
+
+    attachments: list[dict] = []
+
+    if inline_images:
+        for cid, path in inline_images.items():
+            if not path or not os.path.exists(path):
+                continue
+            with open(path, "rb") as f:
+                data = f.read()
+            attachments.append({
+                "filename": os.path.basename(path),
+                "content": base64.b64encode(data).decode("ascii"),
+                "content_id": cid,
+            })
+
+    if attachment_path and os.path.exists(attachment_path):
+        with open(attachment_path, "rb") as f:
+            file_bytes = f.read()
+        attachments.append({
+            "filename": os.path.basename(attachment_path),
+            "content": base64.b64encode(file_bytes).decode("ascii"),
+        })
+
+    if attachments:
+        payload["attachments"] = attachments
+
+    try:
+        response = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # e.response.text is Resend's own (non-secret) error body — the
+        # Authorization header is never included in this message.
+        raise ResendAPIError(f"Resend API returned {e.response.status_code}: {e.response.text}") from None
+    except httpx.HTTPError as e:
+        raise ResendAPIError(f"Resend API request failed: {type(e).__name__}: {e}") from None
 
 
 class SmsNotConfiguredError(Exception):
@@ -236,13 +438,23 @@ def send_customer_password_reset_email(to_email: str, subject: str, body: str, d
     db.commit()
 
 
-def send_customer_login_otp_email(to_email: str, subject: str, body: str, db: Session) -> None:
+def send_customer_login_otp_email(
+    to_email: str, subject: str, body: str, db: Session,
+    html_body: str | None = None, inline_images: dict[str, str] | None = None,
+    timeout: int = 15,
+) -> None:
     """Phase 3E counterpart to send_otp_email/send_customer_password_reset_
     email — same reasoning throughout this file: re-raises whatever
     send_email raised, only adding a NotificationLog row alongside it.
-    Never logs the OTP code — only recipient + success/error_message."""
+    Never logs the OTP code — only recipient + success/error_message.
+    html_body/inline_images are optional purely so the branded HTML
+    version (see _render_customer_otp_html) can ride along the same
+    plain-text body every existing caller already relies on. timeout is
+    only ever overridden by the LOCAL real-email OTP test path (see
+    send_customer_login_otp_email_now) — every other caller keeps the
+    default 15s production timeout unchanged."""
     try:
-        send_email(to_email, subject, body)
+        send_email(to_email, subject, body, html_body=html_body, inline_images=inline_images, timeout=timeout)
     except Exception as e:
         db.add(NotificationLog(event_type="customer_login_otp", channel="email", recipient=to_email, success=False, error_message=str(e)))
         db.commit()
@@ -264,7 +476,106 @@ def send_customer_login_otp_sms(to_phone: str, message: str, db: Session) -> Non
     db.commit()
 
 
-def dispatch_customer_login_otp_email(customer_id: uuid.UUID, subject: str, body: str) -> None:
+def _render_customer_otp_html(otp_code: str, expiry_minutes: int, settings_row) -> str:
+    """Branded HTML for the customer login OTP email — same card/logo
+    skeleton as _render_customer_welcome_html, but built around a single
+    large, high-contrast OTP display instead of a login button, since
+    reading and re-typing six digits accurately is the only thing this
+    email needs to make easy. Logo is rendered noticeably larger (72px vs
+    the 44px used elsewhere) as its own visual anchor — deliberately kept
+    inline via cid: (see send_email's html_body/inline_images docstring)
+    rather than a public asset URL, matching the pattern every other
+    branded email in this file already uses. Digit spacing on the code
+    itself is real letter-spacing on monospaced text, not embedded
+    spaces, so the value copy/pastes cleanly.
+
+    Two deliberate additions for Gmail's inbox-list preview snippet
+    specifically (Gmail generates that snippet from whatever text it
+    finds earliest in the message, not necessarily what's visually
+    first when opened — this does not force or guarantee what Gmail
+    shows, it only gives its snippet-generator the best chance of
+    finding the code without the customer opening the email):
+      1. A standard "preheader" — a zero-size, color-matched, hidden div
+         placed before everything else, containing the same plain-text
+         code/expiry a snippet generator can read. Invisible in every
+         actual rendering of the email; real content, not a trick played
+         on the recipient, only on where in the DOM it sits.
+      2. The visible code itself moved to directly under the logo, with
+         its own bold intro sentence immediately before it, rather than
+         after a separate "Hello," paragraph — so even without the
+         preheader, the code is the first substantial text in the body.
+    """
+    contact_line = " &middot; ".join(x for x in (settings_row.address, settings_row.contact_phone, settings_row.contact_email) if x)
+
+    return f"""\
+<div style="display:none;font-size:1px;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;color:#ffffff;">
+Your Sri Apartment verification code is {otp_code}. It expires in {expiry_minutes} minutes.
+</div>
+<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:0 auto;background:#ffffff;
+            border:1px solid #e6ddd0;border-radius:12px;overflow:hidden;">
+  <div style="padding:28px 24px 4px;text-align:center;">
+    <img src="cid:logo" alt="Sri Apartment Homestay" style="height:72px;width:auto;display:inline-block;">
+  </div>
+  <div style="padding:8px 32px 32px;text-align:center;">
+    <p style="color:#2b2b2b;font-size:16px;font-weight:bold;line-height:1.5;margin:12px 0 16px;">
+      Your Sri Apartment verification code is:
+    </p>
+    <div style="background:#f7f4ee;border:1px solid #e6ddd0;border-radius:10px;padding:20px 16px;margin:0 0 20px;">
+      <span style="font-family:'Courier New',Courier,monospace;font-size:40px;font-weight:bold;
+                   letter-spacing:10px;color:#1e3d32;">{otp_code}</span>
+    </div>
+    <p style="color:#2b2b2b;font-size:14px;line-height:1.6;margin:0 0 16px;">
+      This code will expire in {expiry_minutes} minutes.
+    </p>
+    <p style="color:#8a7f6c;font-size:13px;line-height:1.6;margin:0 0 4px;">
+      For your security, please do not share this verification code with anyone.
+    </p>
+    <p style="color:#8a7f6c;font-size:13px;line-height:1.6;margin:0;">
+      If you did not request this code, you can safely ignore this email.
+    </p>
+  </div>
+  <div style="background:#f1ece1;padding:18px 24px;text-align:center;color:#8a7f6c;font-size:11px;line-height:1.7;">
+    Sri Apartment Homestay<br>
+    Pondicherry, India<br>
+    {contact_line}
+  </div>
+</div>"""
+
+
+def send_customer_login_otp_email_now(account: CustomerAccount, otp_code: str, expiry_minutes: int, db: Session, timeout: int = 15) -> None:
+    """The actual content-build-and-send for a customer's login OTP email —
+    factored out of dispatch_customer_login_otp_email (which now delegates
+    to this, with its own DB session and outer catch, completely
+    unchanged in observable behavior) so the LOCAL-ONLY real-email OTP
+    test path (customer_auth/router.py's _dispatch_dev_email_otp) can also
+    call it directly, synchronously, on the request's own DB session —
+    the whole point being that path CAN observe/report the real outcome,
+    unlike the backgrounded production path this was extracted from.
+
+    Raises on failure exactly like send_customer_login_otp_email (which
+    this calls and which already writes the NotificationLog row, success
+    or failure, before returning or raising) — every caller decides for
+    itself what a failure means; this function itself is unopinionated.
+    """
+    business_settings = get_or_create_settings(db)
+    subject = "Your Sri Apartment Verification Code"
+    body = (
+        f"Hello,\n\n"
+        f"Your verification code for your Sri Apartment Homestay account is: {otp_code}\n\n"
+        f"This code will expire in {expiry_minutes} minutes.\n\n"
+        f"For your security, please do not share this verification code with anyone.\n\n"
+        f"If you did not request this code, you can safely ignore this email."
+    )
+    html_body = _render_customer_otp_html(otp_code, expiry_minutes, business_settings)
+
+    send_customer_login_otp_email(
+        account.email, subject, body, db,
+        html_body=html_body, inline_images={"logo": _DEFAULT_EMAIL_LOGO_PATH},
+        timeout=timeout,
+    )
+
+
+def dispatch_customer_login_otp_email(customer_id: uuid.UUID, otp_code: str, expiry_minutes: int) -> None:
     """
     Sends a customer's login OTP email, in its own DB session — same
     background-task pattern as dispatch_booking_notifications and
@@ -279,12 +590,11 @@ def dispatch_customer_login_otp_email(customer_id: uuid.UUID, subject: str, body
     never again delay or fail the login response — the OTP challenge is
     already created/persisted by the time this runs.
 
-    Reuses send_customer_login_otp_email completely unchanged — it
-    already writes the NotificationLog row (success or failure) and
-    commits before returning or raising; this wrapper only adds an outer
-    catch so a delivery failure can never crash the background task
-    itself, exactly like dispatch_booking_notifications' own outer
-    try/except.
+    Content-building/sending itself lives in send_customer_login_otp_email_
+    now (see its own docstring) — this wrapper only owns the DB session
+    and the outer catch, so a delivery failure can never crash the
+    background task, exactly like dispatch_booking_notifications' own
+    outer try/except.
     """
     db = SessionLocal()
     try:
@@ -292,7 +602,7 @@ def dispatch_customer_login_otp_email(customer_id: uuid.UUID, subject: str, body
         if account is None:
             logger.error("Login OTP email dispatch skipped: customer %s not found", customer_id)
             return
-        send_customer_login_otp_email(account.email, subject, body, db)
+        send_customer_login_otp_email_now(account, otp_code, expiry_minutes, db)
     except Exception:
         logger.exception("Login OTP email dispatch failed for customer %s", customer_id)
     finally:
@@ -551,6 +861,7 @@ def render_booking_confirmation_message(db: Session, booking: Booking) -> dict:
         f"Check-in: {booking.check_in} — {ctx['checkin_time']}\n"
         f"Check-out: {booking.check_out} — {ctx['checkout_time']}\n"
         f"Nights: {ctx['nights']}\n"
+        f"Guests: {booking.adults + booking.children}\n"
         f"Total: Rs. {ctx['total_amount']:.2f}\n"
         f"Paid: Rs. {ctx['payment_received']:.2f}\n"
         f"Balance: Rs. {ctx['balance_due']:.2f}\n"
@@ -755,13 +1066,103 @@ def trigger_website_booking_owner_notification(db: Session, booking: Booking, in
     return {"email": email_results, "whatsapp": whatsapp_results}
 
 
-def trigger_cancellation(db: Session, booking: Booking) -> bool | None:
+def trigger_cancellation(db: Session, booking: Booking, refund_amount: float | None = None, refund_failed_amount: float | None = None) -> dict:
+    """
+    OS10 Phase 2 Step 2/2B: notifies the guest (email) and the business
+    owner (email, both configured contacts) that a booking has been
+    cancelled — closes the "cancellation notification is not reliably
+    sent" audit finding, which root-caused to this function existing but
+    having zero callers anywhere in the codebase (confirmed by a
+    full-repo search before Step 2). Reuses the exact same helpers every
+    other trigger in this file already depends on (_log_and_maybe_send,
+    _already_sent_for_recipient, get_or_create_settings) — not a second
+    notification system.
+
+    IDEMPOTENCY: guarded per (event_type, booking_id, recipient) via
+    _already_sent_for_recipient, same pattern as
+    trigger_website_booking_owner_notification — calling this more than
+    once for the same booking never re-notifies a recipient already
+    reached. Defense-in-depth on top of the caller's own single-dispatch
+    guarantee (see dispatch_cancellation_notifications).
+
+    refund_amount/refund_failed_amount are purely informational text
+    (what actually happened, decided by the caller) — this function makes
+    no refund decision itself. refund_failed_amount is deliberately
+    surfaced to the OWNER only, not the guest: a failed refund is an
+    internal processing issue staff need to act on (see the retry-refund
+    endpoint), not something to alarm a guest about before staff has had
+    a chance to retry it.
+
+    Best-effort throughout, exactly like every other trigger here: a
+    failed send here can never roll back or block the cancellation itself.
+    """
+    from app.modules.settings.router import get_or_create_settings
+
     guest = booking.guest
-    if not guest or not guest.email:
-        return None
-    subject = "Booking Cancelled — Sri Apartment Homestay"
-    body = f"Hi {guest.name},\n\nYour booking for {booking.check_in} to {booking.check_out} has been cancelled."
-    return _log_and_maybe_send(db, "cancellation", guest.email, subject, body, booking_id=booking.id)
+    results: dict[str, bool | None] = {}
+
+    if guest and guest.email:
+        subject = "Booking Cancelled — Sri Apartment Homestay"
+        refund_line = (
+            f"\n\nA refund of Rs. {refund_amount:.2f} has been initiated to your original payment method."
+            if refund_amount else ""
+        )
+        body = (
+            f"Hi {guest.name},\n\n"
+            f"Your booking for {booking.check_in} to {booking.check_out} has been cancelled."
+            f"{refund_line}"
+        )
+        if _already_sent_for_recipient(db, "cancellation", booking.id, guest.email):
+            results[guest.email] = None
+        else:
+            results[guest.email] = _log_and_maybe_send(db, "cancellation", guest.email, subject, body, booking_id=booking.id)
+
+    settings_row = get_or_create_settings(db)
+    owner_subject = f"Booking Cancelled — {guest.name if guest else 'Guest'} ({booking.id})"
+    owner_body = (
+        f"A booking has been cancelled.\n\n"
+        f"Guest: {guest.name if guest else 'Unknown'}\n"
+        f"Booking reference: {booking.id}\n"
+        f"Check-in: {booking.check_in}\n"
+        f"Check-out: {booking.check_out}\n"
+        + (f"Refund issued: Rs. {refund_amount:.2f}\n" if refund_amount else "Refund issued: none\n")
+        + (f"\n⚠ REFUND NOT CONFIRMED: Rs. {refund_failed_amount:.2f} requires provider reconciliation. Do not retry until the provider outcome is checked.\n" if refund_failed_amount else "")
+    )
+    for recipient in (settings_row.contact_email, settings_row.secondary_contact_email):
+        if not recipient:
+            continue
+        if _already_sent_for_recipient(db, "cancellation_owner", booking.id, recipient):
+            results[recipient] = None
+            continue
+        results[recipient] = _log_and_maybe_send(db, "cancellation_owner", recipient, owner_subject, owner_body, booking_id=booking.id)
+
+    return results
+
+
+def dispatch_cancellation_notifications(booking_id: uuid.UUID, refund_amount: float | None = None, refund_failed_amount: float | None = None) -> None:
+    """
+    FastAPI BackgroundTask wrapper for trigger_cancellation — same shape
+    and same reasoning as dispatch_booking_notifications: runs in its own
+    SessionLocal() after the HTTP response has already been sent, so no
+    notification channel's speed or availability can ever delay or break
+    the cancellation response itself. Called exactly once per cancellation
+    event, from either bookings/router.py (manual, and its retry-refund
+    endpoint) or zotel/service.py (OTA-triggered), after each one's own
+    commit succeeds.
+    """
+    db = SessionLocal()
+    try:
+        booking = db.get(Booking, booking_id)
+        if booking is None:
+            logger.error("Cancellation notification dispatch skipped: booking %s not found", booking_id)
+            return
+        trigger_cancellation(db, booking, refund_amount=refund_amount, refund_failed_amount=refund_failed_amount)
+        db.commit()
+    except Exception:
+        logger.exception("Cancellation notification dispatch failed for booking %s", booking_id)
+        db.rollback()
+    finally:
+        db.close()
 
 
 def trigger_invoice_delivery(db: Session, invoice: Invoice, pdf_path: str) -> bool | None:
@@ -850,23 +1251,54 @@ def dispatch_booking_notifications(booking_id: uuid.UUID) -> None:
             logger.error("Notification dispatch skipped: booking %s not found", booking_id)
             return
         invoice = db.scalar(select(Invoice).where(Invoice.booking_id == booking.id))
-        pdf_path = invoice.pdf_path if invoice is not None else None
 
-        # Booking/notification finalization audit: the guest's invoice used
-        # to be a SEPARATE trigger_invoice_delivery email on top of this
-        # confirmation — two client emails per booking. trigger_booking_confirmation
-        # now carries the invoice attachment itself (see its own docstring),
-        # so the guest gets exactly one confirmation email, matching the
-        # same "one email, invoice attached" contract already required of
-        # the business owner email below. trigger_invoice_delivery itself
-        # is untouched and still used by the separate admin manual
-        # "resend invoice" endpoint (payments/router.py).
-        trigger_booking_confirmation(db, booking, pdf_path)
-        trigger_booking_confirmation_sms(db, booking)
-        trigger_booking_confirmation_whatsapp(db, booking)
-        trigger_website_booking_owner_notification(db, booking, invoice, pdf_path)
+        # OS10 Phase 4 Step 4A: regenerated fresh from current DB data for
+        # this send, exactly like generate_invoice_pdf_for_booking's other
+        # caller (the staff invoice-download endpoint) — never read from
+        # invoice.pdf_path, which can point at a file the ephemeral
+        # filesystem has already lost (a Railway redeploy, e.g.), in which
+        # case the email used to send successfully with no attachment and
+        # no indication anything was wrong. A regeneration failure here is
+        # logged clearly and the email still sends (without an attachment)
+        # rather than losing the booking confirmation itself — the booking
+        # and payment are already committed by the time this background
+        # task runs; nothing about a PDF-rendering problem should be able
+        # to affect that.
+        pdf_path = None
+        generated_pdf_path = None
+        if invoice is not None:
+            try:
+                generated_pdf_path = generate_invoice_pdf_for_booking(db, booking, invoice)
+                pdf_path = generated_pdf_path
+            except Exception:
+                logger.exception(
+                    "Invoice PDF regeneration failed for booking %s (invoice %s) — "
+                    "notifications will be sent without the invoice attachment",
+                    booking_id, invoice.id,
+                )
 
-        db.commit()
+        try:
+            # Booking/notification finalization audit: the guest's invoice
+            # used to be a SEPARATE trigger_invoice_delivery email on top of
+            # this confirmation — two client emails per booking.
+            # trigger_booking_confirmation now carries the invoice
+            # attachment itself (see its own docstring), so the guest gets
+            # exactly one confirmation email, matching the same "one email,
+            # invoice attached" contract already required of the business
+            # owner email below. trigger_invoice_delivery itself is
+            # untouched and still used by the separate admin manual
+            # "resend invoice" endpoint (payments/router.py).
+            trigger_booking_confirmation(db, booking, pdf_path)
+            trigger_booking_confirmation_sms(db, booking)
+            trigger_booking_confirmation_whatsapp(db, booking)
+            trigger_website_booking_owner_notification(db, booking, invoice, pdf_path)
+            db.commit()
+        finally:
+            # Cleaned up on both success and failure — this is a fresh
+            # regeneration for this send only, never the historical
+            # invoice.pdf_path file (a different, untouched path).
+            if generated_pdf_path and os.path.exists(generated_pdf_path):
+                os.remove(generated_pdf_path)
     except Exception:
         logger.exception("Booking notification dispatch failed for booking %s", booking_id)
         db.rollback()
@@ -1044,9 +1476,16 @@ def scan_and_send_due_reminders(db: Session, as_of: datetime | None = None) -> d
             results["checkout_reminder"] += 1
 
         if booking.check_out == today - timedelta(days=1) and not _already_sent(db, "review_request", booking.id):
+            # Same real, verified Google Maps listing already linked from
+            # the public website's GoogleReviewsSection (HomePage.tsx) /
+            # Footer.tsx / LocationPage.tsx — reused here, not a new or
+            # guessed URL. Opening this listing lets a signed-in guest post
+            # a review directly, same destination the website itself uses.
+            google_review_url = "https://www.google.com/maps/place//data=!4m2!3m1!1s0x3a53615790e2d601:0x9b1df761cd2112ca"
             _log_and_maybe_send(
                 db, "review_request", guest.email, "How was your stay? — Sri Apartment Homestay",
-                f"Hi {guest.name}, we hope you enjoyed your stay! We'd love it if you could leave us a review.",
+                f"Hi {guest.name}, we hope you enjoyed your stay! We'd love it if you could leave us a review.\n\n"
+                f"⭐ Leave us a Google Review: {google_review_url}",
                 booking_id=booking.id,
             )
             results["review_request"] += 1
@@ -1405,15 +1844,23 @@ def scan_and_send_escalations(db: Session, as_of: datetime | None = None) -> dic
         threshold = ESCALATION_THRESHOLD_HOURS.get(r.priority, 72)
         hours_open = (now - r.created_at).total_seconds() / 3600
         if hours_open >= threshold and r.id not in already_escalated_requests:
-            trigger_guest_request_escalated(db, r)
-            results["guest_request_escalated"] += 1
+            # trigger_guest_request_escalated returns None (no
+            # NotificationLog written at all) when there's no configured
+            # BusinessSettings.contact_email to notify — only count it as
+            # "escalated" when something was actually logged, otherwise
+            # this counter lies about what happened and, worse, a caller
+            # relying on it (e.g. a test, or a future "N escalations
+            # today" dashboard figure) would believe a notification was
+            # recorded when nothing was.
+            if trigger_guest_request_escalated(db, r) is not None:
+                results["guest_request_escalated"] += 1
 
     for t in open_tickets:
         threshold = ESCALATION_THRESHOLD_HOURS.get(t.priority, 72)
         hours_open = (now - t.created_at).total_seconds() / 3600
         if hours_open >= threshold and t.id not in already_escalated_tickets:
-            trigger_maintenance_ticket_escalated(db, t)
-            results["maintenance_ticket_escalated"] += 1
+            if trigger_maintenance_ticket_escalated(db, t) is not None:
+                results["maintenance_ticket_escalated"] += 1
 
     db.commit()
     return results

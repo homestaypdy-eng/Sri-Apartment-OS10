@@ -64,7 +64,11 @@ export default function GuestLoginPage() {
       const result = method === "phone" ? await requestPhoneOtp(identifier) : await requestEmailOtp(identifier);
       setChallengeId(result.challenge_id);
       setCode("");
-      setDevOtpCode(result.dev_otp_code ?? null);
+      if (import.meta.env.DEV === true) {
+        setDevOtpCode(result.dev_otp_code ?? null);
+      } else {
+        setDevOtpCode(null);
+      }
       setStep("verify");
       setStatus("idle");
       setCooldown(RESEND_COOLDOWN_SECONDS);
@@ -186,7 +190,7 @@ export default function GuestLoginPage() {
             Enter the code sent to <span className="font-medium text-slate-900">{identifier}</span>
           </p>
 
-          {devOtpCode && (
+          {import.meta.env.DEV === true && devOtpCode && (
             <p role="status" className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
               Development mode — your verification code is: <span className="font-mono font-semibold">{devOtpCode}</span>
             </p>

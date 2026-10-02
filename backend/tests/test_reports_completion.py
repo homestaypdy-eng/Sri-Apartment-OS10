@@ -6,6 +6,8 @@ Run with: pytest tests/test_reports_completion.py -v
 """
 import uuid
 from datetime import date, timedelta
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -134,6 +136,55 @@ def test_overdue_payment_appears_as_critical_attention_item(headers):
     assert item["severity"] == "critical"
     assert item["link"] == "/finance"
     assert "Overdue Balance Guest" in item["title"]
+
+
+@pytest.mark.parametrize(
+    ("status", "check_in_offset", "expected_severity", "expected_reason", "forbidden_reason"),
+    [
+        ("checked_in", 0, "critical", "Guest is checked in", None),
+        ("confirmed", 0, "critical", "due to check in today", "Guest is checked in"),
+        ("confirmed", -1, "critical", "past check-in date", "Guest is checked in"),
+        ("confirmed", 2, "warning", "Guest arrives in 2 day(s)", "Guest is checked in"),
+    ],
+)
+def test_unpaid_balance_alert_wording_uses_booking_status(
+    status, check_in_offset, expected_severity, expected_reason, forbidden_reason
+):
+    """Only persisted checked_in status may support checked-in alert wording."""
+    from app.modules.bookings.models import Booking
+    from app.modules.reports.service import build_attention_items
+
+    today = date(2026, 9, 29)
+    booking_id = uuid.uuid4()
+    booking = SimpleNamespace(id=booking_id, status=status)
+    db = MagicMock()
+    db.scalars.return_value.all.return_value = [booking]
+    outstanding = [{
+        "booking_id": booking_id,
+        "guest_name": "Policy Alert Guest",
+        "unit_name": "Flat A1",
+        "check_in": today + timedelta(days=check_in_offset),
+        "pending_balance": 5000,
+        "is_overdue": False,
+        "due_date": None,
+    }]
+
+    items = build_attention_items(db, today, outstanding, [], [], [], {})
+
+    assert len(items) == 1
+    item = items[0]
+    assert item["category"] == "unpaid_balance"
+    assert item["severity"] == expected_severity
+    assert item["link"] == "/finance"
+    assert item["reference_id"] == str(booking_id)
+    assert "₹5,000" in item["title"]
+    assert "₹5,000" in item["reason"]
+    assert expected_reason in item["reason"]
+    if forbidden_reason:
+        assert forbidden_reason not in item["reason"]
+    db.scalars.assert_called_once()
+    query = db.scalars.call_args.args[0]
+    assert query.column_descriptions[0]["entity"] is Booking
 
 
 def test_urgent_guest_request_past_threshold_appears_as_critical(headers):

@@ -19,8 +19,10 @@ const HOUSE_RULES = [
 ];
 const CANCELLATION_POLICY = [
   "Cancellation requests must be submitted through WhatsApp or email.",
-  "Full refund for cancellations received at least 48 hours before check-in.",
-  "No refund for cancellations received within 48 hours before check-in or after check-in.",
+  "Cancellations more than 48 hours before scheduled check-in are eligible for a 100% refund of the booking amount.",
+  "Cancellations exactly 48 hours before or within 48 hours of scheduled check-in are eligible for a 50% refund; the remaining 50% is retained as the late-cancellation charge.",
+  "At or after scheduled check-in, no automatic policy refund applies; cancellation and refund require manual/admin review.",
+  "Approved refunds are initiated promptly to the original payment method. Posting time may vary depending on the payment provider, bank, card issuer, or UPI provider.",
 ];
 
 export default function QuotationPopup({

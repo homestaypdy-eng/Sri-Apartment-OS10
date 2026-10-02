@@ -57,6 +57,15 @@ services:
       # OS10-TEST-ISOLATION-01: the ONLY database pytest is allowed to use
       # (see backend/tests/conftest.py). Separate service (test-db), never db.
       TEST_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@test-db:5432/${POSTGRES_TEST_DB:-sri_apartment_os_test}
+      GUEST_DOCUMENT_STORAGE_BACKEND: ${GUEST_DOCUMENT_STORAGE_BACKEND:-local}
+      GUEST_DOCUMENT_STORAGE_DIR: ${GUEST_DOCUMENT_STORAGE_DIR:-/tmp/sri_apartment_guest_documents}
+      GUEST_DOCUMENT_S3_BUCKET: ${GUEST_DOCUMENT_S3_BUCKET:-}
+      GUEST_DOCUMENT_S3_REGION: ${GUEST_DOCUMENT_S3_REGION:-}
+      GUEST_DOCUMENT_S3_ENDPOINT_URL: ${GUEST_DOCUMENT_S3_ENDPOINT_URL:-}
+      GUEST_DOCUMENT_S3_ADDRESSING_STYLE: ${GUEST_DOCUMENT_S3_ADDRESSING_STYLE:-auto}
+      GUEST_DOCUMENT_S3_ACCESS_KEY_ID: ${GUEST_DOCUMENT_S3_ACCESS_KEY_ID:-}
+      GUEST_DOCUMENT_S3_SECRET_ACCESS_KEY: ${GUEST_DOCUMENT_S3_SECRET_ACCESS_KEY:-}
+      GUEST_DOCUMENT_S3_SERVER_SIDE_ENCRYPTION: ${GUEST_DOCUMENT_S3_SERVER_SIDE_ENCRYPTION:-AES256}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set in .env}
       # RBAC Phase A: only consumed once, at first seed, to create the
       # initial admin account (see backend/app/db/seed.py). Empty is fine
@@ -68,6 +77,17 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-homestaypdy@gmail.com}
+      # Email provider switch — safe default "gmail_smtp" (unchanged
+      # behavior). RESEND_* only take effect if EMAIL_PROVIDER=resend is
+      # explicitly set in .env.
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-gmail_smtp}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_EMAIL: ${RESEND_FROM_EMAIL:-}
+      # LOCAL customer login Email OTP testing — never consulted in
+      # production (see customer_auth/router.py). Safe defaults: no real
+      # email is ever sent unless both are explicitly overridden in .env.
+      CUSTOMER_AUTH_EMAIL_OTP_MODE: ${CUSTOMER_AUTH_EMAIL_OTP_MODE:-dev_code}
+      CUSTOMER_AUTH_EMAIL_OTP_TEST_ALLOWLIST: ${CUSTOMER_AUTH_EMAIL_OTP_TEST_ALLOWLIST:-}
       # Base URL of the public customer-facing website — password-reset
       # links and, since Phase 3G, every redirect back to the frontend
       # after a Google OAuth attempt. Production sets this to
@@ -94,6 +114,7 @@ services:
       WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:-v19.0}
       ENABLE_SCHEDULER: ${ENABLE_SCHEDULER:-false}
       REMINDER_SCAN_INTERVAL_MINUTES: ${REMINDER_SCAN_INTERVAL_MINUTES:-60}
+      ZOTEL_SYNC_INTERVAL_MINUTES: ${ZOTEL_SYNC_INTERVAL_MINUTES:-15}
       ENVIRONMENT: ${ENVIRONMENT:-production}
     ports:
       - "8000:8000"
@@ -136,7 +157,7 @@ services:
     build:
       context: ./frontend
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000/api/v1}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:?VITE_API_BASE_URL must be set for the frontend build}
     depends_on:
       backend:
         condition: service_healthy

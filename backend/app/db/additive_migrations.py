@@ -8,7 +8,7 @@ meaning. Safe to run repeatedly against a database that already has some
 or all of these columns.
 """
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 MIGRATION_STATEMENTS = [
     # Outstanding Payments report needs a due date to compare against
@@ -263,6 +263,13 @@ MIGRATION_STATEMENTS = [
     # constraint without needing Alembic.
     "ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS phone VARCHAR(20)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_customer_accounts_phone_unique ON customer_accounts (phone) WHERE phone IS NOT NULL",
+    # A customer account's verified second-factor channels establish the
+    # evidence used for an explicit, unambiguous association with one
+    # booking-side Main Guest. Existing accounts remain unlinked until the
+    # customer invokes that flow; no contact/name backfill is performed.
+    "ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ",
+    "ALTER TABLE customer_accounts ADD COLUMN IF NOT EXISTS guest_id UUID REFERENCES guests(id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_customer_accounts_guest_id ON customer_accounts (guest_id) WHERE guest_id IS NOT NULL",
 
     # Long-stay absolute nightly rate (see Unit model + pricing.py): a
     # stay of long_stay_min_nights or more is billed at long_stay_rate for
@@ -291,8 +298,6 @@ MIGRATION_STATEMENTS = [
     # column's Python-side default never applies to a pre-existing row.
     "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS secondary_contact_email VARCHAR(255)",
     "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS secondary_whatsapp_number VARCHAR(20)",
-    "UPDATE business_settings SET secondary_contact_email = 'sriapartmentpondy@gmail.com' WHERE secondary_contact_email IS NULL",
-    "UPDATE business_settings SET secondary_whatsapp_number = '+919361946138' WHERE secondary_whatsapp_number IS NULL",
     # Admin-control phase 2: structured unit details. All nullable, no
     # backfill — an existing unit's amenities/description text is left
     # exactly as-is; these are additive fields an admin fills in going
@@ -308,7 +313,118 @@ MIGRATION_STATEMENTS = [
     # order, no photo marked primary) for every already-uploaded photo.
     "ALTER TABLE unit_photos ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE unit_photos ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT false",
+    # GST place-of-supply (Step 1B): the guest's state as submitted at hold
+    # creation, carried on the hold (nullable, same pattern as guest_name/
+    # guest_phone/guest_email on this table) until conversion, when it's
+    # applied to the matched/created Guest row — see
+    # public_booking/router.py::_convert_hold_to_booking. Existing holds
+    # (and every hold that never collects a state) simply have NULL here,
+    # which calculate_gst() already treats as "unknown -> IGST".
+    "ALTER TABLE booking_holds ADD COLUMN IF NOT EXISTS guest_state VARCHAR(2)",
+    # OS10 Phase 2B: real, database-level idempotency for provider-mediated
+    # refunds — the same Razorpay-side refund can never be recorded twice.
+    # Partial (WHERE ... IS NOT NULL) because most Refund rows in the
+    # existing table predate gateway_refund_id ever being populated, and a
+    # failed attempt (see cancellation_service.py) never gets one at all —
+    # neither should collide with each other or block on NULL = NULL.
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_refunds_gateway_refund_id ON refunds (gateway_refund_id) WHERE gateway_refund_id IS NOT NULL",
+    # Phase 2 (payment/refund safety): client-supplied idempotency key for a
+    # gateway refund request, so a retried request (e.g. after a client-side
+    # timeout) returns the same Refund row instead of risking a second live
+    # Razorpay refund. Nullable/partial for the same reason as
+    # ux_refunds_gateway_refund_id above — most existing rows never had one.
+    "ALTER TABLE refunds ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_refunds_idempotency_key ON refunds (idempotency_key) WHERE idempotency_key IS NOT NULL",
+    # Same idempotency-key mechanism for the manual refund path (a refund is
+    # a negative-amount Payment row there, not a Refund row — see
+    # Payment.idempotency_key's own docstring).
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_payments_idempotency_key ON payments (idempotency_key) WHERE idempotency_key IS NOT NULL",
+    # Phase 2: refunds.status previously had no DB-level CHECK constraint at
+    # all (only the ORM default). NOT VALID preserves compatibility with any
+    # legacy rows while Postgres enforces it on new/updated rows going
+    # forward — same pattern as the expense constraints above.
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_refund_status') THEN ALTER TABLE refunds ADD CONSTRAINT ck_refund_status CHECK (status IN ('created', 'processed', 'failed')) NOT VALID; END IF; END $$",
+    # GuestDocument durable storage metadata. Nullable so all existing rows
+    # remain legacy records resolved by file_path until explicitly migrated.
+    "ALTER TABLE guest_documents ADD COLUMN IF NOT EXISTS storage_key VARCHAR(500)",
+    "ALTER TABLE guest_documents ADD COLUMN IF NOT EXISTS storage_backend VARCHAR(30)",
+    "ALTER TABLE guest_documents ADD COLUMN IF NOT EXISTS file_size_bytes INTEGER",
+    "ALTER TABLE guest_documents ADD COLUMN IF NOT EXISTS sha256_checksum VARCHAR(64)",
+    # Shared counters for anonymous public booking mutation rate limits.
+    # The identifier is a hash of endpoint scope + client IP, not raw IP.
+    "CREATE TABLE IF NOT EXISTS public_rate_limit_buckets (bucket_key VARCHAR(64) PRIMARY KEY, window_id BIGINT NOT NULL, request_count INTEGER NOT NULL, updated_at TIMESTAMPTZ NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS ix_public_rate_limit_buckets_updated_at ON public_rate_limit_buckets (updated_at)",
+    # Expense integrity (CRUD/approval workflow): database-level checks
+    # protect all writers, including future code paths that bypass Pydantic.
+    # NOT VALID preserves compatibility with any legacy rows while PostgreSQL
+    # enforces the checks on new/updated rows. The app validates the full row
+    # values on every current mutation path.
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_expenses_amount_positive') THEN ALTER TABLE expenses ADD CONSTRAINT ck_expenses_amount_positive CHECK (amount > 0) NOT VALID; END IF; END $$",
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_expenses_approval_status') THEN ALTER TABLE expenses ADD CONSTRAINT ck_expenses_approval_status CHECK (approval_status IN ('pending', 'approved', 'rejected')) NOT VALID; END IF; END $$",
+    # Separate ledger of actual outgoing Expense disbursements; it never
+    # reuses booking Payments or alters existing Expense rows.
+    "CREATE TABLE IF NOT EXISTS expense_payments (id UUID PRIMARY KEY, expense_id UUID NOT NULL REFERENCES expenses(id), amount NUMERIC(10,2) NOT NULL CHECK (amount > 0), payment_date DATE NOT NULL, payment_method VARCHAR(20) NOT NULL CHECK (payment_method IN ('cash', 'bank_transfer', 'upi', 'card', 'cheque')), reference_no VARCHAR(100), idempotency_key VARCHAR(128), request_fingerprint VARCHAR(64), created_by UUID REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    "ALTER TABLE expense_payments ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128)",
+    "ALTER TABLE expense_payments ADD COLUMN IF NOT EXISTS request_fingerprint VARCHAR(64)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_expense_payments_idempotency_key ON expense_payments (idempotency_key)",
+    "CREATE INDEX IF NOT EXISTS ix_expense_payments_expense_date ON expense_payments (expense_id, payment_date)",
+    # Website booking corrections (guest count + customer address): all
+    # three are on booking_holds, the table that already carries the
+    # guest info captured at hold creation before it's copied onto Guest
+    # at conversion (see guest_name/guest_phone/guest_state above) — same
+    # established pattern, not a new mechanism. Existing rows get the same
+    # safe defaults the columns declare (adults=1, matching Booking.adults'
+    # own default; address/gstin NULL, matching "nothing collected"),
+    # so no historical hold or its already-converted booking is affected.
+    "ALTER TABLE booking_holds ADD COLUMN IF NOT EXISTS adults INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE booking_holds ADD COLUMN IF NOT EXISTS guest_address TEXT",
+    "ALTER TABLE booking_holds ADD COLUMN IF NOT EXISTS guest_gstin VARCHAR(20)",
+    # Identity Verification (separate from Account Verification — see
+    # Guest.identity_status's own docstring in bookings/models.py). Every
+    # existing guest gets identity_status='not_required' by this DEFAULT —
+    # nobody is retroactively marked "verified" just because they already
+    # had an id_proof_number on file; that was never reviewed by anyone.
+    "ALTER TABLE guests ADD COLUMN IF NOT EXISTS identity_status VARCHAR(20) NOT NULL DEFAULT 'not_required'",
+    "ALTER TABLE guests ADD COLUMN IF NOT EXISTS identity_verified_at TIMESTAMPTZ",
+    "ALTER TABLE guests ADD COLUMN IF NOT EXISTS identity_verified_by UUID REFERENCES users(id)",
+    "ALTER TABLE guests ADD COLUMN IF NOT EXISTS identity_rejection_reason VARCHAR(500)",
+    "ALTER TABLE guests ADD COLUMN IF NOT EXISTS identity_verified_document_id UUID REFERENCES guest_documents(id)",
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_guest_identity_status') THEN "
+    "ALTER TABLE guests ADD CONSTRAINT ck_guest_identity_status CHECK (identity_status IN "
+    "('not_required', 'pending', 'submitted', 'under_review', 'verified', 'rejected', 'expired')) NOT VALID; END IF; END $$",
+    # Durable cancellation-policy snapshot. Nullable decision fields keep
+    # historical cancellations untouched; the only non-null column uses a
+    # safe false default for existing rows.
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_at TIMESTAMPTZ",
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_checkin_at TIMESTAMPTZ",
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_policy_percent INTEGER",
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_refund_target NUMERIC(10,2)",
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_refund_source VARCHAR(40)",
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_requires_review BOOLEAN NOT NULL DEFAULT false",
+    # Existing tables do not fire SQLAlchemy's after_create DDL listeners.
+    # Ensure the same generated date ranges and exclusion constraints used
+    # on a fresh schema are present on upgraded databases as well.
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS stay_range daterange GENERATED ALWAYS AS (daterange(check_in, check_out, '[)')) STORED",
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'bookings'::regclass AND conname = 'no_overlapping_bookings') THEN ALTER TABLE bookings ADD CONSTRAINT no_overlapping_bookings EXCLUDE USING gist (unit_id WITH =, stay_range WITH &&) WHERE (status IN ('confirmed', 'checked_in')); END IF; END $$",
+    "ALTER TABLE booking_holds ADD COLUMN IF NOT EXISTS hold_range daterange GENERATED ALWAYS AS (daterange(check_in, check_out, '[)')) STORED",
+    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'booking_holds'::regclass AND conname = 'no_overlapping_holds') THEN ALTER TABLE booking_holds ADD CONSTRAINT no_overlapping_holds EXCLUDE USING gist (unit_id WITH =, hold_range WITH &&) WHERE (status IN ('pending_payment', 'paid')); END IF; END $$",
 ]
+
+# These two installation-specific backfills used to sit among the schema
+# statements. They change business contact data and therefore are not part
+# of the migration-only pre-deploy command. `seed.run()` retains the legacy
+# bootstrap behavior by invoking the explicit data helper below.
+BUSINESS_SETTINGS_BACKFILL_STATEMENTS = [
+    "UPDATE business_settings SET secondary_contact_email = 'sriapartmentpondy@gmail.com' WHERE secondary_contact_email IS NULL",
+    "UPDATE business_settings SET secondary_whatsapp_number = '+919361946138' WHERE secondary_whatsapp_number IS NULL",
+]
+
+# BookingGuest (booking_guests) — Additional Guest / Companion assignment —
+# is a genuinely new table, not an ALTER: create_all in seed.py handles it
+# automatically since it's a real ORM model (see bookings/models.py), same
+# as PropertyFile/Loan/StaffDesignation above. No explicit CREATE TABLE
+# statement is needed here.
 
 # Property files (documents/photos) is a genuinely new table, not an
 # ALTER on an existing one — create_all in seed.py handles new tables
@@ -325,11 +441,22 @@ MIGRATION_STATEMENTS = [
 # before apply_additive_migrations in seed.py, so the FK target exists in time).
 
 
-def apply_additive_migrations(engine: Engine) -> None:
-    with engine.connect() as conn:
-        for stmt in MIGRATION_STATEMENTS:
+def apply_additive_migrations(bind: Engine | Connection) -> None:
+    """Apply schema changes, joining an existing migration transaction when given a Connection."""
+    if isinstance(bind, Engine):
+        with bind.begin() as conn:
+            apply_additive_migrations(conn)
+        return
+
+    for stmt in MIGRATION_STATEMENTS:
+        bind.execute(text(stmt))
+
+
+def migrate_business_settings_defaults(engine: Engine) -> None:
+    """Legacy bootstrap-only data backfill for secondary business contacts."""
+    with engine.begin() as conn:
+        for stmt in BUSINESS_SETTINGS_BACKFILL_STATEMENTS:
             conn.execute(text(stmt))
-        conn.commit()
 
 
 def migrate_legacy_bank_settings(engine: Engine) -> None:

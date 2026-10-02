@@ -95,7 +95,9 @@ def create_customer_account(
     return account
 
 
-def create_customer_account_via_oauth(db: Session, email: str, first_name: str, last_name: str) -> CustomerAccount:
+def create_customer_account_via_oauth(
+    db: Session, email: str, first_name: str, last_name: str, *, email_verified: bool = False,
+) -> CustomerAccount:
     """Phase 3G: creates a CustomerAccount for a brand-new Google
     sign-in — no phone (nullable at the DB level, same as any pre-Phase-
     3E legacy account — see CustomerAccount.phone's own docstring) and a
@@ -113,6 +115,7 @@ def create_customer_account_via_oauth(db: Session, email: str, first_name: str, 
         email=normalize_email(email),
         phone=None,
         password_hash=hash_password(secrets.token_urlsafe(32)),
+        email_verified_at=now if email_verified else None,
         terms_accepted_at=now,
         privacy_accepted_at=now,
     )

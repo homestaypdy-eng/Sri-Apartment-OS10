@@ -12,26 +12,32 @@ testability concession that a real production deployment would remove
 (the token would only ever reach the guest via the email/WhatsApp channel,
 never appear in an API response body).
 """
+import hashlib
+import os
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.security import TokenError, create_guest_magic_token, create_guest_session_token, decode_token
 from app.db.session import get_db
-from app.modules.bookings.models import Booking, Guest
+from app.modules.bookings import document_storage
+from app.modules.bookings.models import IDENTITY_DOCUMENT_TYPES, Booking, Guest, GuestDocument
 from app.modules.notifications.service import send_email, EmailNotConfiguredError, trigger_guest_request_created, trigger_guest_request_resolved
-from app.modules.payments.models import Invoice, Payment
-from app.modules.payments.service import generate_invoice_pdf
-from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
+from app.modules.payments.models import Invoice
+from app.modules.payments.service import generate_invoice_pdf_for_booking
 from app.modules.portal.auth_service import is_guest_session_active
 from app.modules.portal.models import REQUEST_PRIORITIES, REQUEST_STATUSES, REQUEST_TYPES, GuestRequest
 from app.modules.portal.schemas import (
     GuestBookingOut,
     GuestFeedbackCreate,
+    GuestIdentityDocumentOut,
+    GuestIdentityStatusOut,
+    GuestIdentitySubmitRequest,
     GuestProfileOut,
     GuestRequestCreate,
     GuestRequestOut,
@@ -44,6 +50,7 @@ from app.modules.portal.schemas import (
 )
 from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
+from app.shared.file_upload import EXTENSION_BY_CONTENT_TYPE, read_and_validate_upload
 from app.shared.rbac import get_current_user, require_role
 from fastapi.responses import FileResponse
 
@@ -154,6 +161,118 @@ def get_my_profile(guest: Guest = Depends(get_current_guest)):
     return guest
 
 
+# ---------------------------------------------------------------------------
+# Identity Verification (guest-facing) — entirely separate from this portal's
+# own login (magic-link / OTP), which only ever proves control of a contact
+# channel. Nothing here can set identity_status to "verified"; only an
+# authorised OS10 admin can, via POST /guests/{id}/identity/verify. Every
+# action below is scoped to the caller's OWN linked Guest record
+# (guest.id from get_current_guest, never a client-supplied guest_id), so
+# there is no path for one guest to act on another's identity record.
+# ---------------------------------------------------------------------------
+
+@router.get("/me/identity", response_model=GuestIdentityStatusOut)
+def get_my_identity(guest: Guest = Depends(get_current_guest), db: Session = Depends(get_db)):
+    most_recent_doc = db.scalar(
+        select(GuestDocument).where(GuestDocument.guest_id == guest.id).order_by(GuestDocument.uploaded_at.desc())
+    )
+    return GuestIdentityStatusOut(
+        status=guest.identity_status,
+        document_type=most_recent_doc.document_type if most_recent_doc else None,
+        document_id=most_recent_doc.id if most_recent_doc else None,
+        verified_at=guest.identity_verified_at,
+        # Section 21: a fixed, generic message — never the admin's raw
+        # internal rejection reason, which stays staff-only.
+        message=(
+            "Your identity verification could not be completed. Please submit a valid identity document."
+            if guest.identity_status == "rejected" else None
+        ),
+    )
+
+
+@router.post("/me/identity/documents", response_model=GuestIdentityDocumentOut, status_code=201)
+async def upload_my_identity_document(
+    document_type: str,
+    file: UploadFile = File(...),
+    guest: Guest = Depends(get_current_guest),
+    db: Session = Depends(get_db),
+):
+    """
+    Guest-facing counterpart to OS10's POST /guests/{id}/documents — same
+    validation (real file-signature check, not just a declared
+    Content-Type) and the same private storage backend, reused as-is.
+    guest_id always comes from the authenticated session, never a path or
+    body parameter, so this can never be used to attach a document to
+    someone else's Guest record.
+    """
+    if document_type not in IDENTITY_DOCUMENT_TYPES:
+        raise HTTPException(400, "Invalid document_type")
+
+    allowed_types = ("image/jpeg", "image/png", "image/webp", "application/pdf")
+    contents = await read_and_validate_upload(file, allowed_content_types=allowed_types, verify_signature=True)
+    ext = EXTENSION_BY_CONTENT_TYPE[file.content_type]
+    stored_object: tuple[str, str] | None = None
+    try:
+        storage_backend, storage_key = await run_in_threadpool(
+            document_storage.store_new_document, contents, ext, file.content_type,
+        )
+        stored_object = (storage_backend, storage_key)
+        stored_path = (
+            str(document_storage.storage_path(storage_backend, storage_key))
+            if storage_backend in {"local", "railway_volume"} else ""
+        )
+        doc = GuestDocument(
+            guest_id=guest.id, document_type=document_type, document_number=None,
+            filename=file.filename or storage_key, content_type=file.content_type,
+            file_path=stored_path, storage_backend=storage_backend, storage_key=storage_key,
+            file_size_bytes=len(contents), sha256_checksum=hashlib.sha256(contents).hexdigest(),
+            side="document", uploaded_by=None,  # uploaded by the guest themself, not an OS10 user
+        )
+        db.add(doc)
+        db.flush()
+        record_audit_log(db, None, "guest.identity_document_upload", entity_type="guest", entity_id=str(guest.id), details=f"Self-uploaded {document_type} via guest portal: {doc.filename}")
+        db.commit()
+        db.refresh(doc)
+        return doc
+    except document_storage.StorageUnavailable:
+        db.rollback()
+        if stored_object:
+            try:
+                await run_in_threadpool(document_storage.delete_stored_object, *stored_object)
+            except Exception:
+                pass
+        raise HTTPException(503, "Document storage is unavailable") from None
+    except Exception:
+        db.rollback()
+        if stored_object:
+            try:
+                await run_in_threadpool(document_storage.delete_stored_object, *stored_object)
+            except Exception:
+                pass
+        raise
+
+
+@router.post("/me/identity/submit", response_model=GuestIdentityStatusOut)
+def submit_my_identity(payload: GuestIdentitySubmitRequest, guest: Guest = Depends(get_current_guest), db: Session = Depends(get_db)):
+    """
+    Moves the guest's OWN Identity Verification into the OS10 review
+    queue. This — and every other endpoint in this file — can never set
+    identity_status to "verified"; only POST /guests/{id}/identity/verify
+    (admin-only, in bookings/router.py) can. A guest cannot mark
+    themselves verified through this or any other API call.
+    """
+    doc = db.get(GuestDocument, payload.document_id)
+    if doc is None or doc.guest_id != guest.id:
+        raise HTTPException(404, "Document not found")
+    if guest.identity_status in ("submitted", "under_review", "verified"):
+        raise HTTPException(409, f"Identity verification is already {guest.identity_status}")
+
+    guest.identity_status = "submitted"
+    record_audit_log(db, None, "guest.identity_submit", entity_type="guest", entity_id=str(guest.id), details=f"Submitted for review via guest portal ({doc.document_type})")
+    db.commit()
+    return GuestIdentityStatusOut(status=guest.identity_status, document_type=doc.document_type, verified_at=None, message=None)
+
+
 @router.get("/bookings", response_model=list[GuestBookingOut])
 def my_bookings(guest: Guest = Depends(get_current_guest), db: Session = Depends(get_db)):
     return db.scalars(select(Booking).where(Booking.guest_id == guest.id).order_by(Booking.check_in.desc())).all()
@@ -168,40 +287,12 @@ def download_my_invoice(booking_id: uuid.UUID, guest: Guest = Depends(get_curren
     if invoice is None:
         raise HTTPException(404, "No invoice generated for this booking yet")
 
-    from app.modules.properties.models import Unit, Property
-    unit = db.get(Unit, booking.unit_id)
-    property_ = db.get(Property, unit.property_id)
-
-    business_settings = get_or_create_settings(db)
-    bank_settings = get_or_create_bank_settings(db)
-    bank_details = {
-        "bank_name": bank_settings.bank_name,
-        "bank_account_name": bank_settings.bank_account_name,
-        "bank_account_number": bank_settings.bank_account_number,
-        "bank_ifsc": bank_settings.bank_ifsc,
-        "bank_branch": bank_settings.bank_branch,
-        "upi_id": bank_settings.upi_id,
-        "signatory_name": business_settings.signatory_name,
-        "signatory_title": business_settings.signatory_title,
-    }
-
-    payments = db.scalars(select(Payment).where(Payment.booking_id == booking_id)).all()
-    payment_received = round(sum(float(p.amount) for p in payments), 2)
-    balance_due = round(float(invoice.total) - payment_received, 2)
-
-    pdf_path = generate_invoice_pdf(
-        invoice_no=invoice.invoice_no, property_name=property_.name, property_gst_number=property_.gst_number,
-        guest_name=guest.name, guest_gst_number=guest.gst_number, unit_name=unit.name,
-        check_in=booking.check_in, check_out=booking.check_out, subtotal=float(invoice.subtotal),
-        cgst=float(invoice.cgst), sgst=float(invoice.sgst), igst=float(invoice.igst), total=float(invoice.total),
-        hsn_code=invoice.hsn_code, gst_rate_percent=float(invoice.gst_rate_percent), itc_available=invoice.itc_available,
-        bank_details=bank_details, qr_path=business_settings.qr_code_path,
-        payment_received=payment_received, balance_due=balance_due,
-        guest_phone=guest.phone, guest_email=guest.email, guest_address=guest.address,
-        num_guests=booking.adults + booking.children, rate_per_night=float(booking.rate_applied),
-        payment_mode=payments[-1].mode if payments else None,
-        extra_charges=float(booking.extra_guest_charge),
-    )
+    # Return the issued file unchanged whenever it is still available. If a
+    # storage restart removed it, regenerate from the invoice record rather
+    # than failing the customer's download outright.
+    pdf_path = invoice.pdf_path if invoice.pdf_path and os.path.isfile(invoice.pdf_path) else None
+    if pdf_path is None:
+        pdf_path = generate_invoice_pdf_for_booking(db, booking, invoice)
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"{invoice.invoice_no.replace('/', '_')}.pdf")
 
 

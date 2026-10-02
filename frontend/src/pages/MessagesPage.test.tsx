@@ -87,7 +87,11 @@ const BOOKING_DETAILS = {
 
 const CONFIRMATION_PREVIEW = {
   subject: "Booking Confirmed — Sri Apartment Homestay",
-  body: "Hi Pranay Kumar,\n\nYour booking is confirmed.\nGuests: 4\nTotal: Rs. 7350.00\nPaid: Rs. 7350.00\nBalance: Rs. 0.00\n",
+  // Matches the real backend template's shape (app/modules/notifications/
+  // service.py), which includes the internal UUID as "Booking ID: <uuid>" —
+  // this is exactly the line the frontend is expected to swap for the
+  // human-readable reference before ever showing/copying/sending it.
+  body: "Hi Pranay Kumar,\n\nYour booking is confirmed.\nBooking ID: 42e3242f-bd39-404f-b45b-a07df66dfe26\nGuests: 4\nTotal: Rs. 7350.00\nPaid: Rs. 7350.00\nBalance: Rs. 0.00\n",
   html_body: "<p>Hi Pranay Kumar</p>",
 };
 
@@ -153,7 +157,7 @@ describe("MessagesPage", () => {
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith("/messages/conversations/c1/read"));
   });
 
-  it("shows the empty booking-details state for an enquiry with no booking", async () => {
+  it("shows conversation-derived details (not invented booking data) for an enquiry with no linked booking", async () => {
     const user = userEvent.setup();
     renderPage();
     await waitFor(() => expect(screen.getByText("Enquiry Guest")).toBeInTheDocument());
@@ -164,7 +168,13 @@ describe("MessagesPage", () => {
     });
 
     await user.click(screen.getByText("Enquiry Guest"));
-    await waitFor(() => expect(screen.getByText("No booking linked to this conversation.")).toBeInTheDocument());
+    // Real, already-known conversation data is shown instead of a bare
+    // empty state — status badge, unit, requested dates, and guest count.
+    await waitFor(() => expect(screen.getByText("No confirmed booking linked yet.")).toBeInTheDocument());
+    // Appears in both the conversation list item and the new right-panel
+    // summary, so assert presence (>=1) rather than a single unique match.
+    expect(screen.getAllByText("01 Nov 2026 → 03 Nov 2026").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Flat A1").length).toBeGreaterThan(0);
   });
 
   it("auto-loads the confirmation preview with the real guest count as soon as the booking is selected — no button click needed", async () => {
@@ -185,8 +195,15 @@ describe("MessagesPage", () => {
     expect(screen.queryByRole("button", { name: /Load Confirmation Message/i })).not.toBeInTheDocument();
     expect(mocks.post).toHaveBeenCalledWith("/messages/conversations/c1/confirmation-preview");
 
+    // The internal UUID from the backend's shared template is never shown —
+    // the human-readable booking reference is used in its place.
+    expect(screen.queryByText(/42e3242f-bd39-404f-b45b-a07df66dfe26/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Booking Reference: SA-2026-1F3A9C/)).toBeInTheDocument();
+
     await user.click(screen.getByRole("button", { name: "Copy Message" }));
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(CONFIRMATION_PREVIEW.body);
+    const humanizedBody = CONFIRMATION_PREVIEW.body.replace(/^Booking ID: .*/m, "Booking Reference: SA-2026-1F3A9C");
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(humanizedBody);
+    expect(navigator.clipboard.writeText).not.toHaveBeenCalledWith(expect.stringContaining("42e3242f"));
     expect(await screen.findByText("Copied ✓")).toBeInTheDocument();
   });
 
@@ -206,7 +223,8 @@ describe("MessagesPage", () => {
 
   it("shows an empty state when there is no selected conversation", async () => {
     renderPage();
-    await waitFor(() => expect(screen.getByText("Select a conversation to view messages and booking details.")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Select a conversation")).toBeInTheDocument());
+    expect(screen.getByText("Choose a guest conversation to view messages and booking details.")).toBeInTheDocument();
   });
 
   it("shows a 'no conversations found' empty state when the filtered list is empty", async () => {

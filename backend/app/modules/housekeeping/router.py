@@ -1,6 +1,5 @@
 import os
 import uuid
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -10,9 +9,10 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
-from app.modules.housekeeping.models import TASK_STATUSES, TASK_TYPES, HousekeepingPhoto, HousekeepingTask
+from app.modules.housekeeping.models import TASK_TYPES, HousekeepingPhoto, HousekeepingTask
 from app.modules.housekeeping.schemas import HousekeepingPhotoOut, HousekeepingTaskCreate, HousekeepingTaskOut, HousekeepingTaskUpdate
-from app.modules.notifications.service import trigger_housekeeping_task_created, trigger_housekeeping_task_completed
+from app.modules.housekeeping.service import update_housekeeping_task
+from app.modules.notifications.service import trigger_housekeeping_task_created
 from app.modules.properties.models import Unit
 from app.shared.file_upload import read_and_validate_upload, IMAGE_CONTENT_TYPES
 from app.shared.rbac import get_current_user, require_role
@@ -67,43 +67,28 @@ def list_tasks(
 
 @router.patch("/{task_id}", response_model=HousekeepingTaskOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def update_task(task_id: uuid.UUID, payload: HousekeepingTaskUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    task = db.get(HousekeepingTask, task_id)
+    # Phase 6: locked FOR UPDATE so two concurrent PATCHes for the same task
+    # (e.g. two staff both trying to claim/start/complete it) serialize
+    # rather than lost-update-racing — matching the same pattern this
+    # router's staff_ops/router.py sibling already uses for MaintenanceTicket.
+    task = db.get(HousekeepingTask, task_id, with_for_update=True)
     if task is None:
         raise HTTPException(404, "Task not found")
 
-    changes = []
-    was_completed_before = task.status == "completed"
-    if payload.status is not None:
-        if payload.status not in TASK_STATUSES:
-            raise HTTPException(400, f"Invalid status '{payload.status}'")
-        changes.append(f"status: {task.status} -> {payload.status}")
-        task.status = payload.status
-        if payload.status == "in_progress" and task.started_at is None:
-            task.started_at = datetime.now(timezone.utc)
-        if payload.status == "completed":
-            task.completed_at = datetime.now(timezone.utc)
-            # Completing a cleaning task is what actually clears the room's
-            # dirty flag — this is the one place housekeeping_status flips
-            # back to clean, so it can't be marked clean without a task.
-            unit = db.get(Unit, task.unit_id)
-            unit.housekeeping_status = "clean"
-
-    # model_fields_set (not `is not None`) distinguishes "field omitted"
-    # from an explicit `assigned_to: null` — the latter now clears the
-    # assignment. Every other field on this endpoint is untouched.
-    if "assigned_to" in payload.model_fields_set:
-        new_assignee = payload.assigned_to
-        if new_assignee is not None and db.get(User, new_assignee) is None:
-            raise HTTPException(404, "Assigned user not found")
-        changes.append(f"assigned_to: {task.assigned_to} -> {new_assignee}")
-        task.assigned_to = new_assignee
-    if payload.notes is not None:
-        task.notes = payload.notes
-
-    if changes:
-        record_audit_log(db, user.id, "housekeeping.update", entity_type="housekeeping_task", entity_id=str(task.id), details="; ".join(changes))
-    if task.status == "completed" and not was_completed_before:
-        trigger_housekeeping_task_completed(db, task)
+    # Canonical mutation workflow (app/modules/housekeeping/service.py) —
+    # also called by staff_ops/router.py's unified Staff Operations
+    # endpoint, so a status change from either surface behaves identically
+    # (validation, timestamps, audit logging, notification).
+    update_housekeeping_task(
+        db, task,
+        status=payload.status,
+        assigned_to=payload.assigned_to,
+        # model_fields_set (not `is not None`) distinguishes "field omitted"
+        # from an explicit `assigned_to: null`, which clears the assignment.
+        assigned_to_set="assigned_to" in payload.model_fields_set,
+        notes=payload.notes,
+        actor_user_id=user.id,
+    )
     db.commit()
     db.refresh(task)
     return task

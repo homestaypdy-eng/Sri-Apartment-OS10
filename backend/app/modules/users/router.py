@@ -27,7 +27,10 @@ def list_users(db: Session = Depends(get_db)):
 
 @router.patch("/{user_id}", response_model=UserOut, dependencies=[Depends(require_role("admin"))])
 def update_user(user_id: uuid.UUID, payload: UserUpdate, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
-    user = db.get(User, user_id)
+    # Locked FOR UPDATE so two concurrent PATCHes on the SAME user can't
+    # lost-update each other (same pattern established for HousekeepingTask/
+    # MaintenanceTicket in Phases 6-7).
+    user = db.get(User, user_id, with_for_update=True)
     if user is None:
         raise HTTPException(404, "User not found")
 
@@ -58,7 +61,17 @@ def update_user(user_id: uuid.UUID, payload: UserUpdate, db: Session = Depends(g
         (new_role is not None and new_role.name != "admin") or payload.is_active is False
     )
     if would_lose_admin_status:
-        admin_role = db.scalar(select(Role).where(Role.name == "admin"))
+        # Phase 8: lock the shared 'admin' Role row as a serialization gate.
+        # Without it, two concurrent requests demoting/deactivating two
+        # DIFFERENT admins (e.g. admin A demotes B while admin B
+        # simultaneously demotes A) can each independently count the OTHER
+        # as still active, both pass this check, and both commit — leaving
+        # zero active admins. Locking this one shared row forces such
+        # requests to serialize: the second one re-evaluates the count only
+        # after the first has committed, so it correctly sees the reduced
+        # count. (Postgres disallows FOR UPDATE on the aggregate COUNT
+        # query itself, so the lock is taken on this row instead.)
+        admin_role = db.scalar(select(Role).where(Role.name == "admin").with_for_update())
         other_active_admins = db.scalar(
             select(func.count()).select_from(User).where(
                 User.role_id == admin_role.id, User.is_active.is_(True), User.id != user_id

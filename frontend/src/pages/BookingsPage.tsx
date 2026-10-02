@@ -1,8 +1,67 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { api, extractErrorMessage, type BookingAttachmentOut, type BookingOut, type GuestOut, type UnitOut, type PaymentOut, type PropertyOut } from "../lib/api";
-import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, SkeletonRows, EmptyState } from "../components/ui";
+import { api, extractErrorMessage, type BookingAttachmentOut, type BookingGuestsOut, type BookingOut, type GuestOut, type UnitOut, type PaymentOut, type PropertyOut } from "../lib/api";
+import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, SkeletonRows, EmptyState, type BadgeTone } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 import GuestPicker from "../components/GuestPicker";
+
+// Indian comma grouping ("₹11,340", not "₹11340" or a locale-dependent
+// "₹11 340") — explicit locale rather than a bare toLocaleString(), which
+// would otherwise fall back to the browser/OS locale's own grouping.
+function formatCurrency(value: number): string {
+  return `₹${value.toLocaleString("en-IN")}`;
+}
+
+// Fixed "en-US" Intl formatter for the month name specifically (always
+// 3-letter, always English, regardless of the browser/OS locale), with
+// day/month/year assembled explicitly in OS10's own order ("27 Sep 2026")
+// rather than trusting any single locale's own part ordering.
+const monthShortFormatter = new Intl.DateTimeFormat("en-US", { month: "short" });
+
+function formatDate(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const [year, month, day] = iso.split("-").map(Number);
+  if (!year || !month || !day) return iso;
+  const d = new Date(year, month - 1, day);
+  return `${day} ${monthShortFormatter.format(d)} ${year}`;
+}
+
+function formatDateTime(iso: string): string {
+  const d = new Date(iso);
+  const time = d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+  return `${d.getDate()} ${monthShortFormatter.format(d)} ${d.getFullYear()}, ${time}`;
+}
+
+function nightsBetween(checkIn: string, checkOut: string): number {
+  return Math.max(0, Math.round((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / (1000 * 60 * 60 * 24)));
+}
+
+// Identity Verification display — separate from Account Verification,
+// which this page never touches. Only ever changed via the dedicated
+// /guests/{id}/identity/* actions on the Guests page, never here.
+function identityStatusMeta(status: GuestOut["identity_status"]): { label: string; tone: BadgeTone } {
+  if (status === "verified") return { label: "Identity Verified", tone: "green" };
+  if (status === "submitted" || status === "under_review") return { label: "Identity Pending", tone: "amber" };
+  if (status === "pending") return { label: "Identity Pending", tone: "amber" };
+  if (status === "rejected") return { label: "Identity Rejected", tone: "red" };
+  if (status === "expired") return { label: "Identity Expired", tone: "slate" };
+  return { label: "Identity Not Verified", tone: "slate" };
+}
+
+// Same PAID / PARTIALLY PAID / PENDING vocabulary already used elsewhere in
+// OS10 (Messages/Guests booking-details panels) — derived here from the
+// same total/paid figures already shown on this page, not a new business
+// rule or an invented status value.
+function paymentStatusOf(total: number, paid: number): { label: string; tone: "green" | "amber" | "slate" } {
+  if (total > 0 && paid >= total) return { label: "Paid", tone: "green" };
+  if (paid > 0) return { label: "Partially Paid", tone: "amber" };
+  return { label: "Pending", tone: "amber" };
+}
+
+function SectionLabel({ children }: { children: string }) {
+  return <h3 className="mb-2 text-[10px] font-semibold tracking-wider text-slate-400 uppercase">{children}</h3>;
+}
+
+const INPUT_CLASSES = "w-full rounded-[10px] border border-slate-300 px-3 py-2.5 text-sm placeholder:text-slate-400";
 
 export default function BookingsPage() {
   const { role } = useAuth();
@@ -43,6 +102,13 @@ export default function BookingsPage() {
   const [archivingBooking, setArchivingBooking] = useState(false);
   const [archiveReason, setArchiveReason] = useState("");
   const detailsRef = useRef<HTMLDivElement>(null);
+
+  // Additional Guests (section 14/17) — Principal Guest stays exactly
+  // editForm.guest_id/selectedEditGuest above, unchanged; this is only the
+  // list of Additional Guests attached via the new booking_guests
+  // assignment, fetched alongside the booking's other sub-resources.
+  const [bookingGuests, setBookingGuests] = useState<BookingGuestsOut | null>(null);
+  const [showAddGuest, setShowAddGuest] = useState(false);
 
   // Clicking Edit opens the Reservation Details panel above the booking
   // table (it's a single shared panel, not one per row), which can be far
@@ -196,7 +262,7 @@ export default function BookingsPage() {
   }
 
   async function handleCancelBooking(bookingId: string) {
-    if (!window.confirm("Cancel this booking? The booking record, payments, and any invoice are preserved — this only changes its status. Refunds (if needed) are handled separately from the payment's own Refund action.")) return;
+    if (!window.confirm("Cancel this booking? OS10 determines refund eligibility and any policy refund amount. Cancellation may start the applicable refund workflow; some payment sources or cancellations at/after check-in require manual review or reconciliation. Staff cannot set the policy refund amount. Booking, payment, and invoice records are preserved.")) return;
     await transitionStatus(bookingId, "cancelled");
   }
 
@@ -247,10 +313,12 @@ export default function BookingsPage() {
     api.get(`/bookings/${b.id}/attachments`).then((r) => setAttachments(r.data)).catch(() => setAttachments([]));
     api.get(`/bookings/${b.id}/timeline`).then((r) => setTimeline(r.data.events)).catch(() => setTimeline([]));
     api.get(`/payments/${b.id}`).then((r) => setPayments(r.data)).catch(() => setPayments([]));
+    api.get(`/bookings/${b.id}/guests`).then((r) => setBookingGuests(r.data)).catch(() => setBookingGuests(null));
     setShowTimeline(false);
     setRefundingPaymentId(null);
     setArchivingBooking(false);
     setArchiveReason("");
+    setShowAddGuest(false);
   }
 
   function closeDetails() {
@@ -263,6 +331,37 @@ export default function BookingsPage() {
     setSelectedEditGuest(null);
     setArchivingBooking(false);
     setArchiveReason("");
+    setBookingGuests(null);
+    setShowAddGuest(false);
+  }
+
+  async function handleAddAdditionalGuest(guest: GuestOut) {
+    if (!detailsBookingId) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.post(`/bookings/${detailsBookingId}/guests`, { guest_id: guest.id });
+      const r = await api.get(`/bookings/${detailsBookingId}/guests`);
+      setBookingGuests(r.data);
+      setShowAddGuest(false);
+      setSuccess(`${guest.name} added as an additional guest.`);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
+  async function handleRemoveAdditionalGuest(bookingGuestId: string) {
+    if (!detailsBookingId) return;
+    setError(null);
+    setSuccess(null);
+    try {
+      await api.delete(`/bookings/${detailsBookingId}/guests/${bookingGuestId}`);
+      const r = await api.get(`/bookings/${detailsBookingId}/guests`);
+      setBookingGuests(r.data);
+      setSuccess("Additional guest removed from this booking.");
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
   }
 
   async function handleAddPayment(e: FormEvent) {
@@ -449,62 +548,75 @@ export default function BookingsPage() {
       <ErrorBanner message={error} />
       <SuccessBanner message={success} />
 
-      <Card className="mb-8 max-w-xl">
+      <Card className="!rounded-[14px] mb-8 max-w-2xl shadow-sm">
         <h2 className="text-sm font-semibold text-slate-900 mb-4">New Booking</h2>
-        <form onSubmit={handleCreate} className="space-y-3">
-          <select required value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            <option value="">Select unit...</option>
-            {bookableUnits.map((u) => (
-              <option key={u.id} value={u.id}>{u.name} (₹{u.base_rate}/night)</option>
-            ))}
-          </select>
+        <form onSubmit={handleCreate} className="space-y-4">
+          <div>
+            <SectionLabel>Booking Setup</SectionLabel>
+            <div className="space-y-3">
+              <select required value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} className={INPUT_CLASSES}>
+                <option value="">Select unit...</option>
+                {bookableUnits.map((u) => (
+                  <option key={u.id} value={u.id}>{u.name} ({formatCurrency(u.base_rate)}/night)</option>
+                ))}
+              </select>
+              <div>
+                <label className="block text-xs text-slate-500 mb-1">Guest</label>
+                <GuestPicker
+                  selectedGuest={selectedNewGuest}
+                  onSelect={(g) => { setSelectedNewGuest(g); setForm({ ...form, guest_id: g.id }); }}
+                  onClear={() => { setSelectedNewGuest(null); setForm({ ...form, guest_id: "" }); }}
+                  setError={setError}
+                />
+              </div>
+            </div>
+          </div>
 
           <div>
-            <label className="block text-xs text-slate-500 mb-1">Guest</label>
-            <GuestPicker
-              selectedGuest={selectedNewGuest}
-              onSelect={(g) => { setSelectedNewGuest(g); setForm({ ...form, guest_id: g.id }); }}
-              onClear={() => { setSelectedNewGuest(null); setForm({ ...form, guest_id: "" }); }}
-              setError={setError}
-            />
-          </div>
-
-          <div className="flex gap-3">
-            <div className="w-full">
-              <label className="block text-xs text-slate-500 mb-1">Check-in</label>
-              <input required type="date" value={form.check_in} onChange={(e) => setForm({ ...form, check_in: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            </div>
-            <div className="w-full">
-              <label className="block text-xs text-slate-500 mb-1">Check-out</label>
-              <input required type="date" value={form.check_out} onChange={(e) => setForm({ ...form, check_out: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+            <SectionLabel>Stay</SectionLabel>
+            <div className="flex gap-3">
+              <div className="w-full">
+                <label className="block text-xs text-slate-500 mb-1">Check-in</label>
+                <input required type="date" lang="en" value={form.check_in} onChange={(e) => setForm({ ...form, check_in: e.target.value })} className={INPUT_CLASSES} />
+              </div>
+              <div className="w-full">
+                <label className="block text-xs text-slate-500 mb-1">Check-out</label>
+                <input required type="date" lang="en" value={form.check_out} onChange={(e) => setForm({ ...form, check_out: e.target.value })} className={INPUT_CLASSES} />
+              </div>
             </div>
           </div>
 
-          <div className="flex gap-3">
-            <div className="w-full">
-              <label className="block text-xs text-slate-500 mb-1">Adults</label>
-              <input required type="number" min={1} value={form.adults} onChange={(e) => setForm({ ...form, adults: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            </div>
-            <div className="w-full">
-              <label className="block text-xs text-slate-500 mb-1">Children</label>
-              <input required type="number" min={0} value={form.children} onChange={(e) => setForm({ ...form, children: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            </div>
-            <div className="w-full flex items-end pb-2">
-              <label className="flex items-center gap-2 text-sm text-slate-600">
-                <input type="checkbox" checked={form.extra_bed} onChange={(e) => setForm({ ...form, extra_bed: e.target.checked })} />
-                Extra Bed
-              </label>
+          <div>
+            <SectionLabel>Guests</SectionLabel>
+            <div className="flex gap-3">
+              <div className="w-full">
+                <label className="block text-xs text-slate-500 mb-1">Adults</label>
+                <input required type="number" min={1} value={form.adults} onChange={(e) => setForm({ ...form, adults: e.target.value })} className={INPUT_CLASSES} />
+              </div>
+              <div className="w-full">
+                <label className="block text-xs text-slate-500 mb-1">Children</label>
+                <input required type="number" min={0} value={form.children} onChange={(e) => setForm({ ...form, children: e.target.value })} className={INPUT_CLASSES} />
+              </div>
+              <div className="w-full flex items-end pb-2.5">
+                <label className="flex items-center gap-2 text-sm text-slate-600">
+                  <input type="checkbox" checked={form.extra_bed} onChange={(e) => setForm({ ...form, extra_bed: e.target.checked })} />
+                  Extra Bed
+                </label>
+              </div>
             </div>
           </div>
 
-          <div className="flex gap-3">
-            <div className="w-full">
-              <label className="block text-xs text-slate-500 mb-1">Arrival Time (optional)</label>
-              <input placeholder="e.g. 14:00" value={form.arrival_time} onChange={(e) => setForm({ ...form, arrival_time: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            </div>
-            <div className="w-full">
-              <label className="block text-xs text-slate-500 mb-1">Departure Time (optional)</label>
-              <input placeholder="e.g. 11:00" value={form.departure_time} onChange={(e) => setForm({ ...form, departure_time: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <div>
+            <SectionLabel>Timing</SectionLabel>
+            <div className="flex gap-3">
+              <div className="w-full">
+                <label className="block text-xs text-slate-500 mb-1">Arrival Time (optional)</label>
+                <input placeholder="e.g. 14:00" value={form.arrival_time} onChange={(e) => setForm({ ...form, arrival_time: e.target.value })} className={INPUT_CLASSES} />
+              </div>
+              <div className="w-full">
+                <label className="block text-xs text-slate-500 mb-1">Departure Time (optional)</label>
+                <input placeholder="e.g. 11:00" value={form.departure_time} onChange={(e) => setForm({ ...form, departure_time: e.target.value })} className={INPUT_CLASSES} />
+              </div>
             </div>
           </div>
 
@@ -523,7 +635,7 @@ export default function BookingsPage() {
 
       {detailsBooking && (
         <div ref={detailsRef} tabIndex={-1} className="outline-none">
-        <Card className="mb-8">
+        <Card className="!rounded-[14px] mb-8 shadow-sm">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
               Reservation Details
@@ -532,81 +644,191 @@ export default function BookingsPage() {
             <button onClick={closeDetails} className="text-xs text-slate-400 hover:text-slate-600 underline">Close</button>
           </div>
 
-          <form onSubmit={handleSaveEdit} className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
-            <div className="sm:col-span-2">
-              <label className="block text-xs text-slate-500 mb-1">Guest</label>
-              <GuestPicker
-                selectedGuest={selectedEditGuest}
-                onSelect={(g) => { setSelectedEditGuest(g); setEditForm({ ...editForm, guest_id: g.id }); }}
-                onClear={() => { setSelectedEditGuest(null); setEditForm({ ...editForm, guest_id: "" }); }}
-                setError={setError}
-              />
+          <form onSubmit={handleSaveEdit} className="mb-4 space-y-5">
+            <div>
+              <SectionLabel>Guest &amp; Apartment</SectionLabel>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="sm:col-span-2">
+                  <label className="block text-xs text-slate-500 mb-1 flex items-center gap-1.5">
+                    Guest (Principal Guest)
+                    {selectedEditGuest && (
+                      <Badge tone={identityStatusMeta(selectedEditGuest.identity_status).tone}>
+                        {identityStatusMeta(selectedEditGuest.identity_status).label}
+                      </Badge>
+                    )}
+                  </label>
+                  <GuestPicker
+                    selectedGuest={selectedEditGuest}
+                    onSelect={(g) => { setSelectedEditGuest(g); setEditForm({ ...editForm, guest_id: g.id }); }}
+                    onClear={() => { setSelectedEditGuest(null); setEditForm({ ...editForm, guest_id: "" }); }}
+                    setError={setError}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Apartment</label>
+                  <select value={editForm.unit_id} onChange={(e) => setEditForm({ ...editForm, unit_id: e.target.value })} className={INPUT_CLASSES}>
+                    {units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Rate / night</label>
+                  <input type="number" placeholder="Rate/night" value={editForm.rate_applied} onChange={(e) => setEditForm({ ...editForm, rate_applied: e.target.value })} className={INPUT_CLASSES} />
+                </div>
+              </div>
             </div>
-            <select value={editForm.unit_id} onChange={(e) => setEditForm({ ...editForm, unit_id: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm">
-              {units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-            </select>
-            <input type="date" value={editForm.check_in} onChange={(e) => setEditForm({ ...editForm, check_in: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <input type="date" value={editForm.check_out} onChange={(e) => setEditForm({ ...editForm, check_out: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <input type="number" placeholder="Rate/night" value={editForm.rate_applied} onChange={(e) => setEditForm({ ...editForm, rate_applied: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <input type="number" min={1} placeholder="Adults" value={editForm.adults} onChange={(e) => setEditForm({ ...editForm, adults: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <input type="number" min={0} placeholder="Children" value={editForm.children} onChange={(e) => setEditForm({ ...editForm, children: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <label className="flex items-center gap-2 text-sm text-slate-600">
-              <input type="checkbox" checked={editForm.extra_bed} onChange={(e) => setEditForm({ ...editForm, extra_bed: e.target.checked })} />
-              Extra Bed
-            </label>
-            <input placeholder="Arrival time (e.g. 14:00)" value={editForm.arrival_time} onChange={(e) => setEditForm({ ...editForm, arrival_time: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <input placeholder="Departure time (e.g. 11:00)" value={editForm.departure_time} onChange={(e) => setEditForm({ ...editForm, departure_time: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <textarea
-              placeholder="Internal notes (staff-only, never shown to the guest)"
-              value={editForm.internal_notes}
-              onChange={(e) => setEditForm({ ...editForm, internal_notes: e.target.value })}
-              className="sm:col-span-2 rounded-lg border border-slate-300 px-3 py-2 text-sm"
-              rows={2}
-            />
-            <textarea
-              placeholder="Special requests (what the guest asked for)"
-              value={editForm.special_requests}
-              onChange={(e) => setEditForm({ ...editForm, special_requests: e.target.value })}
-              className="sm:col-span-2 rounded-lg border border-slate-300 px-3 py-2 text-sm"
-              rows={2}
-            />
-            <input placeholder="Reason for change (for audit log)" value={editForm.reason} onChange={(e) => setEditForm({ ...editForm, reason: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" />
-            <div className="sm:col-span-2 flex gap-3 flex-wrap">
-              <Button type="submit">Save Changes</Button>
-              {(detailsBooking.status === "confirmed" || detailsBooking.status === "inquiry") && (
-                <Button type="button" variant="danger" onClick={() => handleCancelBooking(detailsBooking.id)}>
-                  Cancel Booking
-                </Button>
-              )}
-              {isAdmin && !detailsBooking.is_archived && (
-                <Button type="button" variant="secondary" onClick={() => { setArchivingBooking(true); setArchiveReason(""); }}>
-                  Archive Booking
-                </Button>
-              )}
-              {isAdmin && detailsBooking.is_archived && (
-                <Button type="button" variant="secondary" onClick={() => handleRestoreBooking(detailsBooking.id)}>
-                  Restore Booking
-                </Button>
-              )}
-              {isAdmin && (
-                <Button type="button" variant="danger" onClick={() => handleDelete(detailsBooking.id)}>
-                  Delete Booking
-                </Button>
-              )}
+
+            <div>
+              <SectionLabel>Stay Details</SectionLabel>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Check-in</label>
+                  <input type="date" lang="en" value={editForm.check_in} onChange={(e) => setEditForm({ ...editForm, check_in: e.target.value })} className={INPUT_CLASSES} />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Check-out</label>
+                  <input type="date" lang="en" value={editForm.check_out} onChange={(e) => setEditForm({ ...editForm, check_out: e.target.value })} className={INPUT_CLASSES} />
+                </div>
+                {editForm.check_in && editForm.check_out && (
+                  <p className="text-xs text-slate-500 pb-2.5">
+                    <span className="font-semibold text-slate-800">{nightsBetween(editForm.check_in, editForm.check_out)}</span> night(s) ·{" "}
+                    {formatDate(editForm.check_in)} → {formatDate(editForm.check_out)}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <SectionLabel>Guests &amp; Timing</SectionLabel>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="flex gap-3">
+                  <div className="w-full">
+                    <label className="block text-xs text-slate-500 mb-1">Adults</label>
+                    <input type="number" min={1} placeholder="Adults" value={editForm.adults} onChange={(e) => setEditForm({ ...editForm, adults: e.target.value })} className={INPUT_CLASSES} />
+                  </div>
+                  <div className="w-full">
+                    <label className="block text-xs text-slate-500 mb-1">Children</label>
+                    <input type="number" min={0} placeholder="Children" value={editForm.children} onChange={(e) => setEditForm({ ...editForm, children: e.target.value })} className={INPUT_CLASSES} />
+                  </div>
+                </div>
+                <label className="flex items-center gap-2 text-sm text-slate-600 sm:self-center">
+                  <input type="checkbox" checked={editForm.extra_bed} onChange={(e) => setEditForm({ ...editForm, extra_bed: e.target.checked })} />
+                  Extra Bed
+                </label>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Arrival Time</label>
+                  <input placeholder="e.g. 14:00" value={editForm.arrival_time} onChange={(e) => setEditForm({ ...editForm, arrival_time: e.target.value })} className={INPUT_CLASSES} />
+                </div>
+                <div>
+                  <label className="block text-xs text-slate-500 mb-1">Departure Time</label>
+                  <input placeholder="e.g. 11:00" value={editForm.departure_time} onChange={(e) => setEditForm({ ...editForm, departure_time: e.target.value })} className={INPUT_CLASSES} />
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <SectionLabel>Additional Guests</SectionLabel>
+              <div className="space-y-2">
+                {bookingGuests && bookingGuests.additional_guests.length === 0 && !showAddGuest && (
+                  <p className="text-xs text-slate-400">No additional guests on this booking yet.</p>
+                )}
+                {bookingGuests?.additional_guests.map((ag) => (
+                  <div key={ag.id} className="flex items-center justify-between gap-2 rounded-[10px] border border-slate-200 px-3 py-2 text-sm">
+                    <div className="flex items-center gap-2 flex-wrap min-w-0">
+                      <span className="font-medium text-slate-800 truncate">{ag.name}</span>
+                      <span className="text-xs text-slate-400">{ag.phone}</span>
+                      <Badge tone={identityStatusMeta(ag.identity_status).tone}>{identityStatusMeta(ag.identity_status).label}</Badge>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveAdditionalGuest(ag.id)}
+                      aria-label={`Remove ${ag.name} from this booking`}
+                      className="shrink-0 text-xs text-red-500 hover:underline"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+
+                {showAddGuest ? (
+                  <div className="rounded-[10px] border border-slate-200 p-3">
+                    <GuestPicker
+                      selectedGuest={null}
+                      onSelect={handleAddAdditionalGuest}
+                      onClear={() => setShowAddGuest(false)}
+                      setError={setError}
+                    />
+                    <button type="button" onClick={() => setShowAddGuest(false)} className="mt-2 text-xs text-slate-500 hover:underline">
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <Button type="button" variant="secondary" onClick={() => setShowAddGuest(true)}>
+                    + Add Guest
+                  </Button>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <SectionLabel>Internal Notes</SectionLabel>
+              <div className="space-y-3">
+                <textarea
+                  placeholder="Internal notes (staff-only, never shown to the guest)"
+                  value={editForm.internal_notes}
+                  onChange={(e) => setEditForm({ ...editForm, internal_notes: e.target.value })}
+                  className={INPUT_CLASSES}
+                  rows={2}
+                />
+                <textarea
+                  placeholder="Special requests (what the guest asked for)"
+                  value={editForm.special_requests}
+                  onChange={(e) => setEditForm({ ...editForm, special_requests: e.target.value })}
+                  className={INPUT_CLASSES}
+                  rows={2}
+                />
+                <input placeholder="Reason for change (for audit log)" value={editForm.reason} onChange={(e) => setEditForm({ ...editForm, reason: e.target.value })} className={INPUT_CLASSES} />
+              </div>
+            </div>
+
+            <div>
+              <SectionLabel>Actions</SectionLabel>
+              <div className="flex gap-3 flex-wrap">
+                <Button type="submit">Save Changes</Button>
+                {(detailsBooking.status === "confirmed" || detailsBooking.status === "inquiry") && (
+                  <Button type="button" variant="warning" onClick={() => handleCancelBooking(detailsBooking.id)}>
+                    Cancel Booking
+                  </Button>
+                )}
+                {isAdmin && !detailsBooking.is_archived && (
+                  <Button type="button" variant="secondary" onClick={() => { setArchivingBooking(true); setArchiveReason(""); }}>
+                    Archive Booking
+                  </Button>
+                )}
+                {isAdmin && detailsBooking.is_archived && (
+                  <Button type="button" variant="secondary" onClick={() => handleRestoreBooking(detailsBooking.id)}>
+                    Restore Booking
+                  </Button>
+                )}
+                {isAdmin && (
+                  <Button type="button" variant="danger" onClick={() => handleDelete(detailsBooking.id)}>
+                    Delete Booking
+                  </Button>
+                )}
+              </div>
             </div>
           </form>
 
           {archivingBooking && (
-            <form onSubmit={handleArchiveBooking} className="mb-4 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm space-y-2">
+            <form onSubmit={handleArchiveBooking} className="mb-4 bg-amber-50 border border-amber-200 rounded-[10px] p-4 text-sm space-y-2">
               <h3 className="text-xs font-semibold text-amber-800 uppercase tracking-wide">Archive Booking</h3>
               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-slate-700">
                 <span>Guest: <span className="font-medium">{guestName(detailsBooking.guest_id)}</span></span>
                 <span>Apartment: <span className="font-medium">{unitName(detailsBooking.unit_id)}</span></span>
-                <span>Check-in: <span className="font-medium">{detailsBooking.check_in}</span></span>
-                <span>Check-out: <span className="font-medium">{detailsBooking.check_out}</span></span>
+                <span>Check-in: <span className="font-medium">{formatDate(detailsBooking.check_in)}</span></span>
+                <span>Check-out: <span className="font-medium">{formatDate(detailsBooking.check_out)}</span></span>
                 <span>Status: <span className="font-medium">{detailsBooking.status}</span></span>
-                <span>Estimated total: <span className="font-medium">₹{estimatedTotal(detailsBooking).toLocaleString()}</span></span>
-                <span>Advance received: <span className="font-medium">₹{netPaid(payments).toLocaleString()}</span></span>
+                <span>Estimated total: <span className="font-medium">{formatCurrency(estimatedTotal(detailsBooking))}</span></span>
+                <span>Advance received: <span className="font-medium">{formatCurrency(netPaid(payments))}</span></span>
               </div>
               <p className="text-xs text-amber-700">
                 This removes the booking from the active list. Payments, invoices, GST records, and audit history are all preserved, and it can be restored at any time.
@@ -615,7 +837,7 @@ export default function BookingsPage() {
                 placeholder="Reason (optional)"
                 value={archiveReason}
                 onChange={(e) => setArchiveReason(e.target.value)}
-                className="w-full rounded-lg border border-amber-300 px-3 py-2 text-xs"
+                className="w-full rounded-[10px] border border-amber-300 px-3 py-2 text-xs"
               />
               <div className="flex gap-2">
                 <Button type="submit" variant="danger">Archive Booking</Button>
@@ -625,22 +847,45 @@ export default function BookingsPage() {
           )}
 
           <div className="border-t border-slate-100 pt-4 mb-4">
-            <h3 className="text-xs font-semibold text-slate-700 mb-3 uppercase tracking-wide">Payments</h3>
-            <div className="flex items-center justify-between mb-3 bg-slate-50 rounded-lg px-3 py-2">
-              <span className="text-xs text-slate-500">Net Paid</span>
-              <span className="text-sm font-semibold text-slate-900">₹{netPaid(payments).toLocaleString()}</span>
-            </div>
+            <SectionLabel>Payment Summary</SectionLabel>
+            {(() => {
+              const total = estimatedTotal(detailsBooking);
+              const paid = netPaid(payments);
+              const balance = total - paid;
+              const status = paymentStatusOf(total, paid);
+              return (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                  <div className="bg-slate-50 rounded-[10px] px-3 py-2.5">
+                    <p className="text-[11px] text-slate-500">Total</p>
+                    <p className="text-sm font-semibold text-slate-900">{formatCurrency(total)}</p>
+                  </div>
+                  <div className="bg-slate-50 rounded-[10px] px-3 py-2.5">
+                    <p className="text-[11px] text-slate-500">Paid</p>
+                    <p className="text-sm font-semibold text-slate-900">{formatCurrency(paid)}</p>
+                  </div>
+                  <div className="bg-slate-50 rounded-[10px] px-3 py-2.5">
+                    <p className="text-[11px] text-slate-500">Balance</p>
+                    <p className={`text-sm font-semibold ${balance > 0 ? "text-amber-700" : "text-slate-900"}`}>{formatCurrency(Math.max(0, balance))}</p>
+                  </div>
+                  <div className="bg-slate-50 rounded-[10px] px-3 py-2.5">
+                    <p className="text-[11px] text-slate-500">Payment Status</p>
+                    <Badge tone={status.tone}>{status.label}</Badge>
+                  </div>
+                </div>
+              );
+            })()}
+            <h3 className="text-xs font-semibold text-slate-700 mb-3 uppercase tracking-wide">Payment History</h3>
 
             {isAdmin && (
               <form onSubmit={handleAddPayment} className="flex flex-wrap gap-2 mb-3">
-                <input required type="number" placeholder="Amount (₹)" value={paymentForm.amount} onChange={(e) => setPaymentForm({ ...paymentForm, amount: e.target.value })} className="w-28 rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
-                <select value={paymentForm.mode} onChange={(e) => setPaymentForm({ ...paymentForm, mode: e.target.value })} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+                <input required type="number" placeholder="Amount (₹)" value={paymentForm.amount} onChange={(e) => setPaymentForm({ ...paymentForm, amount: e.target.value })} className="w-28 rounded-[10px] border border-slate-300 px-2 py-1.5 text-xs" />
+                <select value={paymentForm.mode} onChange={(e) => setPaymentForm({ ...paymentForm, mode: e.target.value })} className="rounded-[10px] border border-slate-300 px-2 py-1.5 text-xs">
                   <option value="upi">UPI</option>
                   <option value="card">Card</option>
                   <option value="bank_transfer">Bank Transfer</option>
                   <option value="cash">Cash</option>
                 </select>
-                <input placeholder="Reference no (optional)" value={paymentForm.reference_no} onChange={(e) => setPaymentForm({ ...paymentForm, reference_no: e.target.value })} className="flex-1 min-w-[120px] rounded-lg border border-slate-300 px-2 py-1.5 text-xs" />
+                <input placeholder="Reference no (optional)" value={paymentForm.reference_no} onChange={(e) => setPaymentForm({ ...paymentForm, reference_no: e.target.value })} className="flex-1 min-w-[120px] rounded-[10px] border border-slate-300 px-2 py-1.5 text-xs" />
                 <Button type="submit">Record Payment</Button>
               </form>
             )}
@@ -657,9 +902,9 @@ export default function BookingsPage() {
                     <div key={p.id} className="border border-slate-100 rounded-lg px-3 py-2 text-xs">
                       <div className="flex items-center justify-between">
                         <span className={`font-medium ${isRefund ? "text-red-600" : "text-slate-800"}`}>
-                          {isRefund ? "Refund" : "Payment"}: ₹{Math.abs(p.amount).toLocaleString()} ({p.mode})
+                          {isRefund ? "Refund" : "Payment"}: {formatCurrency(Math.abs(p.amount))} ({p.mode})
                         </span>
-                        <span className="text-slate-400">{new Date(p.paid_at).toLocaleDateString()}</span>
+                        <span className="text-slate-400">{formatDate(p.paid_at.slice(0, 10))}</span>
                       </div>
                       {p.reference_no && <p className="text-slate-500 mt-0.5">Ref: {p.reference_no}</p>}
                       {p.refund_reason && <p className="text-slate-500 mt-0.5">Reason: {p.refund_reason}</p>}
@@ -731,7 +976,7 @@ export default function BookingsPage() {
                     <div key={i} className="text-xs border-l-2 border-slate-200 pl-3 py-1">
                       <div className="flex items-center justify-between">
                         <span className="font-medium text-slate-800">{event.action}</span>
-                        <span className="text-slate-400">{new Date(event.created_at).toLocaleString()}</span>
+                        <span className="text-slate-400">{formatDateTime(event.created_at)}</span>
                       </div>
                       <p className="text-slate-500">By {event.user_name}</p>
                       {event.details && <p className="text-slate-500 mt-0.5">{event.details}</p>}
@@ -747,7 +992,7 @@ export default function BookingsPage() {
         </div>
       )}
 
-      <Card>
+      <Card className="!rounded-[14px] shadow-sm">
         <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
           <h2 className="text-sm font-semibold text-slate-900">All Bookings</h2>
           <div className="flex items-center gap-2">
@@ -762,9 +1007,9 @@ export default function BookingsPage() {
             placeholder="Search by guest or unit..."
             value={bookingSearch}
             onChange={(e) => setBookingSearch(e.target.value)}
-            className="flex-1 min-w-[180px] rounded-lg border border-slate-300 px-3 py-1.5 text-xs"
+            className="flex-1 min-w-[180px] rounded-[10px] border border-slate-300 px-3 py-1.5 text-xs"
           />
-          <select value={bookingStatusFilter} onChange={(e) => setBookingStatusFilter(e.target.value)} className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs">
+          <select value={bookingStatusFilter} onChange={(e) => setBookingStatusFilter(e.target.value)} className="rounded-[10px] border border-slate-300 px-2 py-1.5 text-xs">
             <option value="">All statuses</option>
             <option value="confirmed">Confirmed</option>
             <option value="checked_in">Checked In</option>
@@ -791,9 +1036,9 @@ export default function BookingsPage() {
                   <tr key={b.id}>
                     <td className="px-4 py-2.5 font-medium text-slate-800">{unitName(b.unit_id)}</td>
                     <td className="px-4 py-2.5 text-slate-500">{guestName(b.guest_id)}</td>
-                    <td className="px-4 py-2.5 text-slate-500">{b.check_in}</td>
-                    <td className="px-4 py-2.5 text-slate-500">{b.check_out}</td>
-                    <td className="px-4 py-2.5 text-slate-500">₹{b.rate_applied}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{formatDate(b.check_in)}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{formatDate(b.check_out)}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{formatCurrency(b.rate_applied)}</td>
                     <td className="px-4 py-2.5 space-x-1">
                       <Badge tone={b.status === "confirmed" ? "green" : b.status === "checked_in" ? "amber" : "slate"}>{b.status}</Badge>
                       {b.is_archived && <Badge tone="amber">Archived</Badge>}

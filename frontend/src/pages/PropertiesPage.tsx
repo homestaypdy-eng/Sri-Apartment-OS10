@@ -56,6 +56,34 @@ function typeLabel(options: { value: string; label: string }[], value: string): 
   return options.find((o) => o.value === value)?.label ?? value;
 }
 
+// Same fixed apartment order the Availability Calendar and other OS10
+// operational pages use — not alphabetical, not backend-return order (the
+// API has no guaranteed ordering), so every page a staff member switches
+// between shows the same six rows in the same order.
+const UNIT_ORDER = ["A1", "A2", "B3", "B4", "C5", "C6"];
+
+function orderUnits(list: UnitOut[]): UnitOut[] {
+  return [...list].sort((a, b) => {
+    const aCode = a.unit_code || a.name;
+    const bCode = b.unit_code || b.name;
+    const aIndex = UNIT_ORDER.indexOf(aCode);
+    const bIndex = UNIT_ORDER.indexOf(bCode);
+    if (aIndex >= 0 || bIndex >= 0) return (aIndex < 0 ? UNIT_ORDER.length : aIndex) - (bIndex < 0 ? UNIT_ORDER.length : bIndex);
+    return aCode.localeCompare(bCode);
+  });
+}
+
+// Indian comma grouping ("₹3,500", not "₹3500" or a locale-dependent
+// "₹3 500") — explicit locale rather than a bare toLocaleString(), which
+// would otherwise fall back to the browser/OS locale's own grouping.
+function formatCurrency(value: number | string): string {
+  return `₹${Number(value).toLocaleString("en-IN")}`;
+}
+
+function statusLabel(status: string): string {
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
 // ---- Icons (small hand-drawn outline icons, no external icon dependency) ----
 
 function BuildingIcon(props: SVGProps<SVGSVGElement>) {
@@ -282,7 +310,7 @@ function PropertyCard({
   const location = locationParts.length > 0 ? locationParts.slice(-2).join(", ") : null;
 
   return (
-    <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5">
+    <div className="flex flex-col gap-4 rounded-[14px] border border-slate-200 bg-white p-5 shadow-sm">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
           {thumbUrl ? (
@@ -324,7 +352,7 @@ function PropertyCard({
           <p className="text-[11px] leading-tight text-slate-500">Max Guest Capacity</p>
         </div>
         <div>
-          <p className="text-lg font-semibold text-slate-900">{avgRate > 0 ? `₹${avgRate.toLocaleString()}` : "—"}</p>
+          <p className="text-lg font-semibold text-slate-900">{avgRate > 0 ? formatCurrency(avgRate) : "—"}</p>
           <p className="text-[11px] leading-tight text-slate-500">Avg. Weekday Rate</p>
         </div>
       </div>
@@ -378,6 +406,8 @@ export default function PropertiesPage() {
   const [discountTiers, setDiscountTiers] = useState<LongStayDiscountTierOut[]>([]);
   const [seasonalForm, setSeasonalForm] = useState({ name: "", start_date: "", end_date: "", rate_per_night: "" });
   const [tierForm, setTierForm] = useState({ min_nights: "", discount_percent: "" });
+  const [savingSeasonalRate, setSavingSeasonalRate] = useState(false);
+  const [savingTier, setSavingTier] = useState(false);
   const [propSearch, setPropSearch] = useState("");
   const [manageProp, setManageProp] = useState<PropertyOut | null>(null);
   const [manageForm, setManageForm] = useState<Record<string, string>>({});
@@ -986,6 +1016,12 @@ export default function PropertiesPage() {
     e.preventDefault();
     setError(null);
     setSuccess(null);
+    if (savingSeasonalRate) return;
+    if (seasonalForm.end_date < seasonalForm.start_date) {
+      setError("End date must be on or after the start date.");
+      return;
+    }
+    setSavingSeasonalRate(true);
     try {
       await api.post(`/units/${pricingUnitId}/seasonal-rates`, {
         name: seasonalForm.name,
@@ -998,6 +1034,8 @@ export default function PropertiesPage() {
       loadPricingRules(pricingUnitId);
     } catch (err) {
       setError(extractErrorMessage(err));
+    } finally {
+      setSavingSeasonalRate(false);
     }
   }
 
@@ -1015,6 +1053,8 @@ export default function PropertiesPage() {
     e.preventDefault();
     setError(null);
     setSuccess(null);
+    if (savingTier) return;
+    setSavingTier(true);
     try {
       await api.post(`/units/${pricingUnitId}/long-stay-discounts`, {
         min_nights: Number(tierForm.min_nights),
@@ -1025,6 +1065,8 @@ export default function PropertiesPage() {
       loadPricingRules(pricingUnitId);
     } catch (err) {
       setError(extractErrorMessage(err));
+    } finally {
+      setSavingTier(false);
     }
   }
 
@@ -1055,7 +1097,7 @@ export default function PropertiesPage() {
   // shows up automatically the moment a unit of that type is created.
   const presentUnitTypes = Array.from(new Set(units.map((u) => u.unit_type))).sort();
 
-  const filteredUnits = units.filter((u) => {
+  const filteredUnits = orderUnits(units).filter((u) => {
     const q = unitSearch.toLowerCase();
     const matchesSearch =
       !unitSearch ||
@@ -1091,7 +1133,7 @@ export default function PropertiesPage() {
         />
       </div>
       {filteredProperties.length === 0 ? (
-        <Card className="mb-8">
+        <Card className="!rounded-[14px] mb-8 shadow-sm">
           <EmptyState message={properties.length === 0 ? "No properties yet." : "No properties match your search."} />
         </Card>
       ) : (
@@ -1116,7 +1158,7 @@ export default function PropertiesPage() {
       )}
 
       {/* ---- Accommodations ---- */}
-      <Card className="mb-8">
+      <Card className="!rounded-[14px] mb-8 shadow-sm">
         <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <h2 className="text-sm font-semibold text-slate-900">Accommodations</h2>
           <div className="flex flex-wrap items-center gap-2">
@@ -1179,11 +1221,11 @@ export default function PropertiesPage() {
                       <Badge tone={unitTypeBadgeTone(u.unit_type)}>{typeLabel(UNIT_TYPE_OPTIONS, u.unit_type)}</Badge>
                     </td>
                     <td className="px-4 py-2.5 text-slate-500">{u.max_occupancy} Guests</td>
-                    <td className="px-4 py-2.5 text-slate-500">₹{u.base_rate}</td>
-                    <td className="px-4 py-2.5 text-slate-500">{u.weekend_rate ? `₹${u.weekend_rate}` : "—"}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{formatCurrency(u.base_rate)}</td>
+                    <td className="px-4 py-2.5 text-slate-500">{u.weekend_rate ? formatCurrency(u.weekend_rate) : "—"}</td>
                     <td className="px-4 py-2.5">
                       {u.is_active ? (
-                        <Badge tone={u.status === "available" ? "green" : "amber"}>{u.status}</Badge>
+                        <Badge tone={u.status === "available" ? "green" : "amber"}>{statusLabel(u.status)}</Badge>
                       ) : (
                         <Badge tone="slate">Inactive</Badge>
                       )}
@@ -1206,7 +1248,7 @@ export default function PropertiesPage() {
                       <p className="text-xs text-slate-400">{propertyName(u.property_id)}</p>
                     </div>
                     {u.is_active ? (
-                      <Badge tone={u.status === "available" ? "green" : "amber"}>{u.status}</Badge>
+                      <Badge tone={u.status === "available" ? "green" : "amber"}>{statusLabel(u.status)}</Badge>
                     ) : (
                       <Badge tone="slate">Inactive</Badge>
                     )}
@@ -1214,8 +1256,8 @@ export default function PropertiesPage() {
                   <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-slate-500">
                     <Badge tone={unitTypeBadgeTone(u.unit_type)}>{typeLabel(UNIT_TYPE_OPTIONS, u.unit_type)}</Badge>
                     <span>{u.max_occupancy} Guests</span>
-                    <span>₹{u.base_rate} weekday</span>
-                    {u.weekend_rate && <span>₹{u.weekend_rate} weekend</span>}
+                    <span>{formatCurrency(u.base_rate)} weekday</span>
+                    {u.weekend_rate && <span>{formatCurrency(u.weekend_rate)} weekend</span>}
                   </div>
                   <Button variant="secondary" onClick={() => openManageUnit(u)} className="flex w-full items-center justify-center">
                     {isAdmin ? "Edit" : isManager ? "Edit Pricing" : "View"}
@@ -1228,20 +1270,16 @@ export default function PropertiesPage() {
       </Card>
 
       {(isAdmin || isManager) && (
-        <Card>
+        <Card className="!rounded-[14px] shadow-sm">
           <h2 className="text-sm font-semibold text-slate-900 mb-1">Dynamic Pricing Rules</h2>
-          <p className="text-xs text-slate-400 mb-4">
-            Seasonal rates always override weekday/weekend rates for their date range. Long-stay discounts apply the
-            highest-qualifying tier's percentage off the pre-discount total — a 30-night stay gets the 30-night
-            tier, not a lower one it also happens to qualify for.
-          </p>
+          <p className="text-xs text-slate-400 mb-4">Manage seasonal, weekend and long-stay pricing rules for each apartment.</p>
           <select
             value={pricingUnitId}
             onChange={(e) => setPricingUnitId(e.target.value)}
             className="w-full sm:w-80 rounded-lg border border-slate-300 px-3 py-2 text-sm mb-6"
           >
             <option value="">Select a unit to manage its pricing rules...</option>
-            {units.map((u) => (
+            {orderUnits(units).map((u) => (
               <option key={u.id} value={u.id}>
                 {u.name}
               </option>
@@ -1251,10 +1289,12 @@ export default function PropertiesPage() {
           {pricingUnitId && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div>
-                <h3 className="text-xs font-semibold text-slate-700 mb-3 uppercase tracking-wide">Seasonal Rates</h3>
+                <h3 className="text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">Seasonal Rates</h3>
+                <p className="text-[11px] text-slate-400 mb-3">Overrides weekday/weekend rates for their date range.</p>
                 <form onSubmit={handleAddSeasonalRate} className="space-y-2 mb-4">
                   <input
                     required
+                    aria-label="Seasonal rate name"
                     placeholder="Name (e.g. Diwali 2026)"
                     value={seasonalForm.name}
                     onChange={(e) => setSeasonalForm({ ...seasonalForm, name: e.target.value })}
@@ -1264,6 +1304,7 @@ export default function PropertiesPage() {
                     <input
                       required
                       type="date"
+                      aria-label="Seasonal rate start date"
                       value={seasonalForm.start_date}
                       onChange={(e) => setSeasonalForm({ ...seasonalForm, start_date: e.target.value })}
                       className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-xs"
@@ -1271,6 +1312,8 @@ export default function PropertiesPage() {
                     <input
                       required
                       type="date"
+                      aria-label="Seasonal rate end date"
+                      min={seasonalForm.start_date || undefined}
                       value={seasonalForm.end_date}
                       onChange={(e) => setSeasonalForm({ ...seasonalForm, end_date: e.target.value })}
                       className="w-full rounded-lg border border-slate-300 px-3 py-1.5 text-xs"
@@ -1280,12 +1323,15 @@ export default function PropertiesPage() {
                     <input
                       required
                       type="number"
+                      min={0.01}
+                      step="0.01"
+                      aria-label="Seasonal rate per night"
                       placeholder="Rate / night"
                       value={seasonalForm.rate_per_night}
                       onChange={(e) => setSeasonalForm({ ...seasonalForm, rate_per_night: e.target.value })}
                       className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-xs"
                     />
-                    <Button type="submit">Add</Button>
+                    <Button type="submit" disabled={savingSeasonalRate}>{savingSeasonalRate ? "Adding..." : "Add"}</Button>
                   </div>
                 </form>
                 <div className="space-y-2">
@@ -1294,7 +1340,7 @@ export default function PropertiesPage() {
                     <div key={s.id} className="flex items-center justify-between border border-slate-100 rounded-lg px-3 py-2 text-xs">
                       <span>
                         <span className="font-medium text-slate-800">{s.name}</span>
-                        <span className="text-slate-500"> · {s.start_date} → {s.end_date} · ₹{s.rate_per_night}/night</span>
+                        <span className="text-slate-500"> · {s.start_date} → {s.end_date} · {formatCurrency(s.rate_per_night)}/night</span>
                       </span>
                       <button onClick={() => handleDeleteSeasonalRate(s.id)} className="text-red-500 hover:text-red-700 ml-2">
                         Remove
@@ -1305,12 +1351,16 @@ export default function PropertiesPage() {
               </div>
 
               <div>
-                <h3 className="text-xs font-semibold text-slate-700 mb-3 uppercase tracking-wide">Long-Stay Discounts</h3>
+                <h3 className="text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">Long-Stay Discounts</h3>
+                <p className="text-[11px] text-slate-400 mb-3">The highest-qualifying tier applies — a 30-night stay gets the 30-night tier, not a lower one it also qualifies for.</p>
                 <form onSubmit={handleAddTier} className="space-y-2 mb-4">
                   <div className="flex gap-2">
                     <input
                       required
                       type="number"
+                      min={1}
+                      step="1"
+                      aria-label="Minimum nights"
                       placeholder="Min nights (e.g. 7)"
                       value={tierForm.min_nights}
                       onChange={(e) => setTierForm({ ...tierForm, min_nights: e.target.value })}
@@ -1319,12 +1369,16 @@ export default function PropertiesPage() {
                     <input
                       required
                       type="number"
+                      min={0.01}
+                      max={100}
+                      step="0.01"
+                      aria-label="Discount percent"
                       placeholder="Discount %"
                       value={tierForm.discount_percent}
                       onChange={(e) => setTierForm({ ...tierForm, discount_percent: e.target.value })}
                       className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-xs"
                     />
-                    <Button type="submit">Add</Button>
+                    <Button type="submit" disabled={savingTier}>{savingTier ? "Adding..." : "Add"}</Button>
                   </div>
                 </form>
                 <div className="space-y-2">
@@ -1654,13 +1708,13 @@ export default function PropertiesPage() {
             </div>
             {propPnl && (
               <div className="bg-slate-50 rounded-lg p-3 text-xs space-y-1">
-                <p>Total Revenue: <span className="font-semibold text-slate-800">₹{propPnl.total_revenue.toLocaleString()}</span></p>
+                <p>Total Revenue: <span className="font-semibold text-slate-800">{formatCurrency(propPnl.total_revenue)}</span></p>
                 <p>
-                  Central / Property-wide Expenses: <span className="font-semibold text-slate-800">₹{propPnl.central_expenses.toLocaleString()}</span>
+                  Central / Property-wide Expenses: <span className="font-semibold text-slate-800">{formatCurrency(propPnl.central_expenses)}</span>
                   <span className="text-slate-400"> (not allocated to any apartment)</span>
                 </p>
-                <p>Total Expenses: <span className="font-semibold text-slate-800">₹{propPnl.total_expenses.toLocaleString()}</span></p>
-                <p>Net Profit: <span className={`font-semibold ${propPnl.net_profit >= 0 ? "text-emerald-600" : "text-red-600"}`}>₹{propPnl.net_profit.toLocaleString()}</span></p>
+                <p>Total Expenses: <span className="font-semibold text-slate-800">{formatCurrency(propPnl.total_expenses)}</span></p>
+                <p>Net Profit: <span className={`font-semibold ${propPnl.net_profit >= 0 ? "text-emerald-600" : "text-red-600"}`}>{formatCurrency(propPnl.net_profit)}</span></p>
                 <p className="text-slate-400">Across {propPnl.units.length} unit(s) this period.</p>
               </div>
             )}
@@ -1797,9 +1851,9 @@ export default function PropertiesPage() {
             <div className="mb-6 space-y-2 text-sm">
               <p><span className="text-slate-500">Type:</span> {typeLabel(UNIT_TYPE_OPTIONS, manageUnit.unit_type)}</p>
               <p><span className="text-slate-500">Max Guests:</span> {manageUnit.max_occupancy}</p>
-              <p><span className="text-slate-500">Weekday Rate:</span> ₹{manageUnit.base_rate}</p>
-              {manageUnit.weekend_rate && <p><span className="text-slate-500">Weekend Rate:</span> ₹{manageUnit.weekend_rate}</p>}
-              <p><span className="text-slate-500">Long-Stay Rate:</span> ₹{manageUnit.long_stay_rate} / night at {manageUnit.long_stay_min_nights}+ nights</p>
+              <p><span className="text-slate-500">Weekday Rate:</span> {formatCurrency(manageUnit.base_rate)}</p>
+              {manageUnit.weekend_rate && <p><span className="text-slate-500">Weekend Rate:</span> {formatCurrency(manageUnit.weekend_rate)}</p>}
+              <p><span className="text-slate-500">Long-Stay Rate:</span> {formatCurrency(manageUnit.long_stay_rate)} / night at {manageUnit.long_stay_min_nights}+ nights</p>
               {manageUnit.amenities && <p><span className="text-slate-500">Amenities:</span> {manageUnit.amenities}</p>}
               {manageUnit.description && <p className="text-slate-500">{manageUnit.description}</p>}
             </div>

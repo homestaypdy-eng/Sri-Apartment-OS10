@@ -61,7 +61,7 @@ export default function StaffPage() {
             key={t.key}
             onClick={() => setTab(t.key)}
             className={`px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 -mb-px ${
-              tab === t.key ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400 hover:text-slate-600"
+              tab === t.key ? "border-brand-green text-brand-green" : "border-transparent text-slate-400 hover:text-slate-600"
             }`}
           >
             {t.label}
@@ -462,7 +462,7 @@ function StaffProfileModal({
               key={t.key}
               onClick={() => setModalTab(t.key)}
               className={`px-3 py-1.5 text-xs font-medium whitespace-nowrap border-b-2 -mb-px ${
-                modalTab === t.key ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400 hover:text-slate-600"
+                modalTab === t.key ? "border-brand-green text-brand-green" : "border-transparent text-slate-400 hover:text-slate-600"
               }`}
             >
               {t.label}

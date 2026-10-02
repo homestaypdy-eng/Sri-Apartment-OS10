@@ -1,9 +1,53 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type HousekeepingTaskOut, type HousekeepingPhotoOut, type UnitOut, type UserOut, type TimelineEvent, type InventoryItemOut } from "../lib/api";
-import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner } from "../components/ui";
+import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner, type BadgeTone } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
 const TASK_TYPES = ["routine", "checkout_clean", "deep_clean", "inspection"];
+
+// Same standard OS10 apartment order already used on Properties &
+// Availability Calendar — this page's own copy, matching how each of those
+// pages independently keeps its own local ordering helper rather than
+// sharing one, to keep every per-page polish task narrowly scoped.
+const UNIT_ORDER = ["A1", "A2", "B3", "B4", "C5", "C6"];
+
+function orderUnits(list: UnitOut[]): UnitOut[] {
+  return [...list].sort((a, b) => {
+    const aCode = a.unit_code || a.name;
+    const bCode = b.unit_code || b.name;
+    const aIndex = UNIT_ORDER.indexOf(aCode);
+    const bIndex = UNIT_ORDER.indexOf(bCode);
+    if (aIndex >= 0 || bIndex >= 0) return (aIndex < 0 ? UNIT_ORDER.length : aIndex) - (bIndex < 0 ? UNIT_ORDER.length : bIndex);
+    return aCode.localeCompare(bCode);
+  });
+}
+
+// unit.housekeeping_status is only ever set to "clean" or "dirty" anywhere
+// in this codebase (see app/modules/properties/models.py's own comment and
+// every write site) — never invented values, just a soft-color mapping for
+// the two real ones plus a neutral, non-alarming fallback for anything
+// unexpected.
+function unitHkStatusMeta(status: string): { label: string; tone: BadgeTone } {
+  if (status === "clean") return { label: "Clean", tone: "green" };
+  if (status === "dirty") return { label: "Dirty", tone: "red" };
+  return { label: status, tone: "slate" };
+}
+
+// HousekeepingTask.status is DB-constrained to exactly these three values
+// (see app/modules/housekeeping/models.py TASK_STATUSES) — Pending/In
+// Progress/Completed, soft amber/blue/green per the approved palette.
+function taskStatusMeta(status: string): { label: string; tone: BadgeTone } {
+  if (status === "completed") return { label: "Completed", tone: "green" };
+  if (status === "in_progress") return { label: "In progress", tone: "blue" };
+  if (status === "pending") return { label: "Pending", tone: "amber" };
+  return { label: status.replace("_", " "), tone: "slate" };
+}
+
+function SectionLabel({ children }: { children: string }) {
+  return <h3 className="mb-2 text-[10px] font-semibold tracking-wider text-slate-400 uppercase">{children}</h3>;
+}
+
+const INPUT_CLASSES = "w-full rounded-[10px] border border-slate-300 px-3 py-2.5 text-sm placeholder:text-slate-400";
 
 export default function HousekeepingPage() {
   const { role } = useAuth();
@@ -83,6 +127,24 @@ export default function HousekeepingPage() {
   function staffName(id: string | null) {
     if (!id) return "Unassigned";
     return staff.find((u) => u.id === id)?.name ?? "—";
+  }
+
+  // Active-only + standard apartment order, same presentational convention
+  // already used on Properties & Availability Calendar — no new data, no
+  // change to what /units returns.
+  const orderedActiveUnits = orderUnits(units.filter((u) => u.is_active));
+
+  // Section 4 — unit-card click reuses the EXISTING task-details interaction
+  // (openDetails, already wired to the Details button below) rather than
+  // any new endpoint or business logic: a unit's card is only ever
+  // clickable when at least one already-loaded task exists for it, and
+  // clicking it opens that unit's most recently created task's existing
+  // details view. No safe interaction exists for a unit with zero tasks,
+  // so those cards stay non-clickable, per the brief.
+  function mostRecentTaskForUnit(unitId: string): HousekeepingTaskOut | undefined {
+    return tasks
+      .filter((t) => t.unit_id === unitId)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
   }
 
   async function openDetails(taskId: string) {
@@ -185,50 +247,108 @@ export default function HousekeepingPage() {
       <ErrorBanner message={error} />
       <SuccessBanner message={success} />
 
-      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 mb-8">
-        {units.map((u) => (
-          <Card key={u.id} className="flex items-center justify-between">
-            <span className="text-sm font-medium text-slate-800">{u.name}</span>
-            <Badge tone={u.housekeeping_status === "clean" ? "green" : u.housekeeping_status === "dirty" ? "red" : "amber"}>
-              {u.housekeeping_status}
-            </Badge>
-          </Card>
-        ))}
+      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-8">
+        {orderedActiveUnits.map((u) => {
+          const meta = unitHkStatusMeta(u.housekeeping_status);
+          // Existing data only — a count of already-loaded, still-open
+          // tasks for this unit. Never a new API call, never an invented
+          // field (checkout status/guest info/deadlines/priority stay out).
+          const openTaskCount = tasks.filter((t) => t.unit_id === u.id && t.status !== "completed").length;
+          const linkedTask = mostRecentTaskForUnit(u.id);
+          const cardBody = (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-medium text-slate-800">
+                  {u.name}
+                  {u.unit_code && <span className="ml-1 text-xs font-normal text-slate-400">({u.unit_code})</span>}
+                </span>
+                <Badge tone={meta.tone}>{meta.label}</Badge>
+              </div>
+              {openTaskCount > 0 && (
+                <p className="mt-2 text-xs text-slate-400">
+                  {openTaskCount} open task{openTaskCount === 1 ? "" : "s"}
+                </p>
+              )}
+            </>
+          );
+          const cardClasses = "w-full text-left bg-white rounded-[14px] border border-slate-200 shadow-sm p-4";
+          return linkedTask ? (
+            <button
+              key={u.id}
+              type="button"
+              onClick={() => openDetails(linkedTask.id)}
+              aria-label={`View housekeeping details for ${u.name}`}
+              className={`${cardClasses} transition hover:border-slate-300 hover:shadow focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-slate-900`}
+            >
+              {cardBody}
+            </button>
+          ) : (
+            <div key={u.id} className={cardClasses}>
+              {cardBody}
+            </div>
+          );
+        })}
       </div>
 
-      <Card className="mb-8 max-w-lg">
+      <Card className="!rounded-[14px] mb-8 max-w-lg shadow-sm">
         <h2 className="text-sm font-semibold text-slate-900 mb-4">Assign Cleaning Task</h2>
-        <form onSubmit={handleCreate} className="space-y-3">
-          <select required value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            <option value="">Select unit...</option>
-            {units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-          </select>
-          <select value={form.task_type} onChange={(e) => setForm({ ...form, task_type: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            {TASK_TYPES.map((t) => <option key={t} value={t}>{t.replace("_", " ")}</option>)}
-          </select>
-          <select value={form.assigned_to} onChange={(e) => setForm({ ...form, assigned_to: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            <option value="">Assign to staff (optional)...</option>
-            {staff.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
-          <input
-            placeholder="Notes (optional)"
-            value={form.notes}
-            onChange={(e) => setForm({ ...form, notes: e.target.value })}
-            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-          />
+        <form onSubmit={handleCreate} className="space-y-4">
+          <div>
+            <SectionLabel>Task Details</SectionLabel>
+            <div className="space-y-3">
+              <div>
+                <label htmlFor="hk-unit" className="mb-1 block text-xs text-slate-500">Unit</label>
+                <select id="hk-unit" required value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} className={INPUT_CLASSES}>
+                  <option value="">Select unit...</option>
+                  {orderedActiveUnits.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="hk-task-type" className="mb-1 block text-xs text-slate-500">Task Type</label>
+                <select id="hk-task-type" value={form.task_type} onChange={(e) => setForm({ ...form, task_type: e.target.value })} className={INPUT_CLASSES}>
+                  {TASK_TYPES.map((t) => <option key={t} value={t}>{t.replace("_", " ")}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="hk-assignee" className="mb-1 block text-xs text-slate-500">Assign to staff (optional)</label>
+                <select id="hk-assignee" value={form.assigned_to} onChange={(e) => setForm({ ...form, assigned_to: e.target.value })} className={INPUT_CLASSES}>
+                  <option value="">Unassigned</option>
+                  {staff.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="hk-notes" className="mb-1 block text-xs text-slate-500">Notes (optional)</label>
+                <input
+                  id="hk-notes"
+                  placeholder="Notes (optional)"
+                  value={form.notes}
+                  onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                  className={INPUT_CLASSES}
+                />
+              </div>
+            </div>
+          </div>
           <Button type="submit">Create Task</Button>
         </form>
       </Card>
 
-      <Card>
+      <Card className="!rounded-[14px] shadow-sm">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-sm font-semibold text-slate-900">Tasks</h2>
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="rounded-lg border border-slate-300 px-2 py-1 text-xs">
-            <option value="">All statuses</option>
-            <option value="pending">Pending</option>
-            <option value="in_progress">In progress</option>
-            <option value="completed">Completed</option>
-          </select>
+          <div>
+            <label htmlFor="hk-status-filter" className="sr-only">Filter by status</label>
+            <select
+              id="hk-status-filter"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="rounded-[10px] border border-slate-300 px-2.5 py-1.5 text-xs text-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-900"
+            >
+              <option value="">All statuses</option>
+              <option value="pending">Pending</option>
+              <option value="in_progress">In progress</option>
+              <option value="completed">Completed</option>
+            </select>
+          </div>
         </div>
         {loading ? (
           <Spinner label="Loading tasks..." />
@@ -236,26 +356,29 @@ export default function HousekeepingPage() {
           <EmptyState message="No housekeeping tasks yet — create one above to get started." />
         ) : (
           <Table headers={["Unit", "Type", "Assigned To", "Status", "Actions"]}>
-            {tasks.map((t) => (
-              <tr key={t.id}>
-                <td className="px-4 py-2.5 font-medium text-slate-800">{unitName(t.unit_id)}</td>
-                <td className="px-4 py-2.5 text-slate-500">{t.task_type.replace("_", " ")}</td>
-                <td className="px-4 py-2.5 text-slate-500">{staffName(t.assigned_to)}</td>
-                <td className="px-4 py-2.5">
-                  <Badge tone={t.status === "completed" ? "green" : t.status === "in_progress" ? "amber" : "slate"}>
-                    {t.status.replace("_", " ")}
-                  </Badge>
-                </td>
-                <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
-                  {t.status !== "completed" && (
-                    <Button variant="secondary" onClick={() => advanceStatus(t)}>
-                      {t.status === "pending" ? "Start" : "Mark Complete"}
+            {tasks.map((t) => {
+              const meta = taskStatusMeta(t.status);
+              return (
+                <tr key={t.id}>
+                  <td className="px-4 py-2.5 font-semibold text-slate-800">{unitName(t.unit_id)}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{t.task_type.replace("_", " ")}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{staffName(t.assigned_to)}</td>
+                  <td className="px-4 py-2.5">
+                    <Badge tone={meta.tone}>{meta.label}</Badge>
+                  </td>
+                  <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
+                    {t.status !== "completed" && (
+                      <Button onClick={() => advanceStatus(t)} aria-label={`${t.status === "pending" ? "Start" : "Mark complete"} — ${unitName(t.unit_id)}`}>
+                        {t.status === "pending" ? "Start" : "Mark Complete"}
+                      </Button>
+                    )}
+                    <Button variant="secondary" onClick={() => openDetails(t.id)} aria-label={`Details — ${unitName(t.unit_id)} ${t.task_type.replace("_", " ")}`}>
+                      Details
                     </Button>
-                  )}
-                  <Button variant="secondary" onClick={() => openDetails(t.id)}>Details</Button>
-                </td>
-              </tr>
-            ))}
+                  </td>
+                </tr>
+              );
+            })}
           </Table>
         )}
       </Card>

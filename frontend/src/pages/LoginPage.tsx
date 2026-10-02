@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { api, extractErrorMessage } from "../lib/api";
+import logo from "../assets/logo.png";
 
 type Mode = "login" | "forgot" | "reset";
 
@@ -69,8 +70,9 @@ export default function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-slate-50">
       <div className="w-full max-w-sm bg-white rounded-xl shadow-sm border border-slate-200 p-8">
-        <h1 className="text-xl font-semibold text-slate-900 mb-1">Sri Apartment OS</h1>
-        <p className="text-sm text-slate-500 mb-6">
+        <img src={logo} alt="Sri Apartment Homestay" className="h-16 w-16 rounded-full object-cover mx-auto mb-4" />
+        <h1 className="text-xl font-semibold text-slate-900 mb-1 text-center">Sri Apartment OS</h1>
+        <p className="text-sm text-slate-500 mb-6 text-center">
           {mode === "login" && "Sign in to manage bookings"}
           {mode === "forgot" && "Enter your email to receive a reset code"}
           {mode === "reset" && "Enter the code from your email and a new password"}
@@ -85,7 +87,7 @@ export default function LoginPage() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-green"
               />
             </div>
             <div>
@@ -95,7 +97,7 @@ export default function LoginPage() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-green"
               />
             </div>
 
@@ -104,7 +106,7 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-slate-900 text-white rounded-lg py-2 text-sm font-medium hover:bg-slate-800 disabled:opacity-50"
+              className="w-full bg-brand-green text-white rounded-lg py-2 text-sm font-medium hover:bg-brand-green-2 disabled:opacity-50"
             >
               {loading ? "Signing in..." : "Sign in"}
             </button>
@@ -127,7 +129,7 @@ export default function LoginPage() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-green"
               />
             </div>
             {error && <p className="text-sm text-red-600">{error}</p>}
@@ -135,7 +137,7 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-slate-900 text-white rounded-lg py-2 text-sm font-medium hover:bg-slate-800 disabled:opacity-50"
+              className="w-full bg-brand-green text-white rounded-lg py-2 text-sm font-medium hover:bg-brand-green-2 disabled:opacity-50"
             >
               {loading ? "Sending..." : "Send Reset Code"}
             </button>
@@ -164,7 +166,7 @@ export default function LoginPage() {
                 value={resetToken}
                 onChange={(e) => setResetToken(e.target.value)}
                 required
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-green"
               />
             </div>
             <div>
@@ -175,7 +177,7 @@ export default function LoginPage() {
                 onChange={(e) => setNewPassword(e.target.value)}
                 required
                 minLength={8}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-green"
               />
             </div>
             {error && <p className="text-sm text-red-600">{error}</p>}
@@ -183,7 +185,7 @@ export default function LoginPage() {
             <button
               type="submit"
               disabled={loading}
-              className="w-full bg-slate-900 text-white rounded-lg py-2 text-sm font-medium hover:bg-slate-800 disabled:opacity-50"
+              className="w-full bg-brand-green text-white rounded-lg py-2 text-sm font-medium hover:bg-brand-green-2 disabled:opacity-50"
             >
               {loading ? "Resetting..." : "Reset Password"}
             </button>

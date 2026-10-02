@@ -36,12 +36,13 @@ def headers():
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
-def _make_unit_and_guest(headers, base_rate=2500):
+def _make_unit_and_guest(headers, base_rate=2500, max_occupancy=2):
     prop = client.post("/api/v1/properties", headers=headers, json={
         "name": f"AvailTest {uuid.uuid4().hex[:6]}", "address": "Test", "state_code": "34",
     }).json()
     unit = client.post("/api/v1/units", headers=headers, json={
         "property_id": prop["id"], "name": f"AvailUnit {uuid.uuid4().hex[:6]}", "base_rate": base_rate,
+        "max_occupancy": max_occupancy,
     }).json()
     guest = client.post("/api/v1/guests", headers=headers, json={
         "name": "Avail Test Guest", "phone": f"90{uuid.uuid4().int % 10**8:08d}",
@@ -129,6 +130,46 @@ def test_non_overlapping_dates_allowed(headers):
     assert _availability(headers, unit_id, far, far + timedelta(days=2)) is True
 
 
+def test_overlap_query_handles_optional_and_uuid_booking_exclusion_on_postgres(headers):
+    """The raw SQL bind must work both without an exclusion and with a
+    PostgreSQL-typed UUID exclusion; edits exclude themselves but still see
+    a different overlapping booking."""
+    from app.db.session import SessionLocal
+    from app.shared.availability import _has_overlap
+
+    unit_id, guest_id = _make_unit_and_guest(headers)
+    unit_uuid = uuid.UUID(unit_id)
+    check_in = date(2037, 1, 10)
+    check_out = check_in + timedelta(days=2)
+
+    db = SessionLocal()
+    try:
+        free_range = _has_overlap(db, [unit_uuid], check_in, check_out)
+        assert free_range[unit_uuid] is False
+    finally:
+        db.close()
+
+    booking = client.post("/api/v1/bookings", headers=headers, json={
+        "unit_id": unit_id, "guest_id": guest_id,
+        "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+    })
+    assert booking.status_code == 201, booking.text
+    booking_uuid = uuid.UUID(booking.json()["id"])
+
+    db = SessionLocal()
+    try:
+        self_excluded = _has_overlap(
+            db, [unit_uuid], check_in, check_out, exclude_booking_id=booking_uuid,
+        )
+        other_booking_not_excluded = _has_overlap(
+            db, [unit_uuid], check_in, check_out, exclude_booking_id=uuid.uuid4(),
+        )
+        assert self_excluded[unit_uuid] is False
+        assert other_booking_not_excluded[unit_uuid] is True
+    finally:
+        db.close()
+
+
 def test_cancelled_booking_releases_inventory(headers):
     unit_id, guest_id = _make_unit_and_guest(headers)
     base = date(2031, 2, 1)
@@ -193,6 +234,43 @@ def test_expired_hold_does_not_block_os10_booking(headers):
     from sqlalchemy import text as sa_text
     db = SessionLocal()
     db.execute(sa_text("UPDATE booking_holds SET expires_at = now() - interval '1 minute' WHERE id = :id"), {"id": hold_id})
+    db.commit()
+    db.close()
+
+    assert _availability(headers, unit_id, base, base + timedelta(days=2)) is True
+    allowed = client.post("/api/v1/bookings", headers=headers, json={
+        "unit_id": unit_id, "guest_id": guest_id, "check_in": check_in, "check_out": check_out,
+    })
+    assert allowed.status_code == 201, allowed.text
+
+
+def test_cancelled_hold_does_not_block_os10_booking(headers):
+    """Same guarantee as test_expired_hold_does_not_block_os10_booking, from
+    the other release path: a hold that was explicitly cancelled (e.g. the
+    guest's Razorpay payment failed — see
+    test_razorpay_failure_cancels_hold_and_frees_unit_immediately in
+    test_public_booking_payment_gate.py, which proves the cancelled hold
+    frees the unit for a NEW hold) must equally free the unit for a direct
+    OS10 booking. unit_is_available()'s hold-overlap query only ever
+    matches status IN ('pending_payment', 'paid') — 'cancelled' is excluded
+    by that same WHERE clause, so this is the same code path as the expired
+    case, checked from the OS10-booking side instead of the hold side."""
+    unit_id, guest_id = _make_unit_and_guest(headers)
+    base = date(2031, 4, 15)
+    check_in, check_out = base.isoformat(), (base + timedelta(days=2)).isoformat()
+
+    with patch("app.modules.public_booking.router.create_order") as mock_order:
+        mock_order.return_value = {"id": f"order_{uuid.uuid4().hex[:10]}"}
+        hold_resp = client.post("/api/v1/public/holds", json={
+            "unit_id": unit_id, "check_in": check_in, "check_out": check_out,
+            "guest_name": "Cancelling Guest", "guest_phone": f"94{uuid.uuid4().int % 10**8:08d}", "guest_email": "cancelling@example.com",
+        })
+    hold_id = hold_resp.json()["hold_id"]
+
+    from app.db.session import SessionLocal
+    from sqlalchemy import text as sa_text
+    db = SessionLocal()
+    db.execute(sa_text("UPDATE booking_holds SET status = 'cancelled' WHERE id = :id"), {"id": hold_id})
     db.commit()
     db.close()
 
@@ -337,3 +415,59 @@ def test_concurrent_hold_attempts_exactly_one_succeeds(headers):
 
     assert results.count(201) == 1, f"Expected exactly 1 successful hold, got {results.count(201)} in {sorted(results)}"
     assert results.count(409) == 5, f"Expected exactly 5 conflicts, got {results.count(409)} in {sorted(results)}"
+
+
+def test_booking_max_occupancy_direct_api_and_boundary(headers):
+    unit_id, guest_id = _make_unit_and_guest(headers, max_occupancy=2)
+    base = date(2038, 1, 5)
+    exact = client.post("/api/v1/bookings", headers=headers, json={
+        "unit_id": unit_id, "guest_id": guest_id, "check_in": base.isoformat(),
+        "check_out": (base + timedelta(days=1)).isoformat(), "adults": 1, "children": 1,
+    })
+    assert exact.status_code == 201, exact.text
+    over = client.post("/api/v1/bookings", headers=headers, json={
+        "unit_id": unit_id, "guest_id": guest_id, "check_in": (base + timedelta(days=2)).isoformat(),
+        "check_out": (base + timedelta(days=3)).isoformat(), "adults": 2, "children": 1,
+    })
+    assert over.status_code == 422
+    assert "maximum occupancy" in over.json()["detail"]
+
+
+def test_unit_capacity_must_be_positive(headers):
+    prop = client.post("/api/v1/properties", headers=headers, json={
+        "name": f"CapacityProp {uuid.uuid4().hex[:6]}", "address": "Test", "state_code": "34",
+    }).json()
+    response = client.post("/api/v1/units", headers=headers, json={
+        "property_id": prop["id"], "name": "Zero capacity", "base_rate": 2000, "max_occupancy": 0,
+    })
+    assert response.status_code == 422
+
+
+def test_booking_edit_cannot_raise_party_above_capacity(headers):
+    unit_id, guest_id = _make_unit_and_guest(headers, max_occupancy=2)
+    base = date(2038, 2, 5)
+    created = client.post("/api/v1/bookings", headers=headers, json={
+        "unit_id": unit_id, "guest_id": guest_id, "check_in": base.isoformat(),
+        "check_out": (base + timedelta(days=1)).isoformat(), "adults": 1, "children": 1,
+    })
+    assert created.status_code == 201, created.text
+    changed = client.patch(f"/api/v1/bookings/{created.json()['id']}", headers=headers, json={"adults": 3, "reason": "capacity test"})
+    assert changed.status_code == 422
+
+
+def test_public_hold_rejects_over_capacity_before_provider_order(headers):
+    from app.db.session import SessionLocal
+    from app.modules.public_booking.models import PublicRateLimitBucket
+
+    with SessionLocal() as db:
+        db.query(PublicRateLimitBucket).delete(synchronize_session=False)
+        db.commit()
+    unit_id, _guest_id = _make_unit_and_guest(headers, max_occupancy=1)
+    base = date(2038, 3, 5)
+    with patch("app.modules.public_booking.router.create_order") as create_order:
+        response = client.post("/api/v1/public/holds", json={
+            "unit_id": unit_id, "check_in": base.isoformat(), "check_out": (base + timedelta(days=1)).isoformat(),
+            "guest_name": "Capacity Test", "guest_phone": "919900001111", "guest_email": "capacity@example.com", "adults": 2,
+        })
+    assert response.status_code == 422
+    create_order.assert_not_called()

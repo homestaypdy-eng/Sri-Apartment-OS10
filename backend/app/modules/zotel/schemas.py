@@ -30,6 +30,18 @@ class ZotelRoomMappingCreate(BaseModel):
     zotel_room_type_name: str | None = None
 
 
+class ZotelRoomMappingUpdate(BaseModel):
+    """All fields optional — only what's actually sent is changed, same
+    exclude_unset convention as UnitUpdate/UserUpdate elsewhere. Updates
+    the existing mapping row in place (same id/created_at); this is
+    deliberately NOT delete-then-recreate, so the row's own history
+    (and now, its audit trail) stays attached to one identity."""
+
+    unit_id: uuid.UUID | None = None
+    zotel_room_type_id: str | None = None
+    zotel_room_type_name: str | None = None
+
+
 class ZotelRoomMappingOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

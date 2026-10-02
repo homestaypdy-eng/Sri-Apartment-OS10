@@ -305,7 +305,13 @@ def test_pricing_change_audit_entry_has_manager_actor_role(admin_headers, manage
 
 @pytest.fixture()
 def _mock_create_refund(monkeypatch):
-    mock = MagicMock(return_value=None)
+    # Phase 2 (payment/refund safety): issue_refund() now reads the real
+    # Razorpay response's "id" to populate Refund.gateway_refund_id (the
+    # field the new ux_refunds_gateway_refund_id uniqueness guarantee is
+    # built on) — a plain `return_value=None` would make that a NoneType
+    # AttributeError instead of exercising the audit-log path this test is
+    # actually about.
+    mock = MagicMock(return_value={"id": f"rfnd_test_{uuid.uuid4().hex}", "status": "processed"})
     monkeypatch.setattr("app.modules.payment_gateway.router.create_refund", mock)
     return mock
 
@@ -313,6 +319,20 @@ def _mock_create_refund(monkeypatch):
 def test_payment_gateway_refund_creates_audit_entry(admin_headers, _mock_create_refund):
     _, unit = _make_property_unit(admin_headers)
     _, payment = _make_booking_with_payment(admin_headers, unit["id"], days_offset=9800, paid_amount=1000)
+    # Model a captured provider payment at the persistence boundary. The
+    # general payment endpoint intentionally represents manual-ledger modes;
+    # gateway refunds require both Razorpay mode and provider payment ID.
+    from app.db.session import SessionLocal
+    from app.modules.payments.models import Payment
+
+    db = SessionLocal()
+    try:
+        gateway_payment = db.get(Payment, uuid.UUID(payment["id"]))
+        gateway_payment.mode = "razorpay"
+        gateway_payment.reference_no = f"pay_test_{uuid.uuid4().hex}"
+        db.commit()
+    finally:
+        db.close()
 
     resp = client.post("/api/v1/payment-gateway/refunds", headers=admin_headers, json={"payment_id": payment["id"], "amount": 250, "reason": "audit test"})
     assert resp.status_code == 201, resp.text

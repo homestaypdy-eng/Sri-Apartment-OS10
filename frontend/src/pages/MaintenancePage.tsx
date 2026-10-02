@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, MAINTENANCE_TICKET_CATEGORIES, type MaintenanceTicketOut, type MaintenancePhotoOut, type UnitOut, type UserOut, type TimelineEvent } from "../lib/api";
-import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner } from "../components/ui";
+import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner, type BadgeTone } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
 const PRIORITIES = ["low", "medium", "high", "urgent"];
@@ -8,6 +8,55 @@ const CATEGORY_LABELS: Record<string, string> = {
   ac: "AC", electrical: "Electrical", plumbing: "Plumbing", water: "Water",
   appliance: "Appliance", furniture: "Furniture", internet: "Internet", other: "Other",
 };
+
+// Same standard OS10 apartment order already used on Properties,
+// Availability Calendar & Housekeeping — this page's own local copy, per
+// the established convention of not sharing it across pages.
+const UNIT_ORDER = ["A1", "A2", "B3", "B4", "C5", "C6"];
+
+function orderUnits(list: UnitOut[]): UnitOut[] {
+  return [...list].sort((a, b) => {
+    const aCode = a.unit_code || a.name;
+    const bCode = b.unit_code || b.name;
+    const aIndex = UNIT_ORDER.indexOf(aCode);
+    const bIndex = UNIT_ORDER.indexOf(bCode);
+    if (aIndex >= 0 || bIndex >= 0) return (aIndex < 0 ? UNIT_ORDER.length : aIndex) - (bIndex < 0 ? UNIT_ORDER.length : bIndex);
+    return aCode.localeCompare(bCode);
+  });
+}
+
+// MaintenanceTicket.priority is DB-constrained to exactly these four values
+// (see app/modules/maintenance/models.py TICKET_PRIORITIES) — soft
+// slate/blue/amber/red per the approved palette, never a new value.
+function priorityMeta(priority: string): { label: string; tone: BadgeTone } {
+  if (priority === "urgent") return { label: "Urgent", tone: "red" };
+  if (priority === "high") return { label: "High", tone: "amber" };
+  if (priority === "medium") return { label: "Medium", tone: "blue" };
+  if (priority === "low") return { label: "Low", tone: "slate" };
+  return { label: priority, tone: "slate" };
+}
+
+// MaintenanceTicket.status is DB-constrained to exactly these four values
+// (see app/modules/maintenance/models.py TICKET_STATUSES) — Open/In
+// Progress/Resolved/Closed, soft amber/blue/green/slate. Previously
+// resolved AND closed both rendered "green", and open had no distinct
+// color at all — this is a pure display-mapping fix, not a status change.
+function statusMeta(status: string): { label: string; tone: BadgeTone } {
+  if (status === "resolved") return { label: "Resolved", tone: "green" };
+  if (status === "closed") return { label: "Closed", tone: "slate" };
+  if (status === "in_progress") return { label: "In progress", tone: "blue" };
+  if (status === "open") return { label: "Open", tone: "amber" };
+  return { label: status.replace("_", " "), tone: "slate" };
+}
+
+function SectionLabel({ children }: { children: string }) {
+  return <h3 className="mb-2 text-[10px] font-semibold tracking-wider text-slate-400 uppercase">{children}</h3>;
+}
+
+// No explicit focus classes needed: index.css already has a global
+// `input/select/textarea:focus-visible` teal outline rule every OS10 page
+// relies on instead of a per-page override.
+const INPUT_CLASSES = "w-full rounded-[10px] border border-slate-300 px-3 py-2.5 text-sm placeholder:text-slate-400";
 
 export default function MaintenancePage() {
   const { role } = useAuth();
@@ -92,11 +141,10 @@ export default function MaintenancePage() {
     return staff.find((u) => u.id === id)?.name ?? "—";
   }
 
-  function priorityTone(p: string): "red" | "amber" | "slate" {
-    if (p === "urgent") return "red";
-    if (p === "high") return "amber";
-    return "slate";
-  }
+  // Active-only + standard apartment order — same presentational
+  // convention already applied on Properties, Availability Calendar &
+  // Housekeeping; /units itself is unchanged.
+  const orderedActiveUnits = orderUnits(units.filter((u) => u.is_active));
 
   async function openDetails(ticketId: string) {
     setDetailsTicketId(ticketId);
@@ -175,76 +223,116 @@ export default function MaintenancePage() {
       <ErrorBanner message={error} />
       <SuccessBanner message={success} />
 
-      <Card className="mb-8 max-w-lg">
+      <Card className="!rounded-[14px] mb-8 max-w-lg shadow-sm">
         <h2 className="text-sm font-semibold text-slate-900 mb-4">Raise Ticket</h2>
-        <form onSubmit={handleCreate} className="space-y-3">
-          <select required value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            <option value="">Select unit...</option>
-            {units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-          </select>
-          <textarea required placeholder="Describe the issue" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" rows={3} />
-          <select value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
-          </select>
-          <select value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            <option value="">Category (optional)...</option>
-            {MAINTENANCE_TICKET_CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABELS[c]}</option>)}
-          </select>
-          <select value={form.assigned_to} onChange={(e) => setForm({ ...form, assigned_to: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            <option value="">Assign to staff (optional)...</option>
-            {staff.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-          </select>
+        <form onSubmit={handleCreate} className="space-y-4">
+          <div>
+            <SectionLabel>Ticket Details</SectionLabel>
+            <div className="space-y-3">
+              <div>
+                <label htmlFor="mt-unit" className="mb-1 block text-xs text-slate-500">Unit</label>
+                <select id="mt-unit" required value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} className={INPUT_CLASSES}>
+                  <option value="">Select unit...</option>
+                  {orderedActiveUnits.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="mt-description" className="mb-1 block text-xs text-slate-500">Issue Description</label>
+                <textarea
+                  id="mt-description"
+                  required
+                  placeholder="Describe the issue"
+                  value={form.description}
+                  onChange={(e) => setForm({ ...form, description: e.target.value })}
+                  className={INPUT_CLASSES}
+                  rows={3}
+                />
+              </div>
+              <div>
+                <label htmlFor="mt-priority" className="mb-1 block text-xs text-slate-500">Priority</label>
+                <select id="mt-priority" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} className={INPUT_CLASSES}>
+                  {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="mt-category" className="mb-1 block text-xs text-slate-500">Category (optional)</label>
+                <select id="mt-category" value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} className={INPUT_CLASSES}>
+                  <option value="">Category (optional)...</option>
+                  {MAINTENANCE_TICKET_CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABELS[c]}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="mt-assignee" className="mb-1 block text-xs text-slate-500">Assign to Staff (optional)</label>
+                <select id="mt-assignee" value={form.assigned_to} onChange={(e) => setForm({ ...form, assigned_to: e.target.value })} className={INPUT_CLASSES}>
+                  <option value="">Unassigned</option>
+                  {staff.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                </select>
+              </div>
+            </div>
+          </div>
           <Button type="submit">Raise Ticket</Button>
         </form>
       </Card>
 
-      <Card>
+      <Card className="!rounded-[14px] shadow-sm">
         <h2 className="text-sm font-semibold text-slate-900 mb-4">Tickets</h2>
         {loading ? (
           <Spinner label="Loading tickets..." />
         ) : tickets.length === 0 ? (
           <EmptyState message="No maintenance tickets yet — raise one above to get started." />
         ) : (
-          <Table headers={["Unit", "Issue", "Category", "Priority", "Status", "Assigned To", "Cost", "Actions"]}>
-            {tickets.map((t) => (
-              <tr key={t.id}>
-                <td className="px-4 py-2.5 font-medium text-slate-800">{unitName(t.unit_id)}</td>
-                <td className="px-4 py-2.5 text-slate-500 max-w-xs">{t.description}</td>
-                <td className="px-4 py-2.5 text-slate-500">{t.category ? CATEGORY_LABELS[t.category] ?? t.category : "—"}</td>
-                <td className="px-4 py-2.5">
-                  <Badge tone={priorityTone(t.priority)}>{t.priority}</Badge>
-                </td>
-                <td className="px-4 py-2.5">
-                  <Badge tone={t.status === "closed" || t.status === "resolved" ? "green" : t.status === "in_progress" ? "amber" : "slate"}>
-                    {t.status.replace("_", " ")}
-                  </Badge>
-                </td>
-                <td className="px-4 py-2.5 text-slate-500">{staffName(t.assigned_to)}</td>
-                <td className="px-4 py-2.5 text-slate-500">{t.cost != null ? `₹${t.cost}` : "—"}</td>
-                <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
-                  {t.status === "open" && (
-                    <Button variant="secondary" onClick={() => updateStatus(t, "in_progress")}>Start</Button>
-                  )}
-                  {t.status === "in_progress" && (
-                    <span className="inline-flex items-center gap-2">
-                      <input
-                        type="number"
-                        placeholder="Cost"
-                        title="Resolving with a cost automatically records it as a Finance expense for this apartment"
-                        value={costInputs[t.id] ?? ""}
-                        onChange={(e) => setCostInputs({ ...costInputs, [t.id]: e.target.value })}
-                        className="w-20 rounded-md border border-slate-300 px-2 py-1 text-xs"
-                      />
-                      <Button variant="secondary" onClick={() => updateStatus(t, "resolved")}>Resolve</Button>
-                    </span>
-                  )}
-                  {t.status === "resolved" && (
-                    <Button variant="secondary" onClick={() => updateStatus(t, "closed")}>Close</Button>
-                  )}
-                  <Button variant="secondary" onClick={() => openDetails(t.id)}>Details</Button>
-                </td>
-              </tr>
-            ))}
+          <Table headers={["Unit", "Issue", "Priority", "Category", "Assigned To", "Status", "Cost", "Actions"]}>
+            {tickets.map((t) => {
+              const priority = priorityMeta(t.priority);
+              const status = statusMeta(t.status);
+              return (
+                <tr key={t.id}>
+                  <td className="px-4 py-2.5 font-semibold text-slate-800">{unitName(t.unit_id)}</td>
+                  <td className="px-4 py-2.5 text-slate-500 max-w-xs truncate" title={t.description}>{t.description}</td>
+                  <td className="px-4 py-2.5">
+                    <Badge tone={priority.tone}>{priority.label}</Badge>
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-500">{t.category ? CATEGORY_LABELS[t.category] ?? t.category : "—"}</td>
+                  <td className="px-4 py-2.5 text-slate-500">{staffName(t.assigned_to)}</td>
+                  <td className="px-4 py-2.5">
+                    <Badge tone={status.tone}>{status.label}</Badge>
+                  </td>
+                  <td className="px-4 py-2.5 text-slate-500">{t.cost != null ? `₹${t.cost}` : "—"}</td>
+                  <td className="px-4 py-2.5 space-x-2 whitespace-nowrap">
+                    {t.status === "open" && (
+                      <Button onClick={() => updateStatus(t, "in_progress")} aria-label={`Start — ${unitName(t.unit_id)}`}>
+                        Start
+                      </Button>
+                    )}
+                    {t.status === "in_progress" && (
+                      <span className="inline-flex items-center gap-2">
+                        <label htmlFor={`mt-cost-${t.id}`} className="sr-only">Cost for {unitName(t.unit_id)} ticket</label>
+                        <input
+                          id={`mt-cost-${t.id}`}
+                          type="number"
+                          placeholder="Cost"
+                          title="Resolving with a cost automatically records it as a Finance expense for this apartment"
+                          value={costInputs[t.id] ?? ""}
+                          onChange={(e) => setCostInputs({ ...costInputs, [t.id]: e.target.value })}
+                          className="w-20 rounded-[10px] border border-slate-300 px-2 py-1.5 text-xs"
+                        />
+                        <Button onClick={() => updateStatus(t, "resolved")} aria-label={`Resolve — ${unitName(t.unit_id)}`}>
+                          Resolve
+                        </Button>
+                      </span>
+                    )}
+                    {t.status === "resolved" && (
+                      <Button onClick={() => updateStatus(t, "closed")} aria-label={`Close — ${unitName(t.unit_id)}`}>
+                        Close
+                      </Button>
+                    )}
+                    <Button variant="secondary" onClick={() => openDetails(t.id)} aria-label={`Details — ${unitName(t.unit_id)} ticket`}>
+                      Details
+                    </Button>
+                  </td>
+                </tr>
+              );
+            })}
           </Table>
         )}
       </Card>

@@ -46,7 +46,7 @@ export default function NotificationBell() {
     <div className="relative" ref={containerRef}>
       <button
         onClick={() => setOpen((o) => !o)}
-        className="relative text-slate-500 hover:text-slate-900 p-1.5 rounded-lg hover:bg-slate-100"
+        className="relative text-white/70 hover:text-white p-1.5 rounded-lg hover:bg-white/10"
         aria-label="Notifications"
       >
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">

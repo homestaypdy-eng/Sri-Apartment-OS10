@@ -100,7 +100,12 @@ def test_finance_pnl_matches_canonical_property_pnl(headers):
     strat_pnl = strat_resp.json()["finance"]["pnl"]
 
     pnl_resp = client.get(f"/api/v1/finance/property-pnl/{property_id}", headers=headers, params={
-        "period_year": check_in.year, "period_month": check_in.month,
+        # The selected report range is [date_from, date_to), and the
+        # strategist's monthly P&L is explicitly anchored to the calendar
+        # month containing date_to (see financial_snapshot's period_note).
+        # If the exclusive end is the first of a new month, compare to that
+        # returned monthly scope instead of the booking's check-in month.
+        "period_year": strat_pnl["period_year"], "period_month": strat_pnl["period_month"],
     })
     assert pnl_resp.status_code == 200, pnl_resp.text
     canonical = pnl_resp.json()
@@ -109,8 +114,9 @@ def test_finance_pnl_matches_canonical_property_pnl(headers):
     assert strat_pnl["operating_expenses"] == canonical["total_expenses"]
     assert strat_pnl["central_expenses"] == canonical["central_expenses"]
     assert strat_pnl["net_profit"] == canonical["net_profit"]
-    assert strat_pnl["period_year"] == check_in.year
-    assert strat_pnl["period_month"] == check_in.month
+    expected_pnl_month = (check_in + timedelta(days=1))
+    assert strat_pnl["period_year"] == expected_pnl_month.year
+    assert strat_pnl["period_month"] == expected_pnl_month.month
 
 
 # --- 3: Cash Flow matches canonical cash_flow() ---

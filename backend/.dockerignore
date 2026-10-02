@@ -22,3 +22,19 @@ ENV/
 .vscode/
 *.swp
 *.swo
+
+# Local runtime data, secrets/certificates, and database exports
+tmp/
+uploads/
+*.pem
+*.key
+*.p12
+*.pfx
+*.dump
+*.backup
+*.sql.gz
+*.log
+*.sqlite
+*.sqlite3
+.coverage
+audit-report.html

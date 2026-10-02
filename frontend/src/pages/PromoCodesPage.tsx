@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, extractErrorMessage, type PromoCodeOut } from "../lib/api";
-import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState } from "../components/ui";
+import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 
 /**
@@ -17,6 +17,7 @@ export default function PromoCodesPage() {
   const { role } = useAuth();
   const isAdmin = role === "admin";
   const [codes, setCodes] = useState<PromoCodeOut[]>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [form, setForm] = useState(EMPTY_FORM);
@@ -31,6 +32,8 @@ export default function PromoCodesPage() {
       setCodes(data);
     } catch (err) {
       setError(extractErrorMessage(err));
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -117,12 +120,14 @@ export default function PromoCodesPage() {
           <h2 className="mb-3 text-sm font-semibold text-slate-900">Create Promo Code</h2>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
             <input
+              aria-label="Promo code"
               placeholder="CODE"
               value={form.code}
               onChange={(e) => setForm({ ...form, code: e.target.value })}
               className="rounded-lg border border-slate-300 px-3 py-2 text-sm uppercase"
             />
             <select
+              aria-label="Discount type"
               value={form.discount_type}
               onChange={(e) => setForm({ ...form, discount_type: e.target.value as "percent" | "flat" })}
               className="rounded-lg border border-slate-300 px-3 py-2 text-sm"
@@ -133,7 +138,9 @@ export default function PromoCodesPage() {
             <input
               type="number"
               min={0}
+              max={form.discount_type === "percent" ? 100 : undefined}
               step="0.01"
+              aria-label="Discount value"
               placeholder={form.discount_type === "percent" ? "e.g. 10 (%)" : "e.g. 500 (Rs.)"}
               value={form.value}
               onChange={(e) => setForm({ ...form, value: e.target.value })}
@@ -170,7 +177,9 @@ export default function PromoCodesPage() {
 
       <Card>
         <h2 className="mb-4 text-sm font-semibold text-slate-900">All Promo Codes</h2>
-        {codes.length === 0 ? (
+        {loading ? (
+          <Spinner label="Loading promo codes..." />
+        ) : codes.length === 0 ? (
           <EmptyState message="No promo codes yet." />
         ) : (
           <div className="overflow-x-auto">
@@ -188,7 +197,9 @@ export default function PromoCodesPage() {
                           <input
                             type="number"
                             min={0}
+                            max={c.discount_type === "percent" ? 100 : undefined}
                             step="0.01"
+                            aria-label={`Discount value for ${c.code}`}
                             value={editForm.value}
                             onChange={(e) => setEditForm({ ...editForm, value: e.target.value })}
                             className="w-20 rounded border border-slate-300 px-2 py-1 text-xs"

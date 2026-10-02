@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime, timezone
 
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Numeric, String, Text
+from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.schema import DDL
@@ -9,9 +9,20 @@ from sqlalchemy.event import listens_for
 
 from app.db.session import Base
 
+# Identity Verification is a state machine layered on top of the existing
+# id_proof_type/id_proof_number/id_proof_url fields and the existing
+# GuestDocument table — deliberately NOT a new document/file model. See
+# Guest.identity_status's own docstring for why this is a separate concept
+# from Account Verification (which this module does not touch at all).
+IDENTITY_STATUSES = ("not_required", "pending", "submitted", "under_review", "verified", "rejected", "expired")
+IDENTITY_DOCUMENT_TYPES = frozenset({"aadhaar", "pan", "passport", "driving_license", "other"})
+
 
 class Guest(Base):
     __tablename__ = "guests"
+    __table_args__ = (
+        CheckConstraint(f"identity_status IN {IDENTITY_STATUSES}", name="ck_guest_identity_status"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
@@ -43,6 +54,27 @@ class Guest(Base):
     # invoices — all financial history) ever breaks; see merge endpoint.
     merged_into_guest_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("guests.id"), nullable=True)
 
+    # --- Identity Verification (separate from Account Verification) -------
+    # Account Verification (customer_auth.CustomerAccount.email_verified_at,
+    # the login-OTP flow) proves control of a contact method. This state
+    # machine proves an authorised OS10 workflow reviewed and accepted a
+    # real government ID for THIS person. The two are never conflated:
+    # nothing sets identity_status just because an account/OTP check
+    # passed, and account verification is not touched anywhere by this
+    # feature. Defaults to "not_required" for every existing and new
+    # guest — the migration that adds this column does NOT mark anyone
+    # "verified" just because they already had an id_proof_number on file;
+    # that data was never reviewed/approved by anyone, so it cannot mean
+    # "verified" retroactively.
+    identity_status: Mapped[str] = mapped_column(String(20), nullable=False, default="not_required")
+    identity_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    identity_verified_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    identity_rejection_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Which specific already-uploaded GuestDocument was the one reviewed
+    # and approved/rejected — not a new file, just a pointer into the
+    # existing, already-secure document storage/audit system.
+    identity_verified_document_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("guest_documents.id"), nullable=True)
+
 
 class GuestDocument(Base):
     """
@@ -63,6 +95,12 @@ class GuestDocument(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(100), nullable=False)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    # New storage metadata is additive. NULL backend/key identifies legacy
+    # rows, which continue resolving through file_path.
+    storage_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    storage_backend: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    file_size_bytes: Mapped[int | None] = mapped_column(nullable=True)
+    sha256_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
     side: Mapped[str] = mapped_column(String(10), default="front")  # front/back/document (for a single-file PDF)
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -91,6 +129,15 @@ class Booking(Base):
     check_out: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="confirmed")
     source: Mapped[str] = mapped_column(String(30), default="direct")  # direct/walk_in/phone/whatsapp/ota_booking_com/...
+    # Immutable cancellation-policy snapshot. Nullable policy fields preserve
+    # legacy cancellations; new cancellations record the effective decision
+    # so refund retries never recalculate against a later clock time.
+    cancellation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancellation_checkin_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancellation_policy_percent: Mapped[int | None] = mapped_column(nullable=True)
+    cancellation_refund_target: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    cancellation_refund_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    cancellation_requires_review: Mapped[bool] = mapped_column(default=False)
     rate_applied: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     extra_guest_charge: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
     security_deposit: Mapped[float] = mapped_column(Numeric(10, 2), default=0)
@@ -132,6 +179,44 @@ class Booking(Base):
 
     unit = relationship("Unit")
     guest = relationship("Guest")
+
+
+class BookingGuest(Base):
+    """
+    An Additional Guest / Companion attached to a booking.
+
+    Deliberately NOT where the Principal Guest lives — Booking.guest_id
+    remains exactly what it always was (the single FK every existing
+    read/write path, the double-booking EXCLUDE constraint's neighbour,
+    payments, invoicing, GST, and Zotel sync all already depend on).
+    Principal Guest is a role a Guest plays on THIS booking, derived from
+    Booking.guest_id — never duplicated into a row here. This table only
+    ever adds rows; a booking with zero BookingGuest rows behaves exactly
+    as every booking already did before this feature existed.
+
+    A Guest row is reused across bookings (Guest Profile → Booking →
+    Guest/Companion Assignment, never a permanent list owned by one
+    principal guest) — the same person can be looked up and attached to
+    a new booking rather than re-created, and their own
+    Guest.identity_status already carries their verification status
+    across every booking they appear on, principal or additional.
+    """
+
+    __tablename__ = "booking_guests"
+    __table_args__ = (
+        # A given person is listed at most once per booking — re-adding
+        # the same guest is a no-op the API rejects, not a duplicate row.
+        UniqueConstraint("booking_id", "guest_id", name="ux_booking_guest_once"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    booking_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("bookings.id"), nullable=False)
+    guest_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("guests.id"), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    added_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    booking = relationship("Booking")
+    guest = relationship("Guest", foreign_keys=[guest_id])
 
 
 # --- Overlap-safe booking constraint (the core anti-double-booking guard) ---

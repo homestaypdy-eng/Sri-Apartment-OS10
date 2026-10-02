@@ -7,15 +7,17 @@ Flow:
   POST /api/v1/public/holds/{hold_id}/verify-payment → verify signature, convert to booking
 
 No authentication — these are called by anonymous website visitors.
-Rate limiting is a known gap (see README), same as the rest of this system.
+The hold-creation and payment-verification mutations use shared PostgreSQL
+rate-limit counters; business-level booking and payment checks remain separate.
 """
+import logging
 import os
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -28,6 +30,7 @@ from app.modules.payment_gateway.models import GatewayOrder
 from app.modules.payment_gateway.service import (
     GatewayNotConfiguredError,
     create_order,
+    verify_provider_payment,
     verify_payment_signature,
 )
 from app.core.config import settings
@@ -36,7 +39,8 @@ from app.modules.payments.service import calculate_gst, generate_invoice_pdf, ne
 from app.modules.properties.models import LongStayDiscountTier, Property, SeasonalRate, Unit, UnitPhoto
 from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
 from app.modules.properties.pricing import calculate_price
-from app.shared.availability import unit_is_available, units_availability
+from app.shared.availability import lock_unit_for_reservation, unit_is_available, units_availability
+from app.shared.occupancy import enforce_unit_max_occupancy
 from app.modules.public_booking.models import BookingHold, PromoCode
 from app.modules.public_booking.schemas import (
     CreateHoldRequest,
@@ -53,8 +57,10 @@ from app.modules.public_booking.schemas import (
     VerifyPaymentRequest,
 )
 from app.shared.rbac import require_role
+from app.shared.database_rate_limit import public_rate_limit
 
 router = APIRouter(prefix="/api/v1/public", tags=["public-booking"])
+logger = logging.getLogger("sri_apartment_os")
 
 promo_admin_router = APIRouter(prefix="/api/v1/promo-codes", tags=["public-booking"])
 
@@ -69,10 +75,33 @@ HOLD_TTL_MINUTES = 15
 class PromoCodeCreate(BaseModel):
     code: str
     discount_type: str
-    value: float
+    # gt=0 matches the same "a discount can't be zero/negative" rule this
+    # codebase already enforces for the analogous LongStayDiscountTier
+    # (properties/schemas.py) — a negative value would silently INCREASE
+    # the guest's total (compute_discount subtracts it from the subtotal),
+    # and this field was previously unvalidated at both the app and DB
+    # layer. The percent<=100 bound (only meaningful for discount_type=
+    # "percent") is enforced below via a field validator, since it depends
+    # on discount_type.
+    value: float = Field(gt=0)
     valid_from: date
     valid_to: date
-    max_uses: int | None = None
+    max_uses: int | None = Field(default=None, gt=0)
+
+    @field_validator("value")
+    @classmethod
+    def percent_value_within_range(cls, v, info):
+        if info.data.get("discount_type") == "percent" and v > 100:
+            raise ValueError("value must be at most 100 when discount_type is 'percent'")
+        return v
+
+    @field_validator("valid_to")
+    @classmethod
+    def valid_to_after_valid_from(cls, v, info):
+        start = info.data.get("valid_from")
+        if start and v < start:
+            raise ValueError("valid_to must be on or after valid_from")
+        return v
 
 
 class PromoCodeOut(BaseModel):
@@ -115,10 +144,10 @@ class PromoCodeUpdate(BaseModel):
     that may already be in use/redeemed)."""
 
     discount_type: str | None = None
-    value: float | None = None
+    value: float | None = Field(default=None, gt=0)
     valid_from: date | None = None
     valid_to: date | None = None
-    max_uses: int | None = None
+    max_uses: int | None = Field(default=None, gt=0)
     active: bool | None = None
 
 
@@ -130,6 +159,19 @@ def update_promo_code(promo_id: uuid.UUID, payload: PromoCodeUpdate, db: Session
     changes = payload.model_dump(exclude_unset=True)
     if "discount_type" in changes and changes["discount_type"] not in ("percent", "flat"):
         raise HTTPException(400, "discount_type must be 'percent' or 'flat'")
+    # Validated against the EFFECTIVE post-merge state, not just the
+    # fields actually sent — a request that only changes `value` on an
+    # existing discount_type="percent" promo must still be bounded, and a
+    # request that only changes `discount_type` to "percent" must still
+    # respect the existing value.
+    effective_discount_type = changes.get("discount_type", promo.discount_type)
+    effective_value = changes.get("value", float(promo.value))
+    if effective_discount_type == "percent" and effective_value > 100:
+        raise HTTPException(400, "value must be at most 100 when discount_type is 'percent'")
+    effective_valid_from = changes.get("valid_from", promo.valid_from)
+    effective_valid_to = changes.get("valid_to", promo.valid_to)
+    if effective_valid_to < effective_valid_from:
+        raise HTTPException(400, "valid_to must be on or after valid_from")
     for field, value in changes.items():
         setattr(promo, field, value)
     db.commit()
@@ -207,15 +249,52 @@ def _convert_hold_to_booking(db: Session, hold: BookingHold) -> tuple[Booking, I
     once per BookingHold — no separate duplicate-call protection needed
     here (dispatch_booking_notifications' own per-recipient idempotency
     guard is defense-in-depth on top of that, same as before).
+
+    Phase 5A: unit.status is checked at hold CREATION time (create_hold)
+    but nothing previously re-checked it here at CONVERSION time — so an
+    admin marking a unit "maintenance"/"blocked" while a guest's payment
+    was already in flight (anywhere within the hold's TTL) would still
+    let that payment convert into a confirmed Booking. Re-checked
+    immediately before creating the Booking below, mirroring the exact
+    rollback-then-409 pattern the pre-existing overlap-conflict branch
+    (the no_overlapping_bookings IntegrityError handler further down)
+    already uses for the equivalent "payment succeeded but conversion
+    can't proceed" situation — same non-partial-state guarantee, same
+    caller-facing contract, nothing new invented.
     """
     unit = db.get(Unit, hold.unit_id)
     property_ = db.get(Property, unit.property_id)
 
+    if unit.status != "available":
+        db.rollback()
+        raise HTTPException(
+            409,
+            f"This unit is no longer available for booking (status: {unit.status}). "
+            "Your payment was received; please contact us for a refund.",
+        )
+
+    # Recheck at payment conversion too: the hold may have been created by an
+    # older client or before a unit's configured capacity changed.
+    enforce_unit_max_occupancy(unit, hold.adults, 0)
+
     guest = db.scalar(select(Guest).where(Guest.phone == hold.guest_phone))
     if guest is None:
-        guest = Guest(name=hold.guest_name, phone=hold.guest_phone, email=hold.guest_email)
+        guest = Guest(
+            name=hold.guest_name, phone=hold.guest_phone, email=hold.guest_email, state_code=hold.guest_state,
+            address=hold.guest_address, gst_number=hold.guest_gstin,
+        )
         db.add(guest)
         db.flush()
+    else:
+        # Only ever set from a real submitted value — never overwrite an
+        # existing guest's known (or unknown) state/address/GSTIN with NULL
+        # just because this particular hold didn't collect one.
+        if hold.guest_state is not None:
+            guest.state_code = hold.guest_state
+        if hold.guest_address:
+            guest.address = hold.guest_address
+        if hold.guest_gstin:
+            guest.gst_number = hold.guest_gstin
 
     effective_rate = (float(hold.subtotal) - float(hold.discount_amount)) / hold.nights if hold.nights else 0
 
@@ -228,6 +307,7 @@ def _convert_hold_to_booking(db: Session, hold: BookingHold) -> tuple[Booking, I
         source="website",
         rate_applied=round(effective_rate, 2),
         promo_code_used=hold.promo_code_used,
+        adults=hold.adults,
     )
     db.add(booking)
     try:
@@ -276,8 +356,12 @@ def _convert_hold_to_booking(db: Session, hold: BookingHold) -> tuple[Booking, I
     # Same bank/UPI + signatory source as the OS10-generated invoice
     # (payments/router.py) and the quotation PDF — BankSettings/
     # BusinessSettings, not a second/duplicated config surface.
-    business_settings = get_or_create_settings(db)
-    bank_settings = get_or_create_bank_settings(db)
+    # Keep lazy singleton creation inside this conversion transaction. The
+    # settings helpers normally commit for standalone GET endpoints; that
+    # would otherwise commit a partially converted booking if rows were
+    # missing during the first public payment.
+    business_settings = get_or_create_settings(db, commit_if_created=False)
+    bank_settings = get_or_create_bank_settings(db, commit_if_created=False)
     bank_details = {
         "bank_name": bank_settings.bank_name,
         "bank_account_name": bank_settings.bank_account_name,
@@ -433,10 +517,18 @@ def check_public_availability(
         )
 
     available = not _check_booking_conflict(db, unit_id, check_in, check_out)
+    # Same pricing engine as /public/quote and create_hold (via
+    # _get_full_price_quote) — this used to be a naive base_rate*nights
+    # estimate that silently disagreed with the real quote whenever a
+    # weekend rate, seasonal rate, or long-stay discount applied to these
+    # dates. subtotal_after_discount (pre-promo, promo isn't known at the
+    # search-results stage) is exactly what /public/quote shows as
+    # subtotal_after_discount before a promo code is applied.
+    quote = _get_full_price_quote(db, unit, check_in, check_out)
     return PublicAvailabilityOut(
         unit_id=unit_id, check_in=check_in, check_out=check_out,
         available=available, nights=nights,
-        estimated_total=round(float(unit.base_rate) * nights, 2),
+        estimated_total=quote.subtotal_after_discount,
     )
 
 
@@ -530,7 +622,12 @@ def public_quote(
 # Hold creation
 # ---------------------------------------------------------------------------
 
-@router.post("/holds", response_model=HoldOut, status_code=201)
+@router.post(
+    "/holds",
+    response_model=HoldOut,
+    status_code=201,
+    dependencies=[Depends(public_rate_limit("create_hold", max_requests=10))],
+)
 def create_hold(payload: CreateHoldRequest, db: Session = Depends(get_db)):
     """
     Reserves a unit for HOLD_TTL_MINUTES and creates a Razorpay order.
@@ -547,6 +644,20 @@ def create_hold(payload: CreateHoldRequest, db: Session = Depends(get_db)):
     # Unit status is authoritative — maintenance/blocked units cannot be held
     if unit.status != "available":
         raise HTTPException(409, f"Unit is not available for booking (status: {unit.status})")
+
+    # --- Phase 1: short, locked reservation transaction -------------------
+    # Closes the booking-vs-active-hold cross-table race: everything from
+    # here through this phase's own db.commit() below happens under a
+    # unit-scoped advisory lock, so a concurrent create_booking() (or
+    # another create_hold()/verify_payment()) for this same unit cannot
+    # interleave its own availability check with this one's reservation
+    # write. Deliberately acquired BEFORE the external Razorpay call further
+    # down (Phase 2) and released at this phase's commit — the lock must
+    # never be held across a slow/unavailable external dependency. See
+    # lock_unit_for_reservation()'s own docstring for the full reasoning.
+    lock_unit_for_reservation(db, payload.unit_id)
+    db.refresh(unit)
+    enforce_unit_max_occupancy(unit, payload.adults, 0)
 
     property_ = db.get(Property, unit.property_id)
 
@@ -573,7 +684,7 @@ def create_hold(payload: CreateHoldRequest, db: Session = Depends(get_db)):
     gst = calculate_gst(
         subtotal=subtotal_after_promo,
         tariff_per_night=effective_rate,
-        guest_state=None,
+        guest_state=payload.guest_state,
         property_state=property_.state_code,
     )
 
@@ -607,6 +718,10 @@ def create_hold(payload: CreateHoldRequest, db: Session = Depends(get_db)):
         guest_name=payload.guest_name,
         guest_phone=payload.guest_phone,
         guest_email=payload.guest_email,
+        guest_state=payload.guest_state,
+        adults=payload.adults,
+        guest_address=payload.guest_address,
+        guest_gstin=payload.guest_gstin,
         check_in=payload.check_in,
         check_out=payload.check_out,
         nights=quote.nights,
@@ -637,18 +752,39 @@ def create_hold(payload: CreateHoldRequest, db: Session = Depends(get_db)):
     # Link GatewayOrder back to the hold
     gateway_order.hold_id = hold.id
 
-    # Create the Razorpay order — raises 501 if not configured
+    # Phase 1 ends here: the unit is now safely, atomically reserved — this
+    # commit is what makes the hold visible (and correctly blocking) to
+    # every other transaction, and releases the advisory lock acquired
+    # above. From this point on, no lock is needed: a real, committed row
+    # is enough for unit_is_available() and the EXCLUDE constraints to do
+    # their job, exactly as they already do for same-table races.
+    db.commit()
+    db.refresh(hold)
+    db.refresh(gateway_order)
+
+    # --- Phase 2: unlocked — the external Razorpay call ---------------
+    # Deliberately outside the lock and outside Phase 1's transaction: a
+    # slow or unavailable Razorpay must never block another guest's
+    # reservation attempt for this same unit. Failure here cancels the
+    # already-committed hold explicitly (below) rather than relying on a
+    # rollback, since there is nothing left in this transaction to roll
+    # back — Phase 1 already committed.
     try:
         result = create_order(total, gateway_order.receipt, notes={"hold_id": str(hold.id)})
         gateway_order.gateway_order_id = result.get("id")
+        gateway_order.status = "created"
+        db.commit()
     except GatewayNotConfiguredError as e:
-        db.rollback()
+        hold.status = "cancelled"
+        gateway_order.status = "failed"
+        db.commit()
         raise HTTPException(501, str(e))
     except Exception as e:
-        db.rollback()
+        hold.status = "cancelled"
+        gateway_order.status = "failed"
+        db.commit()
         raise HTTPException(502, f"Razorpay order creation failed: {e}")
 
-    db.commit()
     db.refresh(hold)
     db.refresh(gateway_order)
 
@@ -672,7 +808,12 @@ def create_hold(payload: CreateHoldRequest, db: Session = Depends(get_db)):
 # Payment verification → booking conversion
 # ---------------------------------------------------------------------------
 
-@router.post("/holds/{hold_id}/verify-payment", response_model=PublicBookingConfirmation, status_code=201)
+@router.post(
+    "/holds/{hold_id}/verify-payment",
+    response_model=PublicBookingConfirmation,
+    status_code=201,
+    dependencies=[Depends(public_rate_limit("verify_payment", max_requests=30))],
+)
 def verify_payment(hold_id: uuid.UUID, payload: VerifyPaymentRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Verifies the Razorpay payment signature server-side and, on success,
@@ -769,6 +910,54 @@ def verify_payment(hold_id: uuid.UUID, payload: VerifyPaymentRequest, background
 
     if not valid:
         raise HTTPException(400, "Invalid Razorpay payment signature — payment could not be verified")
+
+    # The Checkout HMAC proves the submitted order/payment IDs are paired,
+    # but only Razorpay's canonical payment resource establishes captured
+    # status, amount, and currency. Do not mutate local payment state if the
+    # provider is unavailable; a later browser retry or signed webhook can
+    # safely complete the conversion.
+    if (
+        gateway_order is None
+        or not gateway_order.gateway_order_id
+        or gateway_order.hold_id != hold.id
+        or round(float(gateway_order.amount), 2) != round(float(hold.advance_amount), 2)
+        or gateway_order.currency.upper() != hold.currency.upper()
+    ):
+        raise HTTPException(409, "The local payment order is unavailable")
+    try:
+        provider_verified = verify_provider_payment(
+            payload.razorpay_payment_id,
+            order_id=stored_razorpay_order_id,
+            amount_rupees=float(gateway_order.amount),
+            currency=gateway_order.currency,
+        )
+    except GatewayNotConfiguredError as e:
+        raise HTTPException(503, str(e))
+    except Exception as e:
+        logger.warning("Razorpay payment lookup failed for hold %s: %s", hold.id, e)
+        raise HTTPException(503, "Payment status could not be confirmed with Razorpay; retry safely")
+    if not provider_verified:
+        raise HTTPException(409, "Razorpay payment is not captured for the expected amount and currency")
+
+    # Provider lookup is external network I/O, so do not hold the unit-scoped
+    # advisory lock across it. The hold row remains locked to serialize
+    # competing conversions; now acquire the shared reservation lock and
+    # keep it through the final expiry check, booking insert, and commit.
+    lock_unit_for_reservation(db, hold.unit_id)
+
+    # Provider lookup is network I/O. The hold may cross its deadline while
+    # that request is in flight; never convert based only on the earlier TTL
+    # check. Record the verified charge against the order for reconciliation,
+    # release the expired hold, and avoid claiming inventory retroactively.
+    now = datetime.now(timezone.utc)
+    if now > hold.expires_at:
+        hold.status = "expired"
+        hold.razorpay_payment_id = payload.razorpay_payment_id
+        hold.updated_at = now
+        gateway_order.status = "paid"
+        gateway_order.gateway_payment_id = payload.razorpay_payment_id
+        db.commit()
+        raise HTTPException(409, "Payment was captured after the booking hold expired and requires reconciliation")
 
     # Payment verified — record it and convert the hold
     hold.status = "paid"

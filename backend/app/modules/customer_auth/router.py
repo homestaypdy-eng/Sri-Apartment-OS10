@@ -58,18 +58,23 @@ factor uses its own dedicated CustomerLoginOtpChallenge table, never
 portal's OtpChallenge, for the same reason.
 """
 import logging
+import hashlib
 import secrets
 import smtplib
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
+from app.modules.bookings import document_storage
+from app.modules.bookings.models import IDENTITY_DOCUMENT_TYPES, Guest, GuestDocument
 from app.modules.customer_auth.models import (
     CustomerAccount,
     CustomerLoginOtpChallenge,
@@ -102,15 +107,19 @@ from app.modules.customer_auth.service import (
     revoke_customer_session,
     verify_customer_password,
 )
+from app.modules.customer_auth.identity_service import resolve_customer_guest
 from app.core.security import create_customer_session_token, hash_password
 from app.modules.notifications.service import (
     EmailNotConfiguredError,
     dispatch_customer_login_otp_email,
     dispatch_customer_login_otp_sms,
     dispatch_customer_welcome_email,
+    send_customer_login_otp_email_now,
     send_customer_password_reset_email,
 )
 from app.modules.portal.auth_service import OTP_EXPIRY_MINUTES, hash_otp_code, normalize_email
+from app.modules.portal.schemas import GuestIdentityDocumentOut, GuestIdentityStatusOut, GuestIdentitySubmitRequest
+from app.shared.file_upload import EXTENSION_BY_CONTENT_TYPE, read_and_validate_upload
 from app.shared.rate_limit import is_rate_limited, record_attempt, reset
 
 logger = logging.getLogger("sri_apartment_os")
@@ -144,6 +153,61 @@ CUSTOMER_PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = 30
 _GENERIC_LOGIN_ERROR = "Incorrect email/phone or password"
 _GENERIC_OTP_VERIFY_ERROR = "That code is incorrect or has expired."
 _GENERIC_RESET_REQUEST_MESSAGE = "If that email is registered, a password reset link has been sent."
+
+# LOCAL EMAIL OTP TESTING: a short SMTP connect timeout for the real-email
+# dev-test path only (see _dispatch_dev_email_otp) — deliberately shorter
+# than send_email's default 15s production timeout, so a local test that
+# hits an unreachable/slow SMTP server can't run long enough to trip the
+# frontend's 12s request timeout (src/lib/api.ts DEFAULT_TIMEOUT_MS).
+_DEV_EMAIL_OTP_TEST_SMTP_TIMEOUT_SECONDS = 8
+
+
+def _dispatch_dev_email_otp(db: Session, account: CustomerAccount, raw_code: str, expiry_minutes: int) -> str:
+    """LOCAL-ONLY — only ever called from the non-production branch of
+    login_customer below; production's own branch is completely untouched
+    and never calls this. Decides and executes the local Email OTP
+    testing behavior per settings.customer_auth_email_otp_mode:
+
+      - "dev_code" (default, or any other/unset value): no network
+        attempt at all — same no-send behavior this codebase always had
+        outside production, before this setting existed.
+      - "real_email": sends SYNCHRONOUSLY (unlike production's
+        backgrounded, outcome-blind dispatch_customer_login_otp_email) so
+        the caller can honestly report what happened — but ONLY when
+        account.email exactly matches an entry in
+        settings.customer_auth_email_otp_test_allowlist. Any other case
+        (mode not "real_email", empty allowlist, or a non-matching
+        address) never attempts a send: flipping the mode alone can never
+        send to an arbitrary address, only an explicit, non-empty,
+        exact-match allowlist entry can.
+
+    Returns one of "dev_code_only", "dev_real_email_not_allowlisted",
+    "dev_real_email_sent", "dev_real_email_failed" — see
+    CustomerLoginOtpRequestResponse.otp_delivery_status.
+    """
+    if settings.customer_auth_email_otp_mode != "real_email":
+        return "dev_code_only"
+
+    allowlist = {
+        entry.strip().lower()
+        for entry in settings.customer_auth_email_otp_test_allowlist.split(",")
+        if entry.strip()
+    }
+    if account.email.lower() not in allowlist:
+        return "dev_real_email_not_allowlisted"
+
+    try:
+        send_customer_login_otp_email_now(
+            account, raw_code, expiry_minutes, db,
+            timeout=_DEV_EMAIL_OTP_TEST_SMTP_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        # Local diagnostic only — never surfaced to the frontend beyond
+        # the generic "failed" status; no OTP code, no stack trace, no
+        # SMTP credential detail crosses this boundary.
+        logger.error(f"LOCAL real-email OTP test send failed for customer_id={account.id}: {type(e).__name__}: {e}")
+        return "dev_real_email_failed"
+    return "dev_real_email_sent"
 
 
 @router.post("/register", response_model=CustomerAccountOut, status_code=status.HTTP_201_CREATED)
@@ -302,20 +366,35 @@ def login_customer(payload: CustomerLoginRequest, request: Request, background_t
     # customer, which is a strictly stronger form of the same
     # anti-disclosure principle already applied to forgot-password's own
     # 501 message.
+    # otp_delivery_status tells the caller exactly what happened (see
+    # CustomerLoginOtpRequestResponse) — "sent" is the PRODUCTION-ONLY
+    # branch's value below, completely unchanged from what this response
+    # always meant before the field existed. Nothing about the production
+    # branch's own logic changes here.
+    otp_delivery_status = "sent"
     if settings.environment == "production":
         if payload.channel == "email":
-            subject = "Your Sri Apartment login code"
-            body = (
-                f"Your Sri Apartment Homestay login verification code is {raw_code}. "
-                f"It expires in {OTP_EXPIRY_MINUTES} minutes. Do not share this code."
-            )
-            background_tasks.add_task(dispatch_customer_login_otp_email, account.id, subject, body)
+            # Subject/body/HTML are built inside dispatch_customer_login_
+            # otp_email itself now (see its own docstring) — only the raw
+            # code and expiry are passed through, never a pre-formatted
+            # message, so content-building lives in one place.
+            background_tasks.add_task(dispatch_customer_login_otp_email, account.id, raw_code, OTP_EXPIRY_MINUTES)
         else:
             message = (
                 f"Your Sri Apartment Homestay login code is {raw_code}. "
                 f"It expires in {OTP_EXPIRY_MINUTES} minutes. Do not share this code."
             )
             background_tasks.add_task(dispatch_customer_login_otp_sms, account.id, message)
+    else:
+        # LOCAL EMAIL OTP TESTING — never reached in production; the
+        # branch above is untouched by any of this. Phone/SMS is
+        # unchanged outside production (still never sent, same as
+        # before): only email gets the dev_code/real_email modes, via
+        # _dispatch_dev_email_otp below.
+        if payload.channel == "email":
+            otp_delivery_status = _dispatch_dev_email_otp(db, account, raw_code, OTP_EXPIRY_MINUTES)
+        else:
+            otp_delivery_status = "dev_code_only"
 
     record_audit_log(
         db, None, "customer_auth.login_otp_requested",
@@ -328,14 +407,20 @@ def login_customer(payload: CustomerLoginRequest, request: Request, background_t
     # Dev/testability-only — see CustomerLoginOtpRequestResponse.
     # dev_otp_code. raw_code is never logged and never persisted anywhere;
     # this is its only appearance outside the email/SMS it was (or, in the
-    # non-production case, would have been) sent in.
+    # non-production case, would have been) sent in. Populated regardless
+    # of otp_delivery_status (even dev_real_email_sent) so the flow is
+    # never a dead end and test-automation's existing contract (every
+    # non-production response carries a usable code) doesn't change.
     dev_code = raw_code if settings.environment != "production" else None
     message = (
         "We've sent a verification code to your email."
         if payload.channel == "email"
         else "We've sent a verification code to your mobile number."
     )
-    return CustomerLoginOtpRequestResponse(challenge_id=challenge.id, message=message, dev_otp_code=dev_code)
+    return CustomerLoginOtpRequestResponse(
+        challenge_id=challenge.id, message=message, dev_otp_code=dev_code,
+        otp_delivery_status=otp_delivery_status,
+    )
 
 
 @router.post("/login/verify-otp", response_model=CustomerLoginResponse)
@@ -410,6 +495,12 @@ def verify_customer_login_otp(payload: CustomerLoginVerifyRequest, request: Requ
         db.commit()
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, _GENERIC_OTP_VERIFY_ERROR)
 
+    verified_at = datetime.now(timezone.utc)
+    if challenge.channel == "email":
+        account.email_verified_at = verified_at
+    elif challenge.channel == "phone":
+        account.phone_verified_at = verified_at
+
     session_row = create_customer_session(db, account.id, ip_address=ip, user_agent=request.headers.get("user-agent"))
     access_token = create_customer_session_token(str(account.id), jti=str(session_row.id))
 
@@ -463,6 +554,164 @@ def get_me(customer: CustomerAccount = Depends(get_current_customer)):
     return customer
 
 
+def _linked_identity_guest(db: Session, customer: CustomerAccount) -> Guest:
+    if customer.guest_id is None:
+        raise HTTPException(409, "Set up your identity profile before uploading a document")
+    guest = db.get(Guest, customer.guest_id)
+    if guest is None:
+        raise HTTPException(409, "Your guest profile needs staff assistance")
+    if guest.merged_into_guest_id is not None:
+        canonical = db.get(Guest, guest.merged_into_guest_id)
+        if canonical is None or canonical.merged_into_guest_id is not None:
+            raise HTTPException(409, "Your guest profile needs staff assistance")
+        customer.guest_id = canonical.id
+        return canonical
+    return guest
+
+
+def _customer_identity_status(db: Session, guest: Guest) -> GuestIdentityStatusOut:
+    document = db.scalar(
+        select(GuestDocument).where(GuestDocument.guest_id == guest.id).order_by(GuestDocument.uploaded_at.desc())
+    )
+    return GuestIdentityStatusOut(
+        status=guest.identity_status,
+        document_type=document.document_type if document else None,
+        document_id=document.id if document else None,
+        verified_at=guest.identity_verified_at,
+        message=(
+            "Your identity verification could not be completed. Please submit a valid identity document."
+            if guest.identity_status == "rejected" else None
+        ),
+    )
+
+
+@router.post("/me/identity/profile", response_model=GuestIdentityStatusOut)
+def initialize_my_identity_profile(
+    customer: CustomerAccount = Depends(get_current_customer), db: Session = Depends(get_db),
+):
+    """Resolve one Main Guest for the signed-in customer without accepting a
+    guest_id from the browser. Verified OTP/Google contacts may match an
+    existing Guest only when the combined result is unambiguous; otherwise
+    a new profile is created server-side or the request fails closed.
+    """
+    try:
+        resolution = resolve_customer_guest(db, customer)
+        if resolution.created:
+            record_audit_log(
+                db, None, "customer_auth.identity_guest_created",
+                entity_type="customer_account", entity_id=str(customer.id),
+                details="Created a Main Guest profile for customer identity verification",
+            )
+        elif resolution.linked_existing:
+            record_audit_log(
+                db, None, "customer_auth.identity_guest_linked",
+                entity_type="customer_account", entity_id=str(customer.id),
+                details="Linked a Main Guest profile using verified customer contact evidence",
+            )
+        db.commit()
+        db.refresh(resolution.guest)
+        return _customer_identity_status(db, resolution.guest)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "We could not safely link this guest profile. Please contact Sri Apartment for assistance") from None
+
+
+@router.get("/me/identity", response_model=GuestIdentityStatusOut)
+def get_my_identity_status(
+    customer: CustomerAccount = Depends(get_current_customer), db: Session = Depends(get_db),
+):
+    guest = _linked_identity_guest(db, customer)
+    return _customer_identity_status(db, guest)
+
+
+@router.post("/me/identity/documents", response_model=GuestIdentityDocumentOut, status_code=status.HTTP_201_CREATED)
+async def upload_my_identity_document(
+    document_type: str,
+    file: UploadFile = File(...),
+    customer: CustomerAccount = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    guest = _linked_identity_guest(db, customer)
+    if document_type not in IDENTITY_DOCUMENT_TYPES:
+        raise HTTPException(400, "Invalid document_type")
+
+    allowed_types = ("image/jpeg", "image/png", "image/webp", "application/pdf")
+    contents = await read_and_validate_upload(file, allowed_content_types=allowed_types, verify_signature=True)
+    extension = EXTENSION_BY_CONTENT_TYPE[file.content_type]
+    stored_object: tuple[str, str] | None = None
+    try:
+        storage_backend, storage_key = await run_in_threadpool(
+            document_storage.store_new_document, contents, extension, file.content_type,
+        )
+        stored_object = (storage_backend, storage_key)
+        stored_path = (
+            str(document_storage.storage_path(storage_backend, storage_key))
+            if storage_backend in {"local", "railway_volume"} else ""
+        )
+        document = GuestDocument(
+            guest_id=guest.id,
+            document_type=document_type,
+            document_number=None,
+            filename=file.filename or storage_key,
+            content_type=file.content_type,
+            file_path=stored_path,
+            storage_backend=storage_backend,
+            storage_key=storage_key,
+            file_size_bytes=len(contents),
+            sha256_checksum=hashlib.sha256(contents).hexdigest(),
+            side="document",
+            uploaded_by=None,
+        )
+        db.add(document)
+        db.flush()
+        record_audit_log(
+            db, None, "guest.identity_document_upload", entity_type="guest", entity_id=str(guest.id),
+            details=f"Customer self-uploaded {document_type} via customer account: {document.filename}",
+        )
+        db.commit()
+        db.refresh(document)
+        return document
+    except document_storage.StorageUnavailable:
+        db.rollback()
+        if stored_object:
+            try:
+                await run_in_threadpool(document_storage.delete_stored_object, *stored_object)
+            except Exception:
+                pass
+        raise HTTPException(503, "Document storage is unavailable") from None
+    except Exception:
+        db.rollback()
+        if stored_object:
+            try:
+                await run_in_threadpool(document_storage.delete_stored_object, *stored_object)
+            except Exception:
+                pass
+        raise
+
+
+@router.post("/me/identity/submit", response_model=GuestIdentityStatusOut)
+def submit_my_identity_document(
+    payload: GuestIdentitySubmitRequest,
+    customer: CustomerAccount = Depends(get_current_customer),
+    db: Session = Depends(get_db),
+):
+    guest = _linked_identity_guest(db, customer)
+    document = db.get(GuestDocument, payload.document_id)
+    if document is None or document.guest_id != guest.id:
+        raise HTTPException(404, "Document not found")
+    if guest.identity_status in ("submitted", "under_review", "verified"):
+        raise HTTPException(409, f"Identity verification is already {guest.identity_status}")
+
+    guest.identity_status = "submitted"
+    record_audit_log(
+        db, None, "guest.identity_submit", entity_type="guest", entity_id=str(guest.id),
+        details=f"Submitted for review through customer account ({document.document_type})",
+    )
+    db.commit()
+    db.refresh(guest)
+    return _customer_identity_status(db, guest)
+
+
 @router.patch("/me", response_model=CustomerAccountOut)
 def update_me(
     payload: CustomerUpdateProfileRequest,
@@ -485,9 +734,14 @@ def update_me(
         if conflict is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, "An account with this phone number already exists.")
 
+    phone_changed = normalized_phone != customer.phone
     customer.first_name = payload.first_name
     customer.last_name = payload.last_name
     customer.phone = normalized_phone
+    if phone_changed:
+        # A profile edit is not proof of control over a new number. Require
+        # a later successful phone OTP before that number can link a Guest.
+        customer.phone_verified_at = None
 
     record_audit_log(
         db, None, "customer_auth.profile_updated",

@@ -111,6 +111,23 @@ def test_completing_task_marks_unit_clean(headers):
     assert updated_unit["housekeeping_status"] == "clean"
 
 
+def test_repeated_completion_via_dedicated_endpoint_does_not_shift_completed_at(headers):
+    """Housekeeping mutation-logic consolidation: the dedicated
+    PATCH /housekeeping-tasks/{id} endpoint used to unconditionally
+    overwrite completed_at on every 'completed' PATCH (unlike the unified
+    Staff Operations endpoint, which already guarded this — see
+    test_staff_operations.py's own Phase 18C regression test). Both now
+    call the same canonical app/modules/housekeeping/service.py function,
+    so this exact endpoint must be idempotent too."""
+    property_id = _make_property(headers)
+    unit_id = _make_unit(headers, property_id)
+    task_id = client.post("/api/v1/housekeeping-tasks", headers=headers, json={"unit_id": unit_id}).json()["id"]
+
+    first = client.patch(f"/api/v1/housekeeping-tasks/{task_id}", headers=headers, json={"status": "completed"}).json()
+    second = client.patch(f"/api/v1/housekeeping-tasks/{task_id}", headers=headers, json={"status": "completed"}).json()
+    assert first["completed_at"] == second["completed_at"]
+
+
 def test_invalid_task_status_rejected(headers):
     property_id = _make_property(headers)
     unit_id = _make_unit(headers, property_id)

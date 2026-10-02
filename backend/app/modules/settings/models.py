@@ -73,8 +73,9 @@ class BusinessSettings(Base):
         Text,
         default=(
             "Cancellation requests must be submitted through WhatsApp or email.\n"
-            "Full refund for cancellations received at least 48 hours before check-in.\n"
-            "No refund for cancellations received within 48 hours before check-in or after check-in."
+            "Cancellation more than 48 hours before scheduled check-in: eligible for a 100% refund.\n"
+            "Cancellation exactly 48 hours before or within 48 hours of scheduled check-in: eligible for a 50% refund; the remaining 50% is retained as a late-cancellation charge.\n"
+            "Approved refunds are initiated promptly to the original payment method. Posting time varies by payment provider, bank, card issuer, or UPI provider."
         ),
     )
 

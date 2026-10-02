@@ -46,3 +46,19 @@ uploads/
 # Local databases / generated files
 *.sqlite
 *.sqlite3
+
+# Local-only Codex project instructions
+/AGENTS.md
+
+# Sensitive key material and database exports
+*.pem
+*.key
+*.p12
+*.pfx
+*.dump
+*.backup
+*.sql.gz
+
+# Generated audit/coverage output
+audit-report.html
+.coverage

@@ -135,6 +135,51 @@ def test_gst_report_matches_generated_invoices(headers):
     assert data["invoice_count"] >= 1
 
 
+def test_gst_report_total_is_tax_only_not_gross_invoice_total(headers):
+    """
+    Regression test for the "GST Collected" mislabeling bug: gst_totals()
+    must return total == cgst + sgst + igst, never Invoice.total (which is
+    subtotal + tax, i.e. the guest's gross amount, not the tax collected).
+    Uses property_id to scope the query to exactly one invoice so the
+    assertions can be exact equality rather than >=.
+    """
+    property_id = _make_property(headers, state_code="33")
+    unit_id = _make_unit(headers, property_id, base_rate=2000)  # 5% slab
+    guest = _make_guest(headers, state_code="33")  # same state -> CGST/SGST
+    booking_id = _make_booking(headers, unit_id, guest, "2028-04-01", "2028-04-04")  # 3 nights = 6000 subtotal
+
+    invoice_resp = client.post(f"/api/v1/invoices/generate/{booking_id}", headers=headers)
+    assert invoice_resp.status_code == 201, invoice_resp.text
+    invoice = invoice_resp.json()
+
+    # Sanity-check the invoice itself: 6000 subtotal @ 5% = 300 tax, split
+    # 150/150 CGST/SGST (same state), gross total 6300.
+    assert invoice["cgst"] == 150.0
+    assert invoice["sgst"] == 150.0
+    assert invoice["igst"] == 0.0
+    assert invoice["total"] == 6300.0  # gross: subtotal + tax
+
+    issued_date = invoice["issued_at"][:10]
+
+    resp = client.get(
+        "/api/v1/reports/gst",
+        headers=headers,
+        params={"date_from": issued_date, "date_to": "2099-01-01", "property_id": property_id},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["cgst"] == 150.0
+    assert data["sgst"] == 150.0
+    assert data["igst"] == 0.0
+    assert data["invoice_count"] == 1
+
+    # The actual regression assertion: report "total" is the tax collected...
+    assert data["total"] == data["cgst"] + data["sgst"] + data["igst"] == 300.0
+    # ...and must NOT be the gross invoice total, even though they clearly differ here.
+    assert data["total"] != invoice["total"]
+
+
 def test_unit_performance_breaks_down_by_unit(headers):
     property_id = _make_property(headers)
     unit1 = _make_unit(headers, property_id, base_rate=1000)

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
@@ -40,6 +40,10 @@ describe("GuestLoginPage — phone/email OTP (replaces the old magic-link-only f
     verifyEmailOtp.mockReset();
   });
 
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("completes the phone OTP flow end-to-end and lands on the existing guest dashboard route", async () => {
     requestPhoneOtp.mockResolvedValue({ challenge_id: "c1", message: "sent", dev_otp_code: "123456" });
     verifyPhoneOtp.mockResolvedValue({ access_token: "guest-tok", token_type: "bearer" });
@@ -75,6 +79,43 @@ describe("GuestLoginPage — phone/email OTP (replaces the old magic-link-only f
 
     await waitFor(() => expect(requestEmailOtp).toHaveBeenCalledWith("guest@example.com"));
     expect(requestPhoneOtp).not.toHaveBeenCalled();
+    expect(await screen.findByText("654321")).toBeInTheDocument();
+  });
+
+  it("does not display a returned development code when the production DEV guard is false", async () => {
+    vi.stubEnv("DEV", false);
+    requestPhoneOtp.mockResolvedValue({ challenge_id: "c-prod", message: "sent", dev_otp_code: "123456" });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(screen.getByLabelText("Mobile number"), "9876543210");
+    await user.click(screen.getByRole("button", { name: "Send OTP" }));
+    await screen.findByLabelText("Verification code");
+
+    expect(screen.queryByText("Development mode — your verification code is:")).not.toBeInTheDocument();
+    expect(screen.queryByText("123456")).not.toBeInTheDocument();
+
+    // The regular verification path still works when the development code is hidden.
+    verifyPhoneOtp.mockResolvedValue({ access_token: "guest-prod-tok", token_type: "bearer" });
+    await user.type(screen.getByLabelText("Verification code"), "123456");
+    await user.click(screen.getByRole("button", { name: "Verify OTP" }));
+    await waitFor(() => expect(verifyPhoneOtp).toHaveBeenCalledWith("c-prod", "123456"));
+    expect(await screen.findByText("Guest Dashboard Stub")).toBeInTheDocument();
+  });
+
+  it("does not display a returned development email code when the production DEV guard is false", async () => {
+    vi.stubEnv("DEV", false);
+    requestEmailOtp.mockResolvedValue({ challenge_id: "c-email-prod", message: "sent", dev_otp_code: "654321" });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole("tab", { name: "Email" }));
+    await user.type(screen.getByLabelText("Email address"), "guest@example.com");
+    await user.click(screen.getByRole("button", { name: "Send OTP" }));
+    await screen.findByLabelText("Verification code");
+
+    expect(screen.queryByText("Development mode — your verification code is:")).not.toBeInTheDocument();
+    expect(screen.queryByText("654321")).not.toBeInTheDocument();
   });
 
   it("shows the backend error message on an incorrect code rather than a technical detail", async () => {

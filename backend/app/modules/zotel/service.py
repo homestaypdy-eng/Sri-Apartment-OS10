@@ -53,15 +53,19 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.modules.bookings import cancellation_service
 from app.modules.bookings.models import Booking, Guest
+from app.modules.notifications.service import dispatch_cancellation_notifications
 from app.modules.payments.models import Payment
+from app.modules.properties.models import Unit
 from app.modules.zotel import client
 from app.modules.zotel.client import ZotelAPIError, ZotelNotConfiguredError
 from app.modules.zotel.models import ZotelRoomMapping, ZotelSyncLog, ZotelSyncRecord
-from app.shared.availability import unit_is_available
+from app.shared.availability import lock_unit_for_reservation, unit_is_available
+from app.shared.occupancy import enforce_unit_max_occupancy
 
 logger = logging.getLogger("sri_apartment_os")
 
@@ -72,6 +76,18 @@ logger = logging.getLogger("sri_apartment_os")
 # touch it beyond the one explicit exception (cancellation propagation,
 # handled separately and only from this same state).
 SAFE_TO_AUTO_UPDATE_STATUSES = ("confirmed",)
+
+# Stable, application-specific PostgreSQL session advisory-lock key (ASCII
+# "ZOTELSYN"). It is constant across every worker and never comes from input.
+ZOTEL_SYNC_ADVISORY_LOCK_KEY = 0x5A4F54454C53594E
+
+
+class ZotelSyncAlreadyRunning(Exception):
+    """Raised when another worker already owns the global booking-sync lock."""
+
+
+class ZotelSyncLockUnavailable(Exception):
+    """Raised when the lock store cannot safely establish exclusivity."""
 
 
 def _persist_connectivity_log(db: Session, triggered_by: uuid.UUID | None, configured: bool, checks: list[dict], overall_passed: bool) -> None:
@@ -211,6 +227,68 @@ def _record(sync_log_id: uuid.UUID, external_reservation_id: str, outcome: str, 
 
 
 def sync_bookings(db: Session, triggered_by: uuid.UUID | None = None, status_filter: str | None = None) -> ZotelSyncLog:
+    """Serialize all booking syncs across processes using PostgreSQL.
+
+    The session-level lock is held on its own pinned connection because the
+    sync's normal Session commits on success and may roll back after an
+    overlap race. Neither operation can release this lock connection's
+    advisory lock. The lock is explicitly released (or its connection
+    invalidated) on every exit path.
+    """
+    lock_connection = None
+    try:
+        lock_connection = db.get_bind().connect()
+        acquired = lock_connection.execute(
+            select(func.pg_try_advisory_lock(ZOTEL_SYNC_ADVISORY_LOCK_KEY))
+        ).scalar_one()
+        # Session advisory locks survive transaction commit; commit here so
+        # the dedicated connection is not left with an open DB transaction.
+        lock_connection.commit()
+    except Exception as exc:
+        if lock_connection is not None:
+            try:
+                lock_connection.rollback()
+            except Exception:
+                pass
+            lock_connection.invalidate()
+            lock_connection.close()
+        logger.error("Could not acquire Zotel sync lock (%s)", type(exc).__name__)
+        raise ZotelSyncLockUnavailable() from None
+
+    if not acquired:
+        lock_connection.close()
+        raise ZotelSyncAlreadyRunning()
+
+    try:
+        return _sync_bookings_locked(db, triggered_by=triggered_by, status_filter=status_filter)
+    except BaseException:
+        # The import session must be reusable/clean after an exceptional exit.
+        try:
+            db.rollback()
+        except Exception:
+            logger.error("Could not roll back the Zotel sync session after an exception")
+        raise
+    finally:
+        try:
+            released = lock_connection.execute(
+                select(func.pg_advisory_unlock(ZOTEL_SYNC_ADVISORY_LOCK_KEY))
+            ).scalar_one()
+            lock_connection.commit()
+            if not released:
+                # Never return a possibly still-locked server session to the
+                # pool if PostgreSQL reports that this connection did not own it.
+                lock_connection.invalidate()
+                logger.error("PostgreSQL reported that the Zotel sync lock was not held during release")
+        except Exception as exc:
+            # Invalidating closes the physical PostgreSQL session, which
+            # releases any session-level advisory locks owned by it.
+            lock_connection.invalidate()
+            logger.error("Could not explicitly release Zotel sync lock (%s)", type(exc).__name__)
+        finally:
+            lock_connection.close()
+
+
+def _sync_bookings_locked(db: Session, triggered_by: uuid.UUID | None = None, status_filter: str | None = None) -> ZotelSyncLog:
     """
     Fetch Zotel reservations (paginated) and import/reconcile each one into
     the OS10 Booking table, keyed by external_reservation_id (Zotel's
@@ -276,8 +354,20 @@ def sync_bookings(db: Session, triggered_by: uuid.UUID | None = None, status_fil
         f"updated={sync_log.records_updated} skipped={sync_log.records_skipped} "
         f"unmapped={sync_log.records_unmapped} conflicted={sync_log.records_conflicted} failed={sync_log.records_failed}"
     )
+    # "updated" is used for exactly one thing in this file: a propagated
+    # Zotel cancellation (see _reconcile_existing) — collected here rather
+    # than dispatched inline, since this transaction isn't committed until
+    # just below, and dispatch_cancellation_notifications opens its own
+    # session (would read this booking's pre-cancellation state if called
+    # any earlier).
+    cancelled_booking_ids = [r.booking_id for r in records if r.outcome == "updated" and r.booking_id is not None]
+
     db.commit()
     db.refresh(sync_log)
+
+    for booking_id in cancelled_booking_ids:
+        dispatch_cancellation_notifications(booking_id, None)
+
     return sync_log
 
 
@@ -319,13 +409,52 @@ def _import_one(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: 
         return _record(sync_log.id, transaction_id, "failed", existing.id if existing else None, "Reservation checkin/checkout dates could not be parsed")
 
     if existing is not None:
-        return _reconcile_existing(db, sync_log, existing, zotel_status, check_in, check_out)
+        return _reconcile_existing(db, sync_log, existing, zotel_status, check_in, check_out, data, mapping.unit_id)
 
     # New reservation. Cancelled-on-arrival reservations aren't worth
     # occupying a slot for — nothing to protect, nothing to book.
     if zotel_status == "cancelled":
         return _record(sync_log.id, transaction_id, "skipped", None, "Zotel reservation is already cancelled; not imported")
 
+    # Phase 5A: checked explicitly, before the overlap check, so the
+    # detail message tells staff WHY this was rejected (maintenance/
+    # blocked status) rather than reusing the overlap message, which
+    # would misdescribe the actual cause. unit_is_available (below) now
+    # also covers unit.status internally as defense-in-depth, but relying
+    # on that alone here would report every maintenance-unit rejection as
+    # an "overlaps an existing OS10 booking/hold" conflict, which isn't
+    # true and wouldn't tell staff what to actually go fix. Zotel itself
+    # has no write API to receive a block (see zotel/client.py) — this
+    # cannot stop the OTA from selling the unit, only stop OS10 from
+    # silently creating a normal confirmed Booking for it.
+    local_unit = db.get(Unit, mapping.unit_id)
+    if local_unit is not None and local_unit.status != "available":
+        return _record(
+            sync_log.id, transaction_id, "conflicted", None,
+            f"Zotel reservation for unit {mapping.unit_id} ({check_in}..{check_out}) was not imported — "
+            f"the local unit is currently marked '{local_unit.status}' in OS10 (not 'available'); "
+            "review this reservation manually — Zotel has no way to receive a block from OS10, so the "
+            "OTA listing itself must be updated separately if the unit should stop being sold there",
+        )
+    # Serialize imports with direct/public booking and hold creation. The
+    # database exclusion constraints cannot compare an imported booking with
+    # an active hold, so all reservation writers must share this per-unit
+    # transaction lock before checking availability and inserting.
+    lock_unit_for_reservation(db, mapping.unit_id)
+    if local_unit is not None:
+        db.refresh(local_unit)
+        room = rooms[0] if rooms else {}
+        try:
+            adults = int(room.get("num_adults") or 1)
+            children = int(room.get("num_children") or 0)
+        except (TypeError, ValueError):
+            return _record(sync_log.id, transaction_id, "conflicted", None, "Zotel guest count is invalid; review manually")
+        if adults + children > local_unit.max_occupancy:
+            return _record(
+                sync_log.id, transaction_id, "conflicted", None,
+                f"Zotel reservation for unit {mapping.unit_id} has {adults + children} guests, exceeding "
+                f"the OS10 maximum occupancy of {local_unit.max_occupancy}; review manually",
+            )
     if not unit_is_available(db, mapping.unit_id, check_in, check_out):
         return _record(
             sync_log.id, transaction_id, "conflicted", None,
@@ -367,7 +496,7 @@ def _import_one(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: 
     return _record(sync_log.id, transaction_id, "imported", booking.id, f"Imported into unit {mapping.unit_id}")
 
 
-def _reconcile_existing(db: Session, sync_log: ZotelSyncLog, booking: Booking, zotel_status: str | None, check_in, check_out) -> ZotelSyncRecord:
+def _reconcile_existing(db: Session, sync_log: ZotelSyncLog, booking: Booking, zotel_status: str | None, check_in, check_out, data: dict, mapped_unit_id: uuid.UUID) -> ZotelSyncRecord:
     if booking.status not in SAFE_TO_AUTO_UPDATE_STATUSES:
         # Already checked in/out/cancelled locally — never let an external
         # feed reach back into an operationally-advanced record.
@@ -379,14 +508,47 @@ def _reconcile_existing(db: Session, sync_log: ZotelSyncLog, booking: Booking, z
         )
 
     if zotel_status == "cancelled":
-        booking.status = "cancelled"
+        # OS10 Phase 2B: routed through the same single authoritative
+        # cancellation workflow the manual OS10 endpoint uses (see
+        # bookings/cancellation_service.py) — status change, availability
+        # release, and audit all happen there, exactly once, for either
+        # caller. The shared workflow records the policy snapshot, but this
+        # OTA-originated cancellation remains reconciliation-only. A
+        # Zotel-recorded payment (mode="zotel") has no OS10 Razorpay payment
+        # reference to refund through —
+        # money collected via an OTA is refunded through that OTA/Zotel,
+        # not through OS10. The paid amount, if any, is surfaced in the
+        # audit trail so staff know a refund decision is pending.
+        paid_amount = data.get("paid_amount")
+        source_note = f"zotel_transaction_id={booking.external_reservation_id}"
+        if paid_amount and float(paid_amount) > 0:
+            source_note += f", paid_amount={float(paid_amount):.2f} (refund decision pending — see Phase 2B cancellation-policy note; not refundable via Razorpay, no gateway payment on this booking)"
+        cancellation_service.cancel_booking(
+            db, booking, actor_user_id=sync_log.triggered_by, refund_amount=None, refund_reason=None,
+            source=f"zotel ({source_note})",
+        )
         db.flush()
+        # Notification dispatch is deliberately NOT done here: this
+        # function's db session isn't committed yet (sync_bookings()
+        # commits once at the end, after processing every reservation in
+        # the batch), and dispatch_cancellation_notifications opens its
+        # OWN session — calling it now would read this booking's
+        # pre-cancellation state. sync_bookings() dispatches it for every
+        # booking_id in its own_result.cancelled_booking_ids, after its
+        # commit succeeds. See this function's return value below.
         return _record(sync_log.id, booking.external_reservation_id, "updated", booking.id, "Propagated Zotel cancellation to OS10 booking")
 
     if booking.check_in != check_in or booking.check_out != check_out:
         return _record(
             sync_log.id, booking.external_reservation_id, "conflicted", booking.id,
             f"Zotel now reports different dates ({check_in}..{check_out}) than the OS10 booking ({booking.check_in}..{booking.check_out}) — not auto-applied",
+        )
+
+    if booking.unit_id != mapped_unit_id:
+        return _record(
+            sync_log.id, booking.external_reservation_id, "conflicted", booking.id,
+            f"The current Zotel room mapping points to OS10 unit {mapped_unit_id}, but this existing booking is on OS10 unit {booking.unit_id}; "
+            "the existing booking will NOT be auto-moved. Manual review is required.",
         )
 
     return _record(sync_log.id, booking.external_reservation_id, "skipped", booking.id, "No safe change detected; already in sync")

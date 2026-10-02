@@ -42,8 +42,9 @@ describe("Layout navigation — RBAC Phase B Manager awareness", () => {
       "Inquiries", "Housekeeping", "Maintenance", "Inventory", "Guest Requests",
       "Billing", "Finance", "Reports Center", "Notifications",
     ]) {
-      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
+    expect(screen.getByRole("link", { name: "Payment Reconciliation" })).toBeInTheDocument();
   });
 
   it("Manager does not see Settings (BankSettings/backups live there)", async () => {
@@ -93,5 +94,6 @@ describe("Layout navigation — RBAC Phase B Manager awareness", () => {
     expect(screen.queryByText("Users")).not.toBeInTheDocument();
     expect(screen.queryByText("Audit")).not.toBeInTheDocument();
     expect(screen.queryByText("AI Strategist")).not.toBeInTheDocument();
+    expect(screen.queryByText("Payment Reconciliation")).not.toBeInTheDocument();
   });
 });

@@ -27,6 +27,7 @@ Covers:
 """
 import hashlib
 import hmac
+import os
 import uuid
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
@@ -55,11 +56,14 @@ def _make_signature(order_id: str, payment_id: str, secret: str) -> str:
     return hmac.new(secret.encode(), f"{order_id}|{payment_id}".encode(), hashlib.sha256).hexdigest()
 
 
-def _razorpay_captured_payload(order_id: str, payment_id: str) -> bytes:
+def _razorpay_captured_payload(order_id: str, payment_id: str, amount_paise: int) -> bytes:
     import json
     return json.dumps({
         "event": "payment.captured",
-        "payload": {"payment": {"entity": {"order_id": order_id, "id": payment_id}}},
+        "payload": {"payment": {"entity": {
+            "order_id": order_id, "id": payment_id, "status": "captured",
+            "amount": amount_paise, "currency": "INR",
+        }}},
     }).encode()
 
 
@@ -215,17 +219,43 @@ def test_owner_notification_carries_invoice_attachment_exactly_once_per_address(
         from app.modules.payments.models import Invoice
         invoice = db.scalar(select(Invoice).where(Invoice.booking_id == uuid.UUID(booking_id)))
         assert invoice is not None and invoice.pdf_path
-        pdf_path = invoice.pdf_path
+        invoice_no = invoice.invoice_no
     finally:
         db.close()
 
+    # NOT invoice.pdf_path: dispatch_booking_notifications() deliberately
+    # regenerates the invoice PDF fresh for the notification attachment
+    # (generate_invoice_pdf_for_booking) rather than reusing the file at
+    # invoice.pdf_path — a documented, intentional Phase 4A/3A choice so a
+    # lost ephemeral-filesystem file (e.g. after a Railway redeploy) can
+    # never silently produce an attachment-less email. That means the
+    # attachment is a DIFFERENT file on disk than invoice.pdf_path, with
+    # different random-suffix filenames, by design — same invoice content,
+    # not the same file object. The correct invariant to test is therefore
+    # "a real PDF for the correct invoice was attached", not "it's byte-
+    # identical-path to the DB's stored pdf_path" (a previously-failing
+    # assertion found in a production-readiness audit that mis-identified
+    # this deliberate regeneration as a defect).
+    #
+    # Also NOT checked here: os.path.exists(attachment_path). That file is
+    # intentionally deleted by dispatch_booking_notifications' own cleanup
+    # (a `finally: os.remove(generated_pdf_path)` right after all triggers
+    # run — see notifications/service.py) so the regenerated, send-only
+    # copy never accumulates on the ephemeral filesystem. By the time this
+    # assertion runs the file is already gone by design; checking for its
+    # existence was itself a test-hygiene bug, not a real invariant.
+    sanitized_invoice_no = invoice_no.replace("/", "_")
     for owner_email in (primary, secondary):
         calls_to_owner = [c for c in mock_send.call_args_list if c.args[0] == owner_email]
         assert len(calls_to_owner) == 1, (
             f"Expected exactly one email to {owner_email}, got {len(calls_to_owner)}"
         )
         # send_email(to_email, subject, body, attachment_path) — positional.
-        assert calls_to_owner[0].args[3] == pdf_path, "Business email must carry the invoice PDF"
+        attachment_path = calls_to_owner[0].args[3]
+        assert attachment_path, "Business email must carry the invoice PDF"
+        assert sanitized_invoice_no in os.path.basename(attachment_path), (
+            f"Attached PDF {attachment_path!r} does not appear to be for invoice {invoice_no!r}"
+        )
 
     db = SessionLocal()
     try:
@@ -241,6 +271,52 @@ def test_owner_notification_carries_invoice_attachment_exactly_once_per_address(
         db.close()
 
 
+def test_owner_notification_attachment_is_freshly_regenerated_not_the_stored_invoice_file(headers):
+    """
+    Regression test locking in WHY the previous test does not compare
+    against invoice.pdf_path directly: dispatch_booking_notifications()
+    regenerates the invoice PDF fresh (generate_invoice_pdf_for_booking)
+    rather than reading the possibly-lost file at invoice.pdf_path — a
+    deliberate Phase 4A/3A ephemeral-filesystem-resilience choice. This
+    test asserts that divergence explicitly, so a future change that
+    "fixes" the two paths to be identical (silently reintroducing the
+    lost-file risk this design avoids) fails a test instead of passing
+    unnoticed.
+    """
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=931)
+    check_out = check_in + timedelta(days=2)
+
+    with patch("app.modules.notifications.service.send_email", return_value=None) as mock_send:
+        booking_id, *_ = _complete_valid_booking(headers, unit_id, check_in, check_out)
+
+    db = SessionLocal()
+    try:
+        from app.modules.payments.models import Invoice
+        invoice = db.scalar(select(Invoice).where(Invoice.booking_id == uuid.UUID(booking_id)))
+        assert invoice is not None and invoice.pdf_path
+        stored_pdf_path = invoice.pdf_path
+    finally:
+        db.close()
+
+    owner_calls = [c for c in mock_send.call_args_list if len(c.args) > 3 and c.args[3]]
+    assert owner_calls, "Expected at least one owner email carrying an attachment"
+    attached_path = owner_calls[0].args[3]
+
+    assert attached_path != stored_pdf_path, (
+        "The notification attachment is expected to be a freshly regenerated "
+        "file, distinct from invoice.pdf_path — see this test's docstring."
+    )
+    # NOT os.path.exists(attached_path): dispatch_booking_notifications()
+    # deletes that freshly-regenerated file in its own `finally` block
+    # immediately after all triggers run (notifications/service.py), by
+    # design, so it never lingers on the ephemeral filesystem — it is
+    # correct for it to be gone by the time this assertion runs. The
+    # original invoice.pdf_path file (created separately at booking time,
+    # never touched by that cleanup) is expected to still be present.
+    assert os.path.exists(stored_pdf_path)
+
+
 def test_owner_notification_not_duplicated_on_duplicate_webhook(headers):
     _, unit_id = _make_available_unit(headers)
     check_in = date.today() + timedelta(days=910)
@@ -251,7 +327,15 @@ def test_owner_notification_not_duplicated_on_duplicate_webhook(headers):
     assert resp.status_code == 201
     hold_id = resp.json()["hold_id"]
     payment_id = f"pay_ownerdup_{uuid.uuid4().hex[:10]}"
-    body = _razorpay_captured_payload(fake_order_id, payment_id)
+    from app.modules.payment_gateway.models import GatewayOrder
+    db = SessionLocal()
+    try:
+        gateway_order = db.scalar(select(GatewayOrder).where(GatewayOrder.gateway_order_id == fake_order_id))
+        assert gateway_order is not None
+        amount_paise = round(float(gateway_order.amount) * 100)
+    finally:
+        db.close()
+    body = _razorpay_captured_payload(fake_order_id, payment_id, amount_paise)
 
     with patch("app.modules.payment_gateway.router.verify_webhook_signature", return_value=True), \
          patch("app.modules.notifications.service.send_email", return_value=None) as mock_send:
@@ -302,7 +386,15 @@ def test_owner_notification_not_duplicated_on_browser_webhook_race(headers):
     assert resp.status_code == 201
     hold_id = resp.json()["hold_id"]
     payment_id = f"pay_race_{uuid.uuid4().hex[:10]}"
-    webhook_body = _razorpay_captured_payload(fake_order_id, payment_id)
+    from app.modules.payment_gateway.models import GatewayOrder
+    db = SessionLocal()
+    try:
+        gateway_order = db.scalar(select(GatewayOrder).where(GatewayOrder.gateway_order_id == fake_order_id))
+        assert gateway_order is not None
+        amount_paise = round(float(gateway_order.amount) * 100)
+    finally:
+        db.close()
+    webhook_body = _razorpay_captured_payload(fake_order_id, payment_id, amount_paise)
 
     with patch("app.modules.payment_gateway.router.verify_webhook_signature", return_value=True), \
          patch("app.modules.notifications.service.send_email", return_value=None) as mock_send:

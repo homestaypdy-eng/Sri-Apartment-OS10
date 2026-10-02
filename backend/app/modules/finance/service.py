@@ -8,11 +8,11 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.modules.bookings.models import Booking, Guest
-from app.modules.finance.models import EXPENSE_CATEGORIES, Expense, Budget, DailyClosing, OwnerWithdrawal, PurchaseRecord, SecurityDeposit, OTACommission, OTAPayoutReceipt, UtilityReading, UtilityReadingAllocation, LaundryEntry, Loan, LoanEmiPayment
-from app.modules.payments.models import Invoice, Payment
+from app.modules.finance.models import EXPENSE_CATEGORIES, EXPENSE_PNL_STATUSES, Expense, ExpensePayment, Budget, DailyClosing, OwnerWithdrawal, PurchaseRecord, SecurityDeposit, OTACommission, OTAPayoutReceipt, UtilityReading, UtilityReadingAllocation, LaundryEntry, Loan, LoanEmiPayment
+from app.modules.payments.models import PAYMENT_MODES, Invoice, Payment
 from app.modules.properties.models import Unit
 
 
@@ -60,7 +60,7 @@ def budget_vs_actual(db: Session, period_year: int, period_month: int) -> dict:
     }
     start = date(period_year, period_month, 1)
     end = date(period_year + 1, 1, 1) if period_month == 12 else date(period_year, period_month + 1, 1)
-    expenses = db.scalars(select(Expense).where(Expense.expense_date >= start, Expense.expense_date < end)).all()
+    expenses = db.scalars(select(Expense).where(Expense.expense_date >= start, Expense.expense_date < end, Expense.approval_status.in_(EXPENSE_PNL_STATUSES))).all()
 
     actuals: dict[str, float] = defaultdict(float)
     for e in expenses:
@@ -178,11 +178,35 @@ def cash_flow(db: Session, date_from: date, date_to: date) -> dict:
     start, end = _range_bounds(date_from, date_to)
 
     payments = db.scalars(select(Payment).where(Payment.paid_at >= start, Payment.paid_at <= end)).all()
+    # Cash-ledger figures below (cash_in_payments/cash_in_bank/cash_in_hand/
+    # cash_in_total) are scoped to PAYMENT_MODES (upi/card/bank_transfer/
+    # cash/razorpay) only — known_payments — not every Payment row: this is
+    # a ledger of cash that has actually moved into one of the business's
+    # own bank/hand instruments, and PAYMENT_MODES is exactly that set (see
+    # payments/models.py). mode="zotel" is deliberately excluded from it,
+    # not merely uncategorised: a Zotel-recorded Payment row means "the
+    # guest's payment status as reported by Zotel," not "cash has landed in
+    # our bank or hand" — Zotel's own payment_method field (pay_at_hotel/
+    # pay_now/part_payments) describes a billing arrangement, not a
+    # specific instrument, so there is nothing honest to bucket it into
+    # here (see zotel/service.py's _import_one docstring for the original
+    # reasoning). The actual cash event for OTA-sourced revenue is tracked
+    # separately — cash_in_ota_payouts below, sourced from OTAPayoutReceipt,
+    # a staff-confirmed record of money the OTA has actually paid out — so
+    # folding zotel-mode payments into cash_in_total too would double-count
+    # that revenue once both rows eventually exist for the same booking.
+    # Zotel-mode payments are NOT simply dropped, though: cash_in_zotel_
+    # pending below still surfaces them, informationally, so a real
+    # recorded payment never silently vanishes from this report — it's
+    # just correctly kept out of the bank/hand/total cash figures until an
+    # actual OTAPayoutReceipt reconciles it.
+    known_payments = [p for p in payments if p.mode in PAYMENT_MODES]
+    zotel_payments = [p for p in payments if p.mode == "zotel"]
     deposits_received = db.scalars(select(SecurityDeposit).where(SecurityDeposit.received_at >= start, SecurityDeposit.received_at <= end)).all()
     deposits_refunded = db.scalars(
         select(SecurityDeposit).where(SecurityDeposit.refunded_at.isnot(None), SecurityDeposit.refunded_at >= start, SecurityDeposit.refunded_at <= end)
     ).all()
-    expenses = db.scalars(select(Expense).where(Expense.expense_date >= date_from, Expense.expense_date <= date_to)).all()
+    expense_payments = db.scalars(select(ExpensePayment).where(ExpensePayment.payment_date >= date_from, ExpensePayment.payment_date <= date_to)).all()
     withdrawals = db.scalars(select(OwnerWithdrawal).where(OwnerWithdrawal.withdrawal_date >= date_from, OwnerWithdrawal.withdrawal_date <= date_to)).all()
     # Phase 19D-1: only ACTUALLY RECORDED EMI payments count as a cash
     # outflow — an EMI schedule row that's still "due" is not a payment,
@@ -205,20 +229,24 @@ def cash_flow(db: Session, date_from: date, date_to: date) -> dict:
         select(OTAPayoutReceipt).where(OTAPayoutReceipt.receipt_date >= date_from, OTAPayoutReceipt.receipt_date <= date_to)
     ).all()
 
-    cash_in_payments = round(sum(float(p.amount) for p in payments), 2)
+    cash_in_payments = round(sum(float(p.amount) for p in known_payments), 2)
     cash_in_deposits = round(sum(float(d.amount) for d in deposits_received), 2)
     cash_in_ota_payouts = round(sum(float(r.actual_received_amount) for r in ota_payouts_received), 2)
     cash_in_total = round(cash_in_payments + cash_in_deposits + cash_in_ota_payouts, 2)
+    # Informational only — deliberately NOT part of cash_in_total (see the
+    # comment above known_payments/zotel_payments for why folding it in
+    # would double-count against cash_in_ota_payouts).
+    cash_in_zotel_pending = round(sum(float(p.amount) for p in zotel_payments), 2)
 
-    cash_out_expenses = round(sum(float(e.amount) for e in expenses), 2)
+    cash_out_expenses = round(sum(float(p.amount) for p in expense_payments), 2)
     cash_out_withdrawals = round(sum(float(w.amount) for w in withdrawals), 2)
     cash_out_deposit_refunds = round(sum(float(d.refund_amount) for d in deposits_refunded), 2)
     cash_out_loan_emi = round(sum(float(p.paid_amount if p.paid_amount is not None else p.emi_amount) for p in loan_emi_paid), 2)
     cash_out_total = round(cash_out_expenses + cash_out_withdrawals + cash_out_deposit_refunds + cash_out_loan_emi, 2)
 
     bank_modes = ("upi", "card", "bank_transfer", "razorpay")
-    cash_in_bank = round(sum(float(p.amount) for p in payments if p.mode in bank_modes), 2)
-    cash_in_hand = round(sum(float(p.amount) for p in payments if p.mode == "cash"), 2)
+    cash_in_bank = round(sum(float(p.amount) for p in known_payments if p.mode in bank_modes), 2)
+    cash_in_hand = round(sum(float(p.amount) for p in known_payments if p.mode == "cash"), 2)
 
     return {
         "date_from": date_from,
@@ -226,6 +254,7 @@ def cash_flow(db: Session, date_from: date, date_to: date) -> dict:
         "cash_in_payments": cash_in_payments,
         "cash_in_deposits": cash_in_deposits,
         "cash_in_ota_payouts": cash_in_ota_payouts,
+        "cash_in_zotel_pending": cash_in_zotel_pending,
         "cash_in_total": cash_in_total,
         "cash_out_expenses": cash_out_expenses,
         "cash_out_withdrawals": cash_out_withdrawals,
@@ -413,7 +442,7 @@ def apartment_pnl(db: Session, unit_id, period_year: int, period_month: int) -> 
         advance_received += paid
         outstanding_balance += max(booking_total - paid, 0.0)
 
-    expenses = db.scalars(select(Expense).where(Expense.unit_id == unit_id, Expense.expense_date >= start, Expense.expense_date < end)).all()
+    expenses = db.scalars(select(Expense).where(Expense.unit_id == unit_id, Expense.expense_date >= start, Expense.expense_date < end, Expense.approval_status.in_(EXPENSE_PNL_STATUSES))).all()
     expense_by_category: dict[str, float] = defaultdict(float)
     for e in expenses:
         expense_by_category[e.category] += float(e.amount)
@@ -506,8 +535,15 @@ def daily_cashbook(db: Session, cashbook_date: date) -> dict:
     for d in db.scalars(select(SecurityDeposit).where(SecurityDeposit.refunded_at.isnot(None), SecurityDeposit.refunded_at >= start, SecurityDeposit.refunded_at <= end)).all():
         lines.append((d.refunded_at, "Security deposit refunded", "out", float(d.refund_amount)))
 
-    for e in db.scalars(select(Expense).where(Expense.expense_date == cashbook_date)).all():
-        lines.append((datetime.combine(cashbook_date, time.min, tzinfo=timezone.utc), f"Expense — {e.category}" + (f" ({e.notes})" if e.notes else ""), "out", float(e.amount)))
+    expense_payments = db.scalars(
+        select(ExpensePayment).options(joinedload(ExpensePayment.expense)).where(ExpensePayment.payment_date == cashbook_date)
+    ).all()
+    for payment in expense_payments:
+        lines.append((
+            datetime.combine(payment.payment_date, time.min, tzinfo=timezone.utc),
+            f"Expense payment — {payment.expense.category} ({payment.payment_method})",
+            "out", float(payment.amount),
+        ))
 
     for p in db.scalars(select(PurchaseRecord).where(PurchaseRecord.purchase_date == cashbook_date)).all():
         lines.append((datetime.combine(cashbook_date, time.min, tzinfo=timezone.utc), f"Purchase — {p.item_description}", "out", float(p.amount)))
@@ -713,7 +749,7 @@ def property_pnl(db: Session, property_id, period_year: int, period_month: int) 
     start = date(period_year, period_month, 1)
     end = date(period_year + 1, 1, 1) if period_month == 12 else date(period_year, period_month + 1, 1)
     central_expenses = round(sum(float(e.amount) for e in db.scalars(
-        select(Expense).where(Expense.unit_id.is_(None), Expense.expense_date >= start, Expense.expense_date < end)
+        select(Expense).where(Expense.unit_id.is_(None), Expense.expense_date >= start, Expense.expense_date < end, Expense.approval_status.in_(EXPENSE_PNL_STATUSES))
     ).all()), 2)
 
     total_revenue = round(sum(u["revenue"] for u in unit_lines), 2)

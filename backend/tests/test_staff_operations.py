@@ -10,6 +10,7 @@ import ast
 import uuid
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -543,3 +544,31 @@ def test_maintenance_resolution_via_unified_endpoint_does_not_set_cost_or_create
     updated = client.get("/api/v1/maintenance-tickets", headers=headers, params={"unit_id": unit_id}).json()
     match = next(t for t in updated if t["id"] == ticket["id"])
     assert match["cost"] is None
+
+
+def test_maintenance_resolution_via_unified_endpoint_fires_notification_trigger(headers):
+    """Phase 7: the dedicated /maintenance-tickets endpoint fires
+    trigger_maintenance_ticket_resolved when a ticket newly becomes
+    resolved/closed. The unified endpoint replicates every other part of
+    that same transition (status validation, resolved_at, audit action
+    name) but was missing this one call — a real, undocumented asymmetry,
+    not the deliberately-excluded cost/Expense path covered by the test
+    above. Patched at staff_ops/router.py's own import binding, same
+    technique as the Housekeeping consolidation tests."""
+    unit_id = _make_unit(headers)
+    ticket = client.post("/api/v1/maintenance-tickets", headers=headers, json={"unit_id": unit_id, "description": "notif test"}).json()
+
+    with patch("app.modules.staff_ops.router.trigger_maintenance_ticket_resolved") as mock_trigger:
+        resp = client.patch(f"/api/v1/staff/tasks/{ticket['id']}", headers=headers, params={"category": "maintenance"}, json={"status": "resolved"})
+    assert resp.status_code == 200, resp.text
+    mock_trigger.assert_called_once()
+
+
+def test_maintenance_resolution_via_unified_endpoint_does_not_duplicate_notification(headers):
+    unit_id = _make_unit(headers)
+    ticket = client.post("/api/v1/maintenance-tickets", headers=headers, json={"unit_id": unit_id, "description": "notif dedupe test"}).json()
+
+    with patch("app.modules.staff_ops.router.trigger_maintenance_ticket_resolved") as mock_trigger:
+        client.patch(f"/api/v1/staff/tasks/{ticket['id']}", headers=headers, params={"category": "maintenance"}, json={"status": "resolved"})
+        client.patch(f"/api/v1/staff/tasks/{ticket['id']}", headers=headers, params={"category": "maintenance"}, json={"status": "closed"})
+    mock_trigger.assert_called_once()

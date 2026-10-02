@@ -27,14 +27,14 @@ def headers():
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
-def _make_unit(headers, rate=2000, name_prefix="FinCompUnit"):
+def _make_unit(headers, rate=2000, name_prefix="FinCompUnit", max_occupancy=2):
     prop = client.post("/api/v1/properties", headers=headers, json={"name": f"FinCompProp {uuid.uuid4().hex[:6]}", "address": "Test", "state_code": "34"}).json()
-    unit = client.post("/api/v1/units", headers=headers, json={"property_id": prop["id"], "name": f"{name_prefix} {uuid.uuid4().hex[:6]}", "base_rate": rate}).json()
+    unit = client.post("/api/v1/units", headers=headers, json={"property_id": prop["id"], "name": f"{name_prefix} {uuid.uuid4().hex[:6]}", "base_rate": rate, "max_occupancy": max_occupancy}).json()
     return unit["id"]
 
 
 def test_income_register_matches_hand_calculation(headers):
-    unit_id = _make_unit(headers, rate=2000)
+    unit_id = _make_unit(headers, rate=2000, max_occupancy=3)
     guest = client.post("/api/v1/guests", headers=headers, json={"name": "Income Register Guest", "phone": f"91{uuid.uuid4().int % 10**8:08d}"}).json()
     year, month = 2041, 3
     booking = client.post("/api/v1/bookings", headers=headers, json={

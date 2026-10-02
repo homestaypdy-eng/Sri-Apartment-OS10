@@ -25,13 +25,13 @@ export default function AuditPage() {
       <div className="flex gap-1 mb-6 border-b border-slate-200">
         <button
           onClick={() => setTab("logs")}
-          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${tab === "logs" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
+          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${tab === "logs" ? "border-brand-green text-brand-green" : "border-transparent text-slate-400"}`}
         >
           Audit Logs
         </button>
         <button
           onClick={() => setTab("logins")}
-          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${tab === "logins" ? "border-slate-900 text-slate-900" : "border-transparent text-slate-400"}`}
+          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${tab === "logins" ? "border-brand-green text-brand-green" : "border-transparent text-slate-400"}`}
         >
           Login History
         </button>

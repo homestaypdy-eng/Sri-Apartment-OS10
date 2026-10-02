@@ -1,10 +1,13 @@
 import os
+import hashlib
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, timezone
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -12,11 +15,16 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
-from app.modules.bookings.models import BOOKING_STATUSES, Booking, BookingAttachment, Guest, GuestDocument
+from app.modules.customer_auth.models import CustomerAccount
+from app.modules.bookings.models import BOOKING_STATUSES, IDENTITY_DOCUMENT_TYPES, Booking, BookingAttachment, BookingGuest, Guest, GuestDocument
 from app.modules.bookings.schemas import (
     BookingArchiveRequest,
     BookingAttachmentOut,
+    BookingCancellationRequest,
     BookingCreate,
+    BookingGuestCreate,
+    BookingGuestOut,
+    BookingGuestsOut,
     BookingOut,
     BookingUpdate,
     GuestCreate,
@@ -27,22 +35,28 @@ from app.modules.bookings.schemas import (
     GuestOut,
     GuestSegment,
     GuestUpdate,
+    IdentityRejectRequest,
+    IdentityResetRequest,
+    IdentityVerifyRequest,
+    PrincipalGuestOut,
 )
+from app.modules.bookings import cancellation_service
+from app.modules.bookings import document_storage
 from app.modules.finance.models import OTACommission, SecurityDeposit
 from app.modules.housekeeping.models import HousekeepingTask
+from app.modules.notifications.service import dispatch_cancellation_notifications
 from app.modules.payments.models import Invoice, Payment
 from app.modules.portal.auth_models import IDENTITY_CHANNELS, GuestIdentity
 from app.modules.portal.auth_schemas import GuestIdentityOut, LinkGuestIdentityRequest
 from app.modules.portal.auth_service import normalize_email, normalize_phone
 from app.modules.properties.models import Property, Unit
-from app.shared.availability import unit_is_available, units_availability
-from app.shared.file_upload import read_and_validate_upload
+from app.shared.availability import lock_unit_for_reservation, unit_is_available, units_availability
+from app.shared.occupancy import enforce_unit_max_occupancy
+from app.shared.file_upload import EXTENSION_BY_CONTENT_TYPE, read_and_validate_upload
 from app.shared.rbac import get_current_user, require_role
 
 ATTACHMENT_STORAGE_DIR = os.environ.get("BOOKING_ATTACHMENT_STORAGE_DIR", "/tmp/sri_apartment_attachments")
 os.makedirs(ATTACHMENT_STORAGE_DIR, exist_ok=True)
-GUEST_DOCUMENT_STORAGE_DIR = os.environ.get("GUEST_DOCUMENT_STORAGE_DIR", "/tmp/sri_apartment_guest_documents")
-os.makedirs(GUEST_DOCUMENT_STORAGE_DIR, exist_ok=True)
 
 router = APIRouter(prefix="/api/v1", tags=["bookings"])
 
@@ -105,26 +119,64 @@ async def upload_guest_document(
     guest = db.get(Guest, guest_id)
     if guest is None:
         raise HTTPException(404, "Guest not found")
-    if document_type not in ("aadhaar", "pan", "passport", "driving_license", "other"):
+    if document_type not in IDENTITY_DOCUMENT_TYPES:
         raise HTTPException(400, "Invalid document_type")
 
-    contents = await read_and_validate_upload(file)
-    ext = os.path.splitext(file.filename or "")[1]
-    stored_name = f"{guest_id}_{document_type}_{side}_{uuid.uuid4().hex[:8]}{ext}"
-    stored_path = os.path.join(GUEST_DOCUMENT_STORAGE_DIR, stored_name)
-    with open(stored_path, "wb") as f:
-        f.write(contents)
-
-    doc = GuestDocument(
-        guest_id=guest_id, document_type=document_type, document_number=document_number,
-        filename=file.filename or stored_name, content_type=file.content_type or "application/octet-stream",
-        file_path=stored_path, side=side, uploaded_by=user.id,
-    )
-    db.add(doc)
-    record_audit_log(db, user.id, "guest.document_upload", entity_type="guest", entity_id=str(guest_id), details=f"{document_type} ({side}): {doc.filename}")
-    db.commit()
-    db.refresh(doc)
-    return doc
+    # OS10 Phase 3 Step 3A: guest ID documents are the most sensitive
+    # upload in the system — unlike the generic booking-attachment path,
+    # this one now validates the declared content type AND verifies the
+    # actual file bytes match it (verify_signature=True), closing the
+    # "any file type accepted" / "trust the client-declared header" gaps
+    # the storage/security audit found. Only real image or PDF content is
+    # ever accepted — an HTML/SVG upload is rejected outright, whatever
+    # extension or Content-Type header it's sent with.
+    allowed_types = ("image/jpeg", "image/png", "image/webp", "application/pdf")
+    contents = await read_and_validate_upload(file, allowed_content_types=allowed_types, verify_signature=True)
+    # Stored extension is derived from the VALIDATED content type, never
+    # from the client-supplied filename — closes "attacker picks the
+    # extension" (e.g. real JPEG bytes uploaded as "id.html").
+    ext = EXTENSION_BY_CONTENT_TYPE[file.content_type]
+    stored_object: tuple[str, str] | None = None
+    try:
+        storage_backend, storage_key = await run_in_threadpool(
+            document_storage.store_new_document, contents, ext, file.content_type,
+        )
+        stored_object = (storage_backend, storage_key)
+        # file_path remains populated only for filesystem storage. Empty
+        # means the object is stored by backend/key; this is not a URL.
+        stored_path = (
+            str(document_storage.storage_path(storage_backend, storage_key))
+            if storage_backend in {"local", "railway_volume"} else ""
+        )
+        doc = GuestDocument(
+            guest_id=guest_id, document_type=document_type, document_number=document_number,
+            filename=file.filename or storage_key, content_type=file.content_type,
+            file_path=stored_path, storage_backend=storage_backend, storage_key=storage_key,
+            file_size_bytes=len(contents), sha256_checksum=hashlib.sha256(contents).hexdigest(),
+            side=side, uploaded_by=user.id,
+        )
+        db.add(doc)
+        db.flush()
+        record_audit_log(db, user.id, "guest.document_upload", entity_type="guest", entity_id=str(guest_id), details=f"{document_type} ({side}): {doc.filename}")
+        db.commit()
+        db.refresh(doc)
+        return doc
+    except document_storage.StorageUnavailable:
+        db.rollback()
+        if stored_object:
+            try:
+                await run_in_threadpool(document_storage.delete_stored_object, *stored_object)
+            except Exception:
+                pass
+        raise HTTPException(503, "Guest document storage is unavailable") from None
+    except Exception:
+        db.rollback()
+        if stored_object:
+            try:
+                await run_in_threadpool(document_storage.delete_stored_object, *stored_object)
+            except Exception:
+                pass
+        raise
 
 
 @router.get("/guests/{guest_id}/documents", response_model=list[GuestDocumentOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
@@ -133,13 +185,55 @@ def list_guest_documents(guest_id: uuid.UUID, db: Session = Depends(get_db)):
 
 
 @router.get("/guests/{guest_id}/documents/{document_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def download_guest_document(guest_id: uuid.UUID, document_id: uuid.UUID, db: Session = Depends(get_db)):
+def download_guest_document(guest_id: uuid.UUID, document_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     doc = db.get(GuestDocument, document_id)
     if doc is None or doc.guest_id != guest_id:
         raise HTTPException(404, "Document not found")
-    if not os.path.exists(doc.file_path):
-        raise HTTPException(404, "The stored file is missing from disk")
-    return FileResponse(doc.file_path, media_type=doc.content_type, filename=doc.filename)
+    try:
+        if not document_storage.exists(doc):
+            raise HTTPException(404, "Guest document file not found")
+        document_stream = document_storage.open_document(doc)
+    except document_storage.StorageNotFound:
+        raise HTTPException(404, "Guest document file not found") from None
+    except document_storage.StorageUnavailable:
+        raise HTTPException(503, "Guest document storage is unavailable") from None
+    # OS10 Phase 3 Step 3A: closes the audit finding that identity-document
+    # downloads left no record of who accessed them — the single highest-
+    # severity gap the storage/security audit found (OS10 could show who
+    # UPLOADED a passport scan but not who had since viewed it).
+    try:
+        record_audit_log(db, user.id, "guest.document_download", entity_type="guest", entity_id=str(guest_id), details=f"{doc.document_type} ({doc.side}): {doc.filename}")
+        db.commit()
+    except Exception:
+        document_stream.close()
+        db.rollback()
+        raise
+    safe_content_type = doc.content_type if doc.content_type in {
+        "image/jpeg", "image/png", "image/webp", "application/pdf",
+    } else "application/octet-stream"
+    # ".." is stripped in addition to the path separators above: replacing
+    # "/"/"\\" alone still leaves e.g. "../../outside.jpg" as ".._.._outside.jpg"
+    # — no longer usable as an OS path, but the literal ".." substring
+    # still reaches the suggested-download-filename header, which some
+    # non-browser HTTP clients (naive scripts, `curl -O`-style tools) do
+    # honor literally when choosing where to write the downloaded file.
+    safe_filename = (doc.filename or "guest-document").replace("\r", "").replace("\n", "").replace("/", "_").replace("\\", "_").replace("..", "_")
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(safe_filename, safe='')}",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+    def stream_chunks():
+        try:
+            while True:
+                chunk = document_stream.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            document_stream.close()
+
+    return StreamingResponse(stream_chunks(), media_type=safe_content_type, headers=headers)
 
 
 @router.delete("/guests/{guest_id}/documents/{document_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
@@ -148,10 +242,101 @@ def delete_guest_document(guest_id: uuid.UUID, document_id: uuid.UUID, db: Sessi
     if doc is None or doc.guest_id != guest_id:
         raise HTTPException(404, "Document not found")
     record_audit_log(db, user.id, "guest.document_delete", entity_type="guest", entity_id=str(guest_id), details=f"Deleted: {doc.filename}")
-    if os.path.exists(doc.file_path):
-        os.remove(doc.file_path)
+    try:
+        document_storage.delete_document_file(doc)
+    except document_storage.StorageNotFound:
+        pass
+    except document_storage.StorageUnavailable:
+        db.rollback()
+        raise HTTPException(503, "Guest document storage is unavailable") from None
     db.delete(doc)
     db.commit()
+
+
+@router.post("/guests/{guest_id}/identity/verify", response_model=GuestOut, dependencies=[Depends(require_role("admin"))])
+def verify_guest_identity(guest_id: uuid.UUID, payload: IdentityVerifyRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Authorised approval of a guest's already-uploaded identity document —
+    Identity Verification, entirely separate from Account Verification
+    (see Guest.identity_status's own docstring). Admin-only, the same tier
+    as merge/link-identity below, the other two genuinely identity-
+    sensitive actions already in this module. This is the ONLY place
+    identity_status can become "verified"; it always names the real
+    authenticated admin and a server-set timestamp — a client can never
+    submit `identity_verified: true` itself (GuestOut only ever reflects
+    it, GuestCreate/GuestUpdate don't accept it as a field at all).
+    Deliberately callable from any current status (not just "submitted")
+    — front-desk staff routinely check a physical ID and verify it on the
+    spot without the guest having gone through a separate portal submission.
+    """
+    guest = db.get(Guest, guest_id)
+    if guest is None:
+        raise HTTPException(404, "Guest not found")
+    doc = db.get(GuestDocument, payload.document_id)
+    if doc is None or doc.guest_id != guest_id:
+        raise HTTPException(404, "Document not found for this guest")
+
+    guest.identity_status = "verified"
+    guest.identity_verified_at = datetime.now(timezone.utc)
+    guest.identity_verified_by = user.id
+    guest.identity_verified_document_id = doc.id
+    guest.identity_rejection_reason = None
+    # Section 20: never log the raw document number, only its type.
+    record_audit_log(
+        db, user.id, "guest.identity_verify", entity_type="guest", entity_id=str(guest_id),
+        details=f"Verified using {doc.document_type} document",
+    )
+    db.commit()
+    db.refresh(guest)
+    return guest
+
+
+@router.post("/guests/{guest_id}/identity/reject", response_model=GuestOut, dependencies=[Depends(require_role("admin"))])
+def reject_guest_identity(guest_id: uuid.UUID, payload: IdentityRejectRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    guest = db.get(Guest, guest_id)
+    if guest is None:
+        raise HTTPException(404, "Guest not found")
+    if guest.identity_status not in ("pending", "submitted", "under_review"):
+        raise HTTPException(409, f"Cannot reject identity from status '{guest.identity_status}'")
+
+    guest.identity_status = "rejected"
+    guest.identity_rejection_reason = payload.reason
+    guest.identity_verified_by = user.id
+    guest.identity_verified_at = None
+    record_audit_log(db, user.id, "guest.identity_reject", entity_type="guest", entity_id=str(guest_id), details=f"Rejected: {payload.reason}")
+    db.commit()
+    db.refresh(guest)
+    return guest
+
+
+@router.post("/guests/{guest_id}/identity/reset", response_model=GuestOut, dependencies=[Depends(require_role("admin"))])
+def reset_guest_identity(guest_id: uuid.UUID, payload: IdentityResetRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Section 22 re-verification: document expired, guest information
+    changed, or an admin otherwise wants a fresh review of a previously
+    verified/rejected/expired guest. Sends them back to "pending" —
+    nobody is silently re-verified by this call; a genuine new review
+    still has to happen through verify/reject above.
+    """
+    guest = db.get(Guest, guest_id)
+    if guest is None:
+        raise HTTPException(404, "Guest not found")
+    if guest.identity_status not in ("verified", "rejected", "expired"):
+        raise HTTPException(409, f"Cannot reset identity from status '{guest.identity_status}'")
+
+    previous_status = guest.identity_status
+    guest.identity_status = "pending"
+    guest.identity_verified_at = None
+    guest.identity_verified_by = None
+    guest.identity_verified_document_id = None
+    guest.identity_rejection_reason = None
+    record_audit_log(
+        db, user.id, "guest.identity_reset", entity_type="guest", entity_id=str(guest_id),
+        details=f"Reset from '{previous_status}': {payload.reason}",
+    )
+    db.commit()
+    db.refresh(guest)
+    return guest
 
 
 @router.post("/guests/merge", response_model=GuestMergeResult, dependencies=[Depends(require_role("admin"))])
@@ -175,9 +360,21 @@ def merge_guests(payload: GuestMergeRequest, db: Session = Depends(get_db), user
     if duplicate.merged_into_guest_id is not None:
         raise HTTPException(409, "This guest has already been merged into another record")
 
+    duplicate_account = db.scalar(
+        select(CustomerAccount).where(CustomerAccount.guest_id == duplicate.id).with_for_update()
+    )
+    primary_account = db.scalar(
+        select(CustomerAccount).where(CustomerAccount.guest_id == primary.id).with_for_update()
+    )
+    if duplicate_account is not None and primary_account is not None:
+        raise HTTPException(409, "Both guest records are linked to customer accounts; resolve those links before merging")
+
     bookings = db.scalars(select(Booking).where(Booking.guest_id == payload.duplicate_guest_id)).all()
     for b in bookings:
         b.guest_id = payload.primary_guest_id
+
+    if duplicate_account is not None:
+        duplicate_account.guest_id = primary.id
 
     duplicate.merged_into_guest_id = payload.primary_guest_id
     record_audit_log(
@@ -522,6 +719,14 @@ def create_booking(payload: BookingCreate, db: Session = Depends(get_db), user: 
         )
     if not unit.is_active or not unit.property.is_active:
         raise HTTPException(status.HTTP_409_CONFLICT, "This unit (or its property) has been deactivated and is not available for new bookings")
+    # Closes the booking-vs-active-hold cross-table race: unit_is_available()
+    # below is a read, not a lock, so without this a concurrent create_hold()
+    # could pass its own check in the microseconds before this one's INSERT
+    # commits. Held through this whole transaction's commit/rollback below.
+    lock_unit_for_reservation(db, payload.unit_id)
+    db.refresh(unit)
+    enforce_unit_max_occupancy(unit, payload.adults, payload.children)
+
     # The bookings.no_overlapping_bookings EXCLUDE constraint below only
     # compares against OTHER bookings — it has no way to see a website
     # guest's active payment hold on this same unit/range, since holds
@@ -614,8 +819,22 @@ def list_bookings(
 
 
 @router.patch("/bookings/{booking_id}/status", response_model=BookingOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def update_booking_status(booking_id: uuid.UUID, new_status: str = Query(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    booking = db.get(Booking, booking_id)
+def update_booking_status(
+    booking_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    new_status: str = Query(...),
+    payload: BookingCancellationRequest | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    # with_for_update: closes the race where two concurrent requests both
+    # read status="confirmed" before either commits — the second request
+    # now blocks here until the first transaction finishes, then re-reads
+    # the (now "cancelled") status and correctly 409s below instead of
+    # both proceeding to refund. This is what makes "the same cancellation
+    # request repeated twice must not issue two refunds" actually hold
+    # under concurrency, not just on a single serial retry.
+    booking = db.get(Booking, booking_id, with_for_update=True)
     if booking is None:
         raise HTTPException(404, "Booking not found")
 
@@ -629,9 +848,6 @@ def update_booking_status(booking_id: uuid.UUID, new_status: str = Query(...), d
             f"Cannot transition booking from '{booking.status}' to '{new_status}'. "
             f"Allowed next states: {sorted(allowed_next) or 'none (terminal state)'}",
         )
-
-    old_status = booking.status
-    booking.status = new_status
 
     if new_status == "checked_out":
         # Checkout automatically raises a cleaning task and marks the room
@@ -648,9 +864,97 @@ def update_booking_status(booking_id: uuid.UUID, new_status: str = Query(...), d
             )
         )
 
-    record_audit_log(db, user.id, "booking.status_change", entity_type="booking", entity_id=str(booking.id), details=f"{old_status} -> {new_status}")
+    issued_refund_amount: float | None = None
+    failed_refund_amount: float | None = None
+
+    if new_status == "cancelled":
+        # OS10 Phase 2B: cancel_booking() is THE single authoritative
+        # cancellation workflow (also called from zotel/service.py for
+        # OTA-triggered cancellations) — refund (provider-mediated when
+        # the original payment is razorpay-mode, direct ledger entry
+        # otherwise), credit note, and audit all happen there. This
+        # endpoint's job is strictly HTTP orchestration: authorize,
+        # validate the transition and the requested amount, call the
+        # service, translate the result into a response.
+        refund_amount = payload.refund_amount if payload else None
+        refund_reason = payload.refund_reason if payload else None
+
+        if refund_amount and refund_amount > 0:
+            available = cancellation_service.refund_available_for_booking(db, booking.id)
+            if refund_amount > available:
+                raise HTTPException(
+                    400,
+                    f"Refund amount (Rs.{refund_amount}) exceeds what's available to refund on this booking (Rs.{available})",
+                )
+
+        try:
+            outcome = cancellation_service.cancel_booking(
+                db, booking, actor_user_id=user.id, refund_amount=refund_amount, refund_reason=refund_reason, source="manual",
+            )
+        except cancellation_service.CancellationRefundAmountMismatch as exc:
+            raise HTTPException(409, str(exc)) from None
+        issued_refund_amount = outcome.refund_succeeded_amount or None
+        failed_refund_amount = outcome.refund_failed_amount or None
+    else:
+        old_status = booking.status
+        booking.status = new_status
+        record_audit_log(db, user.id, "booking.status_change", entity_type="booking", entity_id=str(booking.id), details=f"{old_status} -> {new_status}")
+
     db.commit()
     db.refresh(booking)
+
+    if new_status == "cancelled":
+        background_tasks.add_task(dispatch_cancellation_notifications, booking.id, issued_refund_amount, failed_refund_amount)
+
+    return booking
+
+
+@router.post("/bookings/{booking_id}/retry-refund", response_model=BookingOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def retry_booking_refund(
+    booking_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    payload: BookingCancellationRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    OS10 Phase 2B: recovery path for a cancellation whose refund attempt
+    failed (a Razorpay call that errored, e.g.) or only partially
+    succeeded — the booking itself is already "cancelled" (that part
+    succeeded and is never retried here), only the outstanding refund
+    balance is retried. refund_available_for_booking nets out every
+    already-successful refund first, so this can never re-refund an
+    amount already confirmed paid back, however it was recorded.
+    """
+    booking = db.get(Booking, booking_id, with_for_update=True)
+    if booking is None:
+        raise HTTPException(404, "Booking not found")
+    if booking.status != "cancelled":
+        raise HTTPException(409, f"Booking is '{booking.status}', not 'cancelled' — nothing to retry")
+    if booking.cancellation_requires_review:
+        raise HTTPException(409, "This cancellation requires manual/provider reconciliation before any refund retry")
+    if not payload.refund_amount or payload.refund_amount <= 0:
+        raise HTTPException(400, "refund_amount is required as confirmation of the remaining server-calculated refund")
+
+    available = cancellation_service.refund_available_for_booking(db, booking.id)
+    if payload.refund_amount > available:
+        raise HTTPException(400, f"Refund amount (Rs.{payload.refund_amount}) exceeds what's available to refund on this booking (Rs.{available})")
+
+    try:
+        outcome = cancellation_service.retry_cancellation_refund(
+            db, booking, actor_user_id=user.id, refund_amount=payload.refund_amount, refund_reason=payload.refund_reason,
+        )
+    except cancellation_service.CancellationRefundAmountMismatch as exc:
+        raise HTTPException(409, str(exc)) from None
+    db.commit()
+    db.refresh(booking)
+
+    if outcome.refund_succeeded_amount or outcome.refund_failed_amount:
+        background_tasks.add_task(
+            dispatch_cancellation_notifications, booking.id,
+            outcome.refund_succeeded_amount or None, outcome.refund_failed_amount or None,
+        )
+
     return booking
 
 
@@ -663,7 +967,7 @@ def update_booking(booking_id: uuid.UUID, payload: BookingUpdate, db: Session = 
     weaker edit path that could silently create a double-booking. Every
     change is recorded to the audit trail with a before/after summary.
     """
-    booking = db.get(Booking, booking_id)
+    booking = db.get(Booking, booking_id, with_for_update=True)
     if booking is None:
         raise HTTPException(404, "Booking not found")
 
@@ -711,6 +1015,34 @@ def update_booking(booking_id: uuid.UUID, payload: BookingUpdate, db: Session = 
     new_check_out = changes.get("check_out", booking.check_out)
     if new_check_out <= new_check_in:
         raise HTTPException(400, "check_out must be after check_in")
+
+    new_unit_id = changes.get("unit_id", booking.unit_id)
+    target_unit = db.get(Unit, new_unit_id)
+    if target_unit is None:
+        raise HTTPException(404, "Unit not found")
+    reservation_fields_changed = bool({"unit_id", "check_in", "check_out"} & changes.keys())
+    capacity_fields_changed = bool({"unit_id", "adults", "children"} & changes.keys())
+    if capacity_fields_changed or (booking.status in ("confirmed", "checked_in") and reservation_fields_changed):
+        for locked_unit_id in sorted({booking.unit_id, new_unit_id}, key=str):
+            lock_unit_for_reservation(db, locked_unit_id)
+        db.refresh(target_unit)
+    enforce_unit_max_occupancy(
+        target_unit,
+        changes.get("adults", booking.adults),
+        changes.get("children", booking.children),
+    )
+    if booking.status in ("confirmed", "checked_in") and reservation_fields_changed:
+        if not unit_is_available(
+            db,
+            new_unit_id,
+            new_check_in,
+            new_check_out,
+            exclude_booking_id=booking.id,
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This change would overlap an existing booking or active payment hold, or the target unit is unavailable",
+            )
 
     before_summary = f"unit={booking.unit_id}, guest={booking.guest_id}, {booking.check_in}->{booking.check_out}, rate={booking.rate_applied}"
 
@@ -881,6 +1213,96 @@ def delete_attachment(booking_id: uuid.UUID, attachment_id: uuid.UUID, db: Sessi
     if os.path.exists(attachment.file_path):
         os.remove(attachment.file_path)
     db.delete(attachment)
+    db.commit()
+
+
+@router.get("/bookings/{booking_id}/guests", response_model=BookingGuestsOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def list_booking_guests(booking_id: uuid.UUID, db: Session = Depends(get_db)):
+    """
+    Principal Guest (Booking.guest_id, unchanged — never duplicated into a
+    row of its own) plus every Additional Guest attached via BookingGuest,
+    each with their own reusable Guest.identity_status. This one call is
+    what both the Booking-detail guest panel and the check-in screen need
+    to show every guest's verification state (sections 14/17/18).
+    """
+    booking = db.get(Booking, booking_id)
+    if booking is None:
+        raise HTTPException(404, "Booking not found")
+    principal = db.get(Guest, booking.guest_id)
+    if principal is None:
+        raise HTTPException(404, "Principal guest not found")
+
+    additional_rows = db.scalars(
+        select(BookingGuest).where(BookingGuest.booking_id == booking_id).order_by(BookingGuest.added_at)
+    ).all()
+    additional_guests = []
+    for row in additional_rows:
+        g = db.get(Guest, row.guest_id)
+        if g is None:
+            continue  # defensive only — FK guarantees this in practice
+        additional_guests.append(BookingGuestOut(
+            id=row.id, guest_id=g.id, name=g.name, phone=g.phone,
+            identity_status=g.identity_status, added_at=row.added_at,
+        ))
+
+    return BookingGuestsOut(
+        principal_guest=PrincipalGuestOut(
+            guest_id=principal.id, name=principal.name, phone=principal.phone,
+            identity_status=principal.identity_status,
+        ),
+        additional_guests=additional_guests,
+    )
+
+
+@router.post("/bookings/{booking_id}/guests", response_model=BookingGuestOut, status_code=201, dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def add_booking_guest(booking_id: uuid.UUID, payload: BookingGuestCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """
+    Attach an EXISTING Guest as an Additional Guest on this booking.
+    Deliberately takes only guest_id — finding or creating that Guest is
+    already the existing GuestPicker / POST /guests flow's job (section
+    28: search existing profiles, staff confirms, never fuzzy-merges), not
+    duplicated here. Section 3's "Guest Profile → Booking → Guest/
+    Companion Assignment" model: the same Guest row can be attached to
+    many bookings, as principal on one and additional on another, and its
+    own identity_status already carries across all of them — no per-
+    booking verification state is stored on BookingGuest itself.
+    """
+    booking = db.get(Booking, booking_id)
+    if booking is None:
+        raise HTTPException(404, "Booking not found")
+    guest = db.get(Guest, payload.guest_id)
+    if guest is None:
+        raise HTTPException(404, "Guest not found")
+    if guest.merged_into_guest_id is not None:
+        raise HTTPException(409, "This guest record was merged into another guest — use the current guest instead")
+    if payload.guest_id == booking.guest_id:
+        raise HTTPException(409, "This guest is already the Principal Guest on this booking")
+
+    existing = db.scalar(
+        select(BookingGuest).where(BookingGuest.booking_id == booking_id, BookingGuest.guest_id == payload.guest_id)
+    )
+    if existing is not None:
+        raise HTTPException(409, "This guest is already attached to this booking")
+
+    row = BookingGuest(booking_id=booking_id, guest_id=payload.guest_id, added_by=user.id)
+    db.add(row)
+    db.flush()
+    record_audit_log(db, user.id, "booking.guest_add", entity_type="booking", entity_id=str(booking_id), details=f"Added {guest.name} as an additional guest")
+    db.commit()
+    db.refresh(row)
+    return BookingGuestOut(id=row.id, guest_id=guest.id, name=guest.name, phone=guest.phone, identity_status=guest.identity_status, added_at=row.added_at)
+
+
+@router.delete("/bookings/{booking_id}/guests/{booking_guest_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
+def remove_booking_guest(booking_id: uuid.UUID, booking_guest_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Detaches an Additional Guest from this booking — never deletes the
+    underlying Guest Profile, which may be attached to other bookings."""
+    row = db.get(BookingGuest, booking_guest_id)
+    if row is None or row.booking_id != booking_id:
+        raise HTTPException(404, "Guest assignment not found")
+    guest = db.get(Guest, row.guest_id)
+    record_audit_log(db, user.id, "booking.guest_remove", entity_type="booking", entity_id=str(booking_id), details=f"Removed {guest.name if guest else row.guest_id} as an additional guest")
+    db.delete(row)
     db.commit()
 
 

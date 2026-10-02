@@ -21,6 +21,7 @@ class PaymentOut(BaseModel):
     paid_at: datetime
     refund_of_payment_id: uuid.UUID | None = None
     refund_reason: str | None = None
+    idempotency_key: str | None = None
 
     class Config:
         from_attributes = True
@@ -29,6 +30,10 @@ class PaymentOut(BaseModel):
 class RefundCreate(BaseModel):
     refund_amount: float = Field(gt=0)
     reason: str
+    # Optional. When supplied, a retry of the exact same request (same
+    # payment_id + idempotency_key) returns the original refund row instead
+    # of creating a second one.
+    idempotency_key: str | None = None
 
 
 class InvoiceOut(BaseModel):

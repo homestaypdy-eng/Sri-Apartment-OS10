@@ -132,6 +132,20 @@ describe("BookingsPage — All Bookings freshness (live refresh fix)", () => {
     expect(bookingsCallCount).toBe(1);
   });
 
+  it("explains that OS10 controls cancellation refund policy and may require manual review", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Existing Guest")).toBeInTheDocument());
+
+    await userEvent.click(screen.getAllByRole("button", { name: "Cancel" })[0]);
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("OS10 determines refund eligibility and any policy refund amount"));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("manual review or reconciliation"));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Staff cannot set the policy refund amount"));
+    expect(confirm).not.toHaveBeenCalledWith(expect.stringContaining("only changes its status"));
+    expect(confirm).not.toHaveBeenCalledWith(expect.stringContaining("handled separately from the payment's own Refund action"));
+  });
+
   it("refetches bookings when the tab becomes visible/focused again, and shows a newly created booking", async () => {
     renderPage();
     await waitFor(() => expect(screen.getByText("Existing Guest")).toBeInTheDocument());

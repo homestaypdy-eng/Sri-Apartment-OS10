@@ -29,9 +29,32 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.db.session import SessionLocal
+from app.modules.public_booking.models import PublicRateLimitBucket
 from conftest import ADMIN_EMAIL, ADMIN_PASSWORD  # single source of truth, see conftest.py
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def reset_public_booking_rate_limit_state():
+    """Isolate independent tests that share TestClient's peer IP quota.
+
+    Production rate limiting is exercised separately in
+    test_public_api_rate_limit.py; this fixture only clears test DB state.
+    """
+    db = SessionLocal()
+    try:
+        db.query(PublicRateLimitBucket).delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.fixture(autouse=True)
+def mock_provider_payment_lookup(monkeypatch):
+    """Keep route tests offline; provider field matching has dedicated unit coverage."""
+    monkeypatch.setattr("app.modules.public_booking.router.verify_provider_payment", lambda *args, **kwargs: True)
 
 FAKE_RAZORPAY_KEY_SECRET = "test_key_secret_for_unit_tests"
 FAKE_ORDER_ID = "order_test_fake123"
@@ -51,14 +74,14 @@ def headers():
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
-def _make_available_unit(headers, base_rate=2000):
+def _make_available_unit(headers, base_rate=2000, max_occupancy=2):
     prop = client.post(
         "/api/v1/properties", headers=headers,
         json={"name": f"PGTest {uuid.uuid4().hex[:6]}", "address": "Test", "state_code": "34"}
     ).json()
     unit = client.post(
         "/api/v1/units", headers=headers,
-        json={"property_id": prop["id"], "name": f"UGTest {uuid.uuid4().hex[:6]}", "base_rate": base_rate}
+        json={"property_id": prop["id"], "name": f"UGTest {uuid.uuid4().hex[:6]}", "base_rate": base_rate, "max_occupancy": max_occupancy}
     ).json()
     return prop["id"], unit["id"]
 
@@ -72,23 +95,37 @@ def _make_guest_and_unit(headers):
     return unit_id, guest["id"]
 
 
-def _create_hold_mocked(unit_id, check_in, check_out, guest_phone=None):
-    """Creates a hold using mocked Razorpay create_order."""
+def _create_hold_mocked(unit_id, check_in, check_out, guest_phone=None, adults=None, guest_address=None, guest_gstin=None, guest_email=None, promo_code=None):
+    """Creates a hold using mocked Razorpay create_order. adults/guest_address/
+    guest_gstin/guest_email/promo_code are omitted from the request body when
+    None, so existing callers keep exercising the schema's own defaults
+    (adults=1, address/gstin/promo unset) exactly as before these params
+    were added."""
     if guest_phone is None:
         guest_phone = f"77{uuid.uuid4().int % 10**8:08d}"
 
     fake_order_id = f"order_{uuid.uuid4().hex[:12]}"
 
+    payload = {
+        "unit_id": str(unit_id),
+        "check_in": check_in.isoformat(),
+        "check_out": check_out.isoformat(),
+        "guest_name": "Test Guest",
+        "guest_phone": guest_phone,
+        "guest_email": guest_email or "test@example.com",
+    }
+    if adults is not None:
+        payload["adults"] = adults
+    if guest_address is not None:
+        payload["guest_address"] = guest_address
+    if guest_gstin is not None:
+        payload["guest_gstin"] = guest_gstin
+    if promo_code is not None:
+        payload["promo_code"] = promo_code
+
     with patch("app.modules.public_booking.router.create_order") as mock_order:
         mock_order.return_value = {"id": fake_order_id}
-        resp = client.post("/api/v1/public/holds", json={
-            "unit_id": str(unit_id),
-            "check_in": check_in.isoformat(),
-            "check_out": check_out.isoformat(),
-            "guest_name": "Test Guest",
-            "guest_phone": guest_phone,
-            "guest_email": "test@example.com",
-        })
+        resp = client.post("/api/v1/public/holds", json=payload)
     return resp, fake_order_id
 
 
@@ -112,7 +149,7 @@ def _create_hold_raw(unit_id, check_in, check_out, guest_name, guest_phone):
 # ---------------------------------------------------------------------------
 
 def test_create_hold_rejects_empty_guest_name(headers):
-    _, unit_id = _make_available_unit(headers)
+    _, unit_id = _make_available_unit(headers, max_occupancy=4)
     check_in = date.today() + timedelta(days=740)
     check_out = check_in + timedelta(days=1)
     resp = _create_hold_raw(unit_id, check_in, check_out, guest_name="", guest_phone="9876543210")
@@ -150,6 +187,333 @@ def test_create_hold_accepts_valid_boundary_length_name_and_phone(headers):
     check_out = check_in + timedelta(days=1)
     resp = _create_hold_raw(unit_id, check_in, check_out, guest_name="A" * 150, guest_phone="123456")
     assert resp.status_code == 201, resp.text
+
+
+def test_create_hold_requires_email(headers):
+    """Correction 5: guest_email is now mandatory on CreateHoldRequest —
+    an omitted or blank email must be a clean 422, not a silently-accepted
+    unreachable hold."""
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=745)
+    check_out = check_in + timedelta(days=1)
+    with patch("app.modules.public_booking.router.create_order") as mock_order:
+        mock_order.return_value = {"id": f"order_{uuid.uuid4().hex[:12]}"}
+        resp = client.post("/api/v1/public/holds", json={
+            "unit_id": str(unit_id), "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+            "guest_name": "No Email Guest", "guest_phone": "9876543210",
+            # guest_email omitted entirely
+        })
+    assert resp.status_code == 422, resp.text
+
+
+def test_create_hold_rejects_malformed_email(headers):
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=746)
+    check_out = check_in + timedelta(days=1)
+    with patch("app.modules.public_booking.router.create_order") as mock_order:
+        mock_order.return_value = {"id": f"order_{uuid.uuid4().hex[:12]}"}
+        resp = client.post("/api/v1/public/holds", json={
+            "unit_id": str(unit_id), "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+            "guest_name": "Bad Email Guest", "guest_phone": "9876543211", "guest_email": "not-an-email",
+        })
+    assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Correction 3: guest count must flow from CreateHoldRequest through
+# BookingHold into the confirmed Booking's own adults field — this is what
+# the confirmation email/WhatsApp/invoice all read from.
+# ---------------------------------------------------------------------------
+
+def test_guest_count_flows_to_booking_adults_for_1_3_4_and_5_guests(headers):
+    from app.db.session import SessionLocal
+    from app.modules.bookings.models import Booking
+    from sqlalchemy import select as sa_select
+
+    for i, selected_guests in enumerate((1, 3, 4, 5)):
+        _, unit_id = _make_available_unit(headers, max_occupancy=5)
+        check_in = date.today() + timedelta(days=1300 + i * 5)
+        check_out = check_in + timedelta(days=2)
+        phone = f"90{uuid.uuid4().int % 10**8:08d}"
+
+        resp, fake_order_id = _create_hold_mocked(unit_id, check_in, check_out, guest_phone=phone, adults=selected_guests)
+        assert resp.status_code == 201, resp.text
+        hold_id = resp.json()["hold_id"]
+
+        sig = _make_signature(fake_order_id, FAKE_PAYMENT_ID, FAKE_RAZORPAY_KEY_SECRET)
+        with patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+            verify_resp = client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json={
+                "razorpay_payment_id": FAKE_PAYMENT_ID, "razorpay_order_id": fake_order_id, "razorpay_signature": sig,
+            })
+        assert verify_resp.status_code == 201, verify_resp.text
+        booking_id = verify_resp.json()["booking_id"]
+
+        db = SessionLocal()
+        try:
+            booking = db.get(Booking, booking_id)
+            assert booking.adults == selected_guests, (
+                f"Selected {selected_guests} guests but Booking.adults is {booking.adults}"
+            )
+            assert booking.children == 0, "No adult/child split exists on the website — children must stay 0"
+        finally:
+            db.close()
+
+
+def test_create_hold_defaults_adults_to_one_when_omitted(headers):
+    """Backward compatibility: a caller that never sends `adults` at all
+    (e.g. an older/other client) must still get the same safe default
+    Booking.adults already had before this change."""
+    from app.db.session import SessionLocal
+    from app.modules.bookings.models import Booking
+
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=1320)
+    check_out = check_in + timedelta(days=2)
+    phone = f"91{uuid.uuid4().int % 10**8:08d}"
+
+    resp, fake_order_id = _create_hold_mocked(unit_id, check_in, check_out, guest_phone=phone)  # no adults kwarg
+    assert resp.status_code == 201, resp.text
+    hold_id = resp.json()["hold_id"]
+
+    sig = _make_signature(fake_order_id, FAKE_PAYMENT_ID, FAKE_RAZORPAY_KEY_SECRET)
+    with patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+        verify_resp = client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json={
+            "razorpay_payment_id": FAKE_PAYMENT_ID, "razorpay_order_id": fake_order_id, "razorpay_signature": sig,
+        })
+    assert verify_resp.status_code == 201
+
+    db = SessionLocal()
+    try:
+        booking = db.get(Booking, verify_resp.json()["booking_id"])
+        assert booking.adults == 1
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Correction 6: customer address/GSTIN must flow from CreateHoldRequest into
+# the Guest record — already rendered on invoices via generate_invoice_pdf's
+# existing guest_gst_number/guest_address parameters, so no invoice-code
+# change was needed, only this collection path.
+# ---------------------------------------------------------------------------
+
+def test_guest_address_and_gstin_flow_to_guest_record(headers):
+    from app.db.session import SessionLocal
+    from app.modules.bookings.models import Booking, Guest
+    from sqlalchemy import select as sa_select
+
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=1340)
+    check_out = check_in + timedelta(days=2)
+    phone = f"92{uuid.uuid4().int % 10**8:08d}"
+    address = "12 MG Road, Near Central Park, Chennai, Tamil Nadu, India - 600001"
+    gstin = "33ABCDE1234F1Z5"
+
+    resp, fake_order_id = _create_hold_mocked(
+        unit_id, check_in, check_out, guest_phone=phone, guest_address=address, guest_gstin=gstin,
+    )
+    assert resp.status_code == 201, resp.text
+    hold_id = resp.json()["hold_id"]
+
+    sig = _make_signature(fake_order_id, FAKE_PAYMENT_ID, FAKE_RAZORPAY_KEY_SECRET)
+    with patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+        verify_resp = client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json={
+            "razorpay_payment_id": FAKE_PAYMENT_ID, "razorpay_order_id": fake_order_id, "razorpay_signature": sig,
+        })
+    assert verify_resp.status_code == 201, verify_resp.text
+
+    db = SessionLocal()
+    try:
+        booking = db.get(Booking, verify_resp.json()["booking_id"])
+        guest = db.get(Guest, booking.guest_id)
+        assert guest.address == address
+        assert guest.gst_number == gstin
+    finally:
+        db.close()
+
+
+def test_guest_without_address_still_produces_a_valid_booking_and_invoice(headers):
+    """Existing behavior must be unchanged for a guest who provides no
+    address/GSTIN — this must not become a required field."""
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=1350)
+    check_out = check_in + timedelta(days=2)
+    phone = f"93{uuid.uuid4().int % 10**8:08d}"
+
+    resp, fake_order_id = _create_hold_mocked(unit_id, check_in, check_out, guest_phone=phone)
+    assert resp.status_code == 201, resp.text
+    hold_id = resp.json()["hold_id"]
+
+    sig = _make_signature(fake_order_id, FAKE_PAYMENT_ID, FAKE_RAZORPAY_KEY_SECRET)
+    with patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+        verify_resp = client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json={
+            "razorpay_payment_id": FAKE_PAYMENT_ID, "razorpay_order_id": fake_order_id, "razorpay_signature": sig,
+        })
+    assert verify_resp.status_code == 201, verify_resp.text
+    assert verify_resp.json()["invoice_no"] is not None
+
+
+def test_existing_guest_address_not_overwritten_with_null_on_repeat_booking(headers):
+    """Same non-destructive rule already used for guest_state: a second
+    booking from the same phone that doesn't resupply an address must
+    never null out the address already on file."""
+    from app.db.session import SessionLocal
+    from app.modules.bookings.models import Booking, Guest
+
+    phone = f"94{uuid.uuid4().int % 10**8:08d}"
+    address = "45 Beach Road, Puducherry, India - 605001"
+
+    _, unit_id_1 = _make_available_unit(headers)
+    check_in_1 = date.today() + timedelta(days=1360)
+    check_out_1 = check_in_1 + timedelta(days=2)
+    resp1, order1 = _create_hold_mocked(unit_id_1, check_in_1, check_out_1, guest_phone=phone, guest_address=address)
+    assert resp1.status_code == 201, resp1.text
+    sig1 = _make_signature(order1, FAKE_PAYMENT_ID, FAKE_RAZORPAY_KEY_SECRET)
+    with patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+        v1 = client.post(f"/api/v1/public/holds/{resp1.json()['hold_id']}/verify-payment", json={
+            "razorpay_payment_id": FAKE_PAYMENT_ID, "razorpay_order_id": order1, "razorpay_signature": sig1,
+        })
+    assert v1.status_code == 201
+
+    # Second booking, same guest phone, no address supplied this time.
+    _, unit_id_2 = _make_available_unit(headers)
+    check_in_2 = date.today() + timedelta(days=1370)
+    check_out_2 = check_in_2 + timedelta(days=2)
+    resp2, order2 = _create_hold_mocked(unit_id_2, check_in_2, check_out_2, guest_phone=phone)
+    assert resp2.status_code == 201, resp2.text
+    payment_id_2 = f"pay_{uuid.uuid4().hex[:10]}"
+    sig2 = _make_signature(order2, payment_id_2, FAKE_RAZORPAY_KEY_SECRET)
+    with patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+        v2 = client.post(f"/api/v1/public/holds/{resp2.json()['hold_id']}/verify-payment", json={
+            "razorpay_payment_id": payment_id_2, "razorpay_order_id": order2, "razorpay_signature": sig2,
+        })
+    assert v2.status_code == 201, v2.text
+
+    db = SessionLocal()
+    try:
+        booking2 = db.get(Booking, v2.json()["booking_id"])
+        guest = db.get(Guest, booking2.guest_id)
+        assert guest.address == address, "Existing address must not be wiped out by a booking that didn't resupply one"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Master audit Part 2/7: the rendered guest-facing notification body (not
+# just the DB row) must show the correct guest count. Uses the same
+# patch("app.modules.notifications.service.send_email") / call_args_list
+# idiom already established in tests/test_owner_and_whatsapp_notifications.py.
+# ---------------------------------------------------------------------------
+
+def test_guest_confirmation_email_body_shows_correct_guest_count(headers):
+    _, unit_id = _make_available_unit(headers, max_occupancy=4)
+    check_in = date.today() + timedelta(days=1400)
+    check_out = check_in + timedelta(days=2)
+    phone = f"95{uuid.uuid4().int % 10**8:08d}"
+    guest_email = f"guestcount-{uuid.uuid4().hex[:8]}@example.com"
+
+    resp, fake_order_id = _create_hold_mocked(
+        unit_id, check_in, check_out, guest_phone=phone, adults=4, guest_email=guest_email,
+    )
+    assert resp.status_code == 201, resp.text
+    hold_id = resp.json()["hold_id"]
+
+    sig = _make_signature(fake_order_id, FAKE_PAYMENT_ID, FAKE_RAZORPAY_KEY_SECRET)
+    with patch("app.modules.notifications.service.send_email", return_value=None) as mock_send, \
+         patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+        verify_resp = client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json={
+            "razorpay_payment_id": FAKE_PAYMENT_ID, "razorpay_order_id": fake_order_id, "razorpay_signature": sig,
+        })
+    assert verify_resp.status_code == 201, verify_resp.text
+
+    # send_email(to_email, subject, body, attachment_path) — positional.
+    guest_call_bodies = [c.args[2] for c in mock_send.call_args_list if c.args[0] == guest_email]
+    assert guest_call_bodies, f"No email was sent to the guest address {guest_email}"
+    for body in guest_call_bodies:
+        # Every guest email this booking triggers (HTML confirmation via
+        # _render_booking_notification_html, and/or the plain-text
+        # fallback in trigger_booking_confirmation) must reflect 4 guests,
+        # never a stale/default 1.
+        assert "4" in body, f"Guest count '4' not found in guest email body: {body!r}"
+        assert not any(bad in body for bad in ("Guests: 1\n", ">1 Adult(s)<", "1 Adult<")), (
+            f"Guest email body appears to show the wrong (default) guest count: {body!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Part 16 Scenario 2: 5 guests + billing address + GSTIN + a valid promo
+# code, all together — confirms OS10 remains the sole pricing authority
+# (the discount is computed server-side from the promo, not invented by
+# the caller) while the address/GSTIN/guest-count paths all still work
+# in combination, not just individually.
+# ---------------------------------------------------------------------------
+
+def test_scenario_2_five_guests_with_address_gstin_and_valid_promo(headers):
+    from app.db.session import SessionLocal
+    from app.modules.bookings.models import Booking, Guest
+    from app.modules.payments.models import Invoice
+
+    code = f"AUDIT{uuid.uuid4().hex[:6].upper()}"
+    client.post(
+        "/api/v1/promo-codes", headers=headers,
+        json={"code": code, "discount_type": "percent", "value": 10, "valid_from": "2020-01-01", "valid_to": "2099-01-01"},
+    )
+
+    _, unit_id = _make_available_unit(headers, base_rate=2000, max_occupancy=5)
+    check_in = date.today() + timedelta(days=1420)
+    check_out = check_in + timedelta(days=2)  # 2 nights * 2000 = 4000 subtotal before discount
+    phone = f"96{uuid.uuid4().int % 10**8:08d}"
+    address = "7 Rock Beach Road, Puducherry, India - 605001"
+    gstin = "34ABCDE5678F1Z9"
+
+    resp, fake_order_id = _create_hold_mocked(
+        unit_id, check_in, check_out, guest_phone=phone, adults=5,
+        guest_address=address, guest_gstin=gstin, promo_code=code,
+    )
+    assert resp.status_code == 201, resp.text
+    hold_id = resp.json()["hold_id"]
+
+    sig = _make_signature(fake_order_id, FAKE_PAYMENT_ID, FAKE_RAZORPAY_KEY_SECRET)
+    with patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+        verify_resp = client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json={
+            "razorpay_payment_id": FAKE_PAYMENT_ID, "razorpay_order_id": fake_order_id, "razorpay_signature": sig,
+        })
+    assert verify_resp.status_code == 201, verify_resp.text
+
+    db = SessionLocal()
+    try:
+        booking = db.get(Booking, verify_resp.json()["booking_id"])
+        guest = db.get(Guest, booking.guest_id)
+        invoice = db.query(Invoice).filter(Invoice.booking_id == booking.id).one()
+
+        assert booking.adults == 5
+        assert booking.promo_code_used == code
+        assert guest.address == address
+        assert guest.gst_number == gstin
+        # 10% off a 4000 subtotal = 3600 — proves OS10, not the client, computed the discount.
+        assert float(invoice.subtotal) == 3600.0, f"Expected server-computed discounted subtotal 3600, got {invoice.subtotal}"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Part 16 Scenario 3: an invalid/unknown promo code must never let a hold
+# through with a fabricated or unchanged-but-silently-ignored discount —
+# create_hold must reject it outright, so no booking/total is ever produced
+# from it.
+# ---------------------------------------------------------------------------
+
+def test_scenario_3_invalid_promo_code_blocks_hold_creation(headers):
+    _, unit_id = _make_available_unit(headers, base_rate=2000)
+    check_in = date.today() + timedelta(days=1440)
+    check_out = check_in + timedelta(days=1)
+    phone = f"97{uuid.uuid4().int % 10**8:08d}"
+
+    resp, _ = _create_hold_mocked(
+        unit_id, check_in, check_out, guest_phone=phone, adults=1, promo_code="NOT-A-REAL-CODE",
+    )
+    assert resp.status_code == 400, resp.text
+    assert "promo" in resp.text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +715,7 @@ def test_maintenance_unit_cannot_be_held(headers):
         "check_out": (date.today() + timedelta(days=402)).isoformat(),
         "guest_name": "Blocked Guest",
         "guest_phone": f"75{uuid.uuid4().int % 10**8:08d}",
+        "guest_email": "blockedguest1@example.com",
     })
     assert resp.status_code == 409, resp.text
     assert "maintenance" in resp.json()["detail"].lower()
@@ -383,6 +748,7 @@ def test_blocked_unit_cannot_be_held(headers):
         "check_out": (date.today() + timedelta(days=412)).isoformat(),
         "guest_name": "Blocked Guest",
         "guest_phone": f"74{uuid.uuid4().int % 10**8:08d}",
+        "guest_email": "blockedguest2@example.com",
     })
     assert resp.status_code == 409, resp.text
     assert "blocked" in resp.json()["detail"].lower()
@@ -603,6 +969,117 @@ def test_concurrent_overlapping_holds_only_one_created(headers):
         db.close()
 
 
+# ---------------------------------------------------------------------------
+# Booking-vs-active-HOLD cross-table concurrency fix (advisory lock keyed by
+# unit_id in lock_unit_for_reservation, see app/shared/availability.py). The
+# two tests above (test_concurrent_overlapping_bookings_only_one_confirmed,
+# test_concurrent_overlapping_holds_only_one_created) already prove the
+# same-table races are closed by each table's own EXCLUDE constraint alone,
+# with no lock involved. These prove the one race neither EXCLUDE constraint
+# can see across a table boundary — a genuinely concurrent admin booking and
+# guest hold for the same unit/overlapping dates — is now closed too.
+# ---------------------------------------------------------------------------
+
+def test_concurrent_booking_and_hold_exactly_one_succeeds_no_double_reservation(headers):
+    """Genuine concurrency (real threads), not sequential logic: an admin
+    create_booking() and a guest create_hold() fired at the same instant for
+    the same unit and overlapping dates. Before the advisory lock fix, both
+    could pass their own unit_is_available() read in the same narrow window
+    and both write — a Booking and an active BookingHold coexisting for the
+    same unit/range, which no single-table EXCLUDE constraint can prevent."""
+    import concurrent.futures
+
+    unit_id, guest_id = _make_guest_and_unit(headers)
+    check_in = date.today() + timedelta(days=1200)
+    check_out = check_in + timedelta(days=3)
+    fake_order_id = f"order_{uuid.uuid4().hex[:12]}"
+    phone = f"81{uuid.uuid4().int % 10**8:08d}"
+
+    def _book():
+        return client.post("/api/v1/bookings", headers=headers, json={
+            "unit_id": str(unit_id), "guest_id": str(guest_id),
+            "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+        })
+
+    def _hold():
+        return client.post("/api/v1/public/holds", json={
+            "unit_id": str(unit_id), "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+            "guest_name": "Race Guest", "guest_phone": phone, "guest_email": "racebh@example.com",
+        })
+
+    with patch("app.modules.public_booking.router.create_order", return_value={"id": fake_order_id}):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_booking = pool.submit(_book)
+            fut_hold = pool.submit(_hold)
+            booking_resp, hold_resp = fut_booking.result(), fut_hold.result()
+
+    statuses = sorted([booking_resp.status_code, hold_resp.status_code])
+    assert statuses == [201, 409], (
+        f"Expected exactly one 201 and one 409, got booking={booking_resp.status_code} hold={hold_resp.status_code}"
+    )
+
+    from app.db.session import SessionLocal
+    from app.modules.bookings.models import Booking
+    from app.modules.public_booking.models import BookingHold
+    from sqlalchemy import select as sa_select
+    db = SessionLocal()
+    try:
+        confirmed = db.scalars(sa_select(Booking).where(
+            Booking.unit_id == uuid.UUID(unit_id), Booking.status == "confirmed",
+        )).all()
+        active_holds = db.scalars(sa_select(BookingHold).where(
+            BookingHold.unit_id == uuid.UUID(unit_id), BookingHold.status == "pending_payment",
+        )).all()
+        assert len(confirmed) + len(active_holds) == 1, (
+            f"Expected exactly one reservation total across both tables, "
+            f"got {len(confirmed)} confirmed booking(s) and {len(active_holds)} active hold(s)"
+        )
+    finally:
+        db.close()
+
+
+def test_concurrent_hold_and_booking_loser_never_reaches_razorpay(headers):
+    """Same race, checked from the other side: if the admin booking wins the
+    advisory lock first, the guest's create_hold() must be rejected during
+    its own locked Phase 1 pre-flight check — before Phase 2 ever calls
+    Razorpay. A losing hold reaching Razorpay would mean either the lock
+    isn't actually closing the race, or Phase 1/Phase 2 got reordered."""
+    import concurrent.futures
+
+    unit_id, guest_id = _make_guest_and_unit(headers)
+    check_in = date.today() + timedelta(days=1210)
+    check_out = check_in + timedelta(days=3)
+    fake_order_id = f"order_{uuid.uuid4().hex[:12]}"
+    phone = f"82{uuid.uuid4().int % 10**8:08d}"
+
+    def _book():
+        return client.post("/api/v1/bookings", headers=headers, json={
+            "unit_id": str(unit_id), "guest_id": str(guest_id),
+            "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+        })
+
+    def _hold():
+        return client.post("/api/v1/public/holds", json={
+            "unit_id": str(unit_id), "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+            "guest_name": "Race Guest 2", "guest_phone": phone, "guest_email": "racebh2@example.com",
+        })
+
+    with patch("app.modules.public_booking.router.create_order", return_value={"id": fake_order_id}) as mock_order:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_booking = pool.submit(_book)
+            fut_hold = pool.submit(_hold)
+            booking_resp, hold_resp = fut_booking.result(), fut_hold.result()
+
+    if hold_resp.status_code == 201:
+        assert mock_order.call_count == 1, "A winning hold must call Razorpay exactly once"
+    else:
+        assert hold_resp.status_code == 409, hold_resp.text
+        assert mock_order.call_count == 0, (
+            "A losing hold must be rejected in its own Phase 1 pre-flight check "
+            "and must never reach the Phase 2 Razorpay call"
+        )
+
+
 def test_admin_cannot_confirm_booking_against_an_active_website_hold(headers):
     """The theoretical gap this audit set out to check — an admin directly
     confirming a booking for a unit+date range while a guest's website
@@ -678,6 +1155,7 @@ def test_client_cannot_override_price(headers):
             "check_out": check_out.isoformat(),
             "guest_name": "Price Hack Attempt",
             "guest_phone": f"73{uuid.uuid4().int % 10**8:08d}",
+            "guest_email": "pricehack@example.com",
             "total": 1.0,          # attacker-supplied — must be ignored
             "amount": 1.0,         # attacker-supplied — must be ignored
             "advance_amount": 1.0, # attacker-supplied — must be ignored
@@ -712,6 +1190,7 @@ def test_quote_amount_matches_hold_amount(headers):
             "check_out": check_out.isoformat(),
             "guest_name": "Quote Match Guest",
             "guest_phone": f"72{uuid.uuid4().int % 10**8:08d}",
+            "guest_email": "quotematch@example.com",
         })
     assert hold_resp.status_code == 201
     assert hold_resp.json()["amount"] == expected_total
@@ -801,6 +1280,67 @@ def test_verify_payment_signature_function():
     correct_sig = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     assert verify_payment_signature(order_id, payment_id, correct_sig, key_secret=secret) is True
     assert verify_payment_signature(order_id, payment_id, "wrong_sig", key_secret=secret) is False
+
+
+def test_provider_payment_must_match_captured_order_amount_and_currency():
+    from app.modules.payment_gateway.service import payment_matches_order
+
+    base = {"id": "pay_expected", "order_id": "order_expected", "amount": 125000, "currency": "INR", "status": "captured"}
+    assert payment_matches_order(base, order_id="order_expected", amount_rupees=1250, currency="INR")
+    for changed in (
+        {**base, "order_id": "order_other"},
+        {**base, "amount": 124999},
+        {**base, "amount": 125000.9},
+        {**base, "currency": "USD"},
+        {**base, "status": "authorized"},
+    ):
+        assert not payment_matches_order(changed, order_id="order_expected", amount_rupees=1250, currency="INR")
+
+
+def test_verify_payment_does_not_convert_when_provider_payment_mismatches(headers, monkeypatch):
+    from app.db.session import SessionLocal
+    from app.modules.public_booking.models import BookingHold
+
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=1500)
+    resp, order_id = _create_hold_mocked(unit_id, check_in, check_in + timedelta(days=1))
+    hold_id = resp.json()["hold_id"]
+    monkeypatch.setattr("app.modules.public_booking.router.verify_payment_signature", lambda **kwargs: True)
+    monkeypatch.setattr("app.modules.public_booking.router.verify_provider_payment", lambda *args, **kwargs: False)
+    result = client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json={
+        "razorpay_payment_id": "pay_mismatch", "razorpay_order_id": order_id, "razorpay_signature": "sig",
+    })
+    assert result.status_code == 409
+    db = SessionLocal()
+    try:
+        assert db.get(BookingHold, hold_id).status == "pending_payment"
+    finally:
+        db.close()
+
+
+def test_verify_payment_provider_timeout_leaves_hold_retryable(headers, monkeypatch):
+    from app.db.session import SessionLocal
+    from app.modules.public_booking.models import BookingHold
+
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=1501)
+    resp, order_id = _create_hold_mocked(unit_id, check_in, check_in + timedelta(days=1))
+    hold_id = resp.json()["hold_id"]
+    monkeypatch.setattr("app.modules.public_booking.router.verify_payment_signature", lambda **kwargs: True)
+
+    def _provider_unavailable(*args, **kwargs):
+        raise TimeoutError("provider timeout")
+
+    monkeypatch.setattr("app.modules.public_booking.router.verify_provider_payment", _provider_unavailable)
+    result = client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json={
+        "razorpay_payment_id": "pay_timeout", "razorpay_order_id": order_id, "razorpay_signature": "sig",
+    })
+    assert result.status_code == 503
+    db = SessionLocal()
+    try:
+        assert db.get(BookingHold, hold_id).status == "pending_payment"
+    finally:
+        db.close()
 
 
 def test_create_order_still_fails_without_credentials(monkeypatch):
@@ -1105,6 +1645,160 @@ def test_verify_payment_is_idempotent(headers):
 
         payments = db.scalars(sa_select(Payment).where(Payment.booking_id == bookings[0].id)).all()
         assert len(payments) == 1, f"Expected 1 payment, got {len(payments)}"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Concurrent verify-payment stays idempotent under the new unit advisory lock
+# (test_verify_payment_is_idempotent above already proves this sequentially;
+# this proves it under genuine concurrent threads, so the lock added inside
+# verify_payment() cannot have altered the pre-existing SELECT FOR UPDATE
+# serialization guarantee).
+# ---------------------------------------------------------------------------
+
+def test_concurrent_verify_payment_on_same_hold_remains_idempotent(headers):
+    import concurrent.futures
+
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=1220)
+    check_out = check_in + timedelta(days=2)
+    phone = f"83{uuid.uuid4().int % 10**8:08d}"
+
+    resp, fake_order_id = _create_hold_mocked(unit_id, check_in, check_out, guest_phone=phone)
+    assert resp.status_code == 201, resp.text
+    hold_id = resp.json()["hold_id"]
+
+    # Pre-warm the BusinessSettings/BankSettings singletons (read inside
+    # _convert_hold_to_booking) before racing the two verify-payment calls.
+    # Unrelated, pre-existing behavior: get_or_create_settings()/
+    # get_or_create_bank_settings() each call db.commit() the FIRST time
+    # their singleton row doesn't exist yet — which, if that first-ever
+    # call happened to land inside this test's own conversion, would
+    # prematurely commit (and release the SELECT FOR UPDATE lock on) the
+    # hold mid-conversion, before hold.status ever reaches "converted".
+    # That's a separate, narrow latent race in the settings singleton's
+    # lazy-init path, not the unit advisory lock under test here — pre-
+    # warming keeps this test isolated to what it's actually verifying.
+    from app.db.session import SessionLocal as _SessionLocal
+    from app.modules.settings.router import get_or_create_settings, get_or_create_bank_settings
+    _db = _SessionLocal()
+    try:
+        get_or_create_settings(_db)
+        get_or_create_bank_settings(_db)
+    finally:
+        _db.close()
+
+    verify_payload = {
+        "razorpay_payment_id": FAKE_PAYMENT_ID,
+        "razorpay_order_id": fake_order_id,
+        "razorpay_signature": "sig",
+    }
+
+    def _verify():
+        return client.post(f"/api/v1/public/holds/{hold_id}/verify-payment", json=verify_payload)
+
+    with patch("app.modules.public_booking.router.verify_payment_signature", return_value=True):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_a = pool.submit(_verify)
+            fut_b = pool.submit(_verify)
+            resp_a, resp_b = fut_a.result(), fut_b.result()
+
+    assert resp_a.status_code == 201, resp_a.text
+    assert resp_b.status_code == 201, resp_b.text
+    assert resp_a.json()["booking_id"] == resp_b.json()["booking_id"], (
+        "Both concurrent verify-payment calls on the same hold must resolve to the same booking"
+    )
+
+    from app.db.session import SessionLocal
+    from app.modules.bookings.models import Booking
+    from sqlalchemy import select as sa_select
+    db = SessionLocal()
+    try:
+        bookings = db.scalars(sa_select(Booking).where(
+            Booking.unit_id == uuid.UUID(unit_id), Booking.status == "confirmed",
+        )).all()
+        assert len(bookings) == 1, f"Expected exactly 1 confirmed booking, got {len(bookings)}"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# create_hold() Phase 2 (Razorpay) failure handling: the advisory lock fix
+# split create_hold() into a locked Phase 1 (reserve) that commits BEFORE
+# the unlocked Phase 2 (call Razorpay) — see create_hold()'s own docstring
+# comments. These prove the two things that split makes newly true: a
+# Phase 2 failure explicitly cancels the already-committed Phase 1 rows
+# (rather than a rollback, since there is nothing left to roll back), and
+# those rows are durable — genuinely committed, not silently discarded.
+# ---------------------------------------------------------------------------
+
+def test_razorpay_failure_cancels_hold_and_frees_unit_immediately(headers):
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=1230)
+    check_out = check_in + timedelta(days=2)
+
+    with patch("app.modules.public_booking.router.create_order", side_effect=Exception("Simulated Razorpay outage")):
+        resp = client.post("/api/v1/public/holds", json={
+            "unit_id": str(unit_id), "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+            "guest_name": "Outage Guest", "guest_phone": f"84{uuid.uuid4().int % 10**8:08d}", "guest_email": "outage@example.com",
+        })
+    assert resp.status_code == 502, resp.text
+
+    from app.db.session import SessionLocal
+    from app.modules.public_booking.models import BookingHold
+    from app.modules.payment_gateway.models import GatewayOrder
+    from sqlalchemy import select as sa_select
+    db = SessionLocal()
+    try:
+        hold = db.scalar(sa_select(BookingHold).where(BookingHold.unit_id == uuid.UUID(unit_id)))
+        assert hold is not None, "Phase 1 must have committed a real hold row before Phase 2 ran"
+        assert hold.status == "cancelled", f"Expected 'cancelled', got '{hold.status}'"
+        gateway_order = db.get(GatewayOrder, hold.gateway_order_id)
+        assert gateway_order is not None
+        assert gateway_order.status == "failed", f"Expected 'failed', got '{gateway_order.status}'"
+    finally:
+        db.close()
+
+    # The unit must be bookable again immediately — not stuck for the
+    # remainder of HOLD_TTL_MINUTES behind a hold that never got a real
+    # Razorpay order.
+    resp2, _ = _create_hold_mocked(unit_id, check_in, check_out)
+    assert resp2.status_code == 201, (
+        f"Expected the unit to be immediately available after the cancelled hold, got {resp2.status_code}: {resp2.text}"
+    )
+
+
+def test_razorpay_failure_phase1_commit_is_durable_not_rolled_back(headers):
+    """Distinct from the test above: proves the Phase 1 write actually
+    reached the database as a real, committed row (not merely that the
+    client-visible outcome looks right) — i.e. that splitting create_hold()
+    into two transactions didn't accidentally make Phase 2's failure roll
+    back Phase 1's already-committed work. TTL/ghost-hold cleanup (already
+    exercised by test_expired_hold_does_not_block_new_hold) is what would
+    reclaim a hold like this if it were ever left uncancelled."""
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=1240)
+    check_out = check_in + timedelta(days=2)
+
+    with patch("app.modules.public_booking.router.create_order", side_effect=Exception("Simulated Razorpay outage")):
+        resp = client.post("/api/v1/public/holds", json={
+            "unit_id": str(unit_id), "check_in": check_in.isoformat(), "check_out": check_out.isoformat(),
+            "guest_name": "Durability Guest", "guest_phone": f"85{uuid.uuid4().int % 10**8:08d}", "guest_email": "durability@example.com",
+        })
+    assert resp.status_code == 502
+
+    from app.db.session import SessionLocal
+    from app.modules.public_booking.models import BookingHold
+    from sqlalchemy import select as sa_select
+    db = SessionLocal()
+    try:
+        hold = db.scalar(sa_select(BookingHold).where(BookingHold.unit_id == uuid.UUID(unit_id)))
+        assert hold is not None, "Phase 1's commit must be durable even though Phase 2 failed"
+        assert hold.id is not None
+        assert hold.check_in == check_in and hold.check_out == check_out
+        assert hold.expires_at is not None, "TTL must still be set so cleanup can reclaim this row on schedule"
+        assert hold.gateway_order_id is not None, "Phase 1's GatewayOrder link must have committed too"
     finally:
         db.close()
 
@@ -1502,7 +2196,8 @@ def test_validate_production_config_passes_in_development():
 def test_validate_production_config_passes_with_real_production_settings():
     """No RuntimeError when production config has proper JWT and real domain in CORS."""
     from app.main import _validate_production_config
-    with patch("app.main.settings") as mock_settings:
+    from app.modules.bookings import document_storage
+    with patch("app.main.settings") as mock_settings, patch.object(document_storage, "STORAGE_BACKEND", "s3"), patch.object(document_storage, "S3_BUCKET", "private-documents"), patch.object(document_storage, "S3_REGION", "ap-south-1"):
         mock_settings.environment = "production"
         mock_settings.jwt_secret_key = "a_real_secret_not_the_default"
         mock_settings.cors_allowed_origins = "https://myapp.sriapartment.com"
@@ -1619,9 +2314,21 @@ def test_confirmation_replay_shows_same_notification_outcome_as_original(headers
 
 def _razorpay_captured_payload(order_id: str, payment_id: str) -> bytes:
     import json
+    from app.db.session import SessionLocal
+    from app.modules.payment_gateway.models import GatewayOrder
+    db = SessionLocal()
+    try:
+        order = db.query(GatewayOrder).filter(GatewayOrder.gateway_order_id == order_id).one()
+        amount = int(round(float(order.amount) * 100))
+        currency = order.currency
+    finally:
+        db.close()
     return json.dumps({
         "event": "payment.captured",
-        "payload": {"payment": {"entity": {"order_id": order_id, "id": payment_id}}},
+        "payload": {"payment": {"entity": {
+            "order_id": order_id, "id": payment_id, "amount": amount,
+            "currency": currency, "status": "captured",
+        }}},
     }).encode()
 
 
@@ -1692,6 +2399,34 @@ def test_duplicate_webhook_delivery_does_not_create_second_booking(headers):
         assert len(payments) == 1, f"Expected exactly 1 payment despite duplicate webhook, got {len(payments)}"
         invoices = db.scalars(sa_select(Invoice).where(Invoice.booking_id == bookings[0].id)).all()
         assert len(invoices) == 1, f"Expected exactly 1 invoice despite duplicate webhook, got {len(invoices)}"
+    finally:
+        db.close()
+
+
+def test_webhook_amount_mismatch_does_not_mark_order_paid_or_convert(headers):
+    import json
+    from app.db.session import SessionLocal
+    from app.modules.payment_gateway.models import GatewayOrder, WebhookEvent
+    from app.modules.public_booking.models import BookingHold
+
+    _, unit_id = _make_available_unit(headers)
+    check_in = date.today() + timedelta(days=779)
+    resp, order_id = _create_hold_mocked(unit_id, check_in, check_in + timedelta(days=1))
+    hold_id = resp.json()["hold_id"]
+    body = json.loads(_razorpay_captured_payload(order_id, "pay_bad_amount"))
+    body["payload"]["payment"]["entity"]["amount"] += 1
+    with patch("app.modules.payment_gateway.router.verify_webhook_signature", return_value=True):
+        webhook = client.post("/api/v1/payment-gateway/webhook", json=body, headers={"X-Razorpay-Signature": "sig"})
+    assert webhook.status_code == 200
+
+    db = SessionLocal()
+    try:
+        hold = db.get(BookingHold, hold_id)
+        order = db.query(GatewayOrder).filter(GatewayOrder.gateway_order_id == order_id).one()
+        event = db.query(WebhookEvent).order_by(WebhookEvent.created_at.desc()).first()
+        assert hold.status == "pending_payment"
+        assert order.status == "created"
+        assert event.processed is False
     finally:
         db.close()
 

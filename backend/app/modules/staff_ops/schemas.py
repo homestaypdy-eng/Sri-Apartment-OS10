@@ -26,6 +26,11 @@ class CheckInLine(BaseModel):
     children: int
     status: str
     net_paid: float
+    # Identity Verification (section 12/18 — display-only at check-in, no
+    # blocking) — the Principal Guest's existing Guest.identity_status,
+    # reused from the guest lookup this function already does, not a new
+    # query. Never implies Account Verification.
+    guest_identity_status: str
 
 
 class CheckOutLine(BaseModel):

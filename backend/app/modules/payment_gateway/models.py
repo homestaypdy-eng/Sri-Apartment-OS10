@@ -49,14 +49,31 @@ class WebhookEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+REFUND_STATUSES = ("created", "processed", "failed")
+# Statuses that count against a payment's refundable balance: "created" is a
+# short-lived reservation held while the live Razorpay call is in flight
+# (see payment_gateway/router.py::issue_refund's two-phase structure) and
+# "processed" is a completed refund. "failed" never counts — the amount it
+# would have reserved is freed back up as soon as it's marked failed.
+REFUND_STATUSES_COUNTED = ("created", "processed")
+
+
 class Refund(Base):
     __tablename__ = "refunds"
+    __table_args__ = (CheckConstraint(f"status IN {REFUND_STATUSES}", name="ck_refund_status"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     payment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("payments.id"), nullable=False)
     amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     gateway_refund_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Client-supplied, optional — lets a caller safely retry the exact same
+    # logical refund request (e.g. after a network timeout) without risking
+    # a second Razorpay refund: see issue_refund()'s idempotent-replay check.
+    # Enforced unique at the DB level (ux_refunds_idempotency_key, partial —
+    # see additive_migrations.py) so this is a real guarantee, not just an
+    # app-level check.
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="created")
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

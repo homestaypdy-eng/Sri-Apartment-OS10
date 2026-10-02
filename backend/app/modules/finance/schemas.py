@@ -1,23 +1,82 @@
 import uuid
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 
 class ExpenseCreate(BaseModel):
-    category: str
+    category: str = Field(min_length=1, max_length=50)
     amount: float = Field(gt=0)
     expense_date: date
     unit_id: uuid.UUID | None = None
     notes: str | None = None
-    approval_status: str = "approved"
+    # Historical expenses continue to be recorded as approved by default;
+    # new expenses can explicitly enter the existing approval workflow.
+    approval_status: Literal["pending", "approved"] = "approved"
+
+    @field_validator("category")
+    @classmethod
+    def category_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("category cannot be empty")
+        return value
 
 
-class ExpenseOut(ExpenseCreate):
+class ExpenseUpdate(BaseModel):
+    category: str = Field(min_length=1, max_length=50)
+    amount: float = Field(gt=0)
+    expense_date: date
+    unit_id: uuid.UUID | None = None
+    notes: str | None = None
+
+    @field_validator("category")
+    @classmethod
+    def category_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("category cannot be empty")
+        return value
+
+
+class ExpenseOut(BaseModel):
     id: uuid.UUID
+    category: str
+    amount: float
+    expense_date: date
+    unit_id: uuid.UUID | None
+    notes: str | None
+    approval_status: Literal["pending", "approved", "rejected"]
     created_at: datetime
     approved_by: uuid.UUID | None = None
     approved_at: datetime | None = None
+    created_by: uuid.UUID | None = None
+    paid_amount: float
+    remaining_amount: float
+    payment_status: Literal["unpaid", "partially_paid", "paid"]
+
+    class Config:
+        from_attributes = True
+
+
+class ExpensePaymentCreate(BaseModel):
+    amount: float = Field(gt=0)
+    payment_date: date
+    payment_method: Literal["cash", "bank_transfer", "upi", "card", "cheque"]
+    reference_no: str | None = Field(default=None, max_length=100)
+
+
+class ExpensePaymentOut(BaseModel):
+    id: uuid.UUID
+    expense_id: uuid.UUID
+    amount: float
+    payment_date: date
+    payment_method: Literal["cash", "bank_transfer", "upi", "card", "cheque"]
+    reference_no: str | None
+    created_by: uuid.UUID | None
+    created_by_name: str | None = None
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -384,6 +443,11 @@ class CashFlowReport(BaseModel):
     cash_in_payments: float
     cash_in_deposits: float
     cash_in_ota_payouts: float
+    # Informational only, excluded from cash_in_total — see cash_flow()'s
+    # docstring comment. A Zotel-recorded payment is the guest's payment
+    # status per Zotel, not confirmed cash in the business's own bank/hand;
+    # the actual cash event is cash_in_ota_payouts, once reconciled.
+    cash_in_zotel_pending: float
     cash_in_total: float
     cash_out_expenses: float
     cash_out_withdrawals: float

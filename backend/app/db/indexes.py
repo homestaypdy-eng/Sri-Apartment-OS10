@@ -17,7 +17,7 @@ and safe to run against a database that already has some or all of these
 indexes.
 """
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 INDEX_STATEMENTS = [
     # Payments — looked up by booking on every payment-list and every
@@ -81,8 +81,12 @@ INDEX_STATEMENTS = [
 ]
 
 
-def apply_indexes(engine: Engine) -> None:
-    with engine.connect() as conn:
-        for stmt in INDEX_STATEMENTS:
-            conn.execute(text(stmt))
-        conn.commit()
+def apply_indexes(bind: Engine | Connection) -> None:
+    """Apply the reviewed index set, joining an existing migration transaction when given a Connection."""
+    if isinstance(bind, Engine):
+        with bind.begin() as conn:
+            apply_indexes(conn)
+        return
+
+    for stmt in INDEX_STATEMENTS:
+        bind.execute(text(stmt))

@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { AuthShell } from "../components/AuthShell";
 import { OAuthButtons } from "../components/OAuthButtons";
 import { useCustomerAuth } from "../context/CustomerAuthContext";
-import { customerLogin, extractErrorMessage } from "../lib/api";
+import { customerLogin, customerVerifyLoginOtp, extractErrorMessage } from "../lib/api";
 
 export default function CustomerLoginPage() {
   const [email, setEmail] = useState("");
@@ -11,6 +11,11 @@ export default function CustomerLoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [oauthNotice, setOauthNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [challengeId, setChallengeId] = useState<string | null>(null);
+  const [challengeMessage, setChallengeMessage] = useState<string | null>(null);
+  const [devOtpCode, setDevOtpCode] = useState<string | null>(null);
+  const [otpCode, setOtpCode] = useState("");
+  const [verifyingOtp, setVerifyingOtp] = useState(false);
   const { customerLogin: setCustomerSession } = useCustomerAuth();
   const navigate = useNavigate();
 
@@ -21,8 +26,10 @@ export default function CustomerLoginPage() {
     setLoading(true);
     try {
       const result = await customerLogin(email, password);
-      setCustomerSession(result.access_token, result.customer);
-      navigate("/account");
+      setChallengeId(result.challenge_id);
+      setChallengeMessage(result.message);
+      setDevOtpCode(result.dev_otp_code ?? null);
+      setOtpCode("");
     } catch (err) {
       // The backend intentionally returns the identical generic message
       // whether the email is unknown or the password is wrong (anti-
@@ -31,6 +38,30 @@ export default function CustomerLoginPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function handleVerifyOtp(e: FormEvent) {
+    e.preventDefault();
+    if (!challengeId) return;
+    setError(null);
+    setVerifyingOtp(true);
+    try {
+      const result = await customerVerifyLoginOtp(challengeId, otpCode.trim());
+      setCustomerSession(result.access_token, result.customer);
+      navigate("/account");
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    } finally {
+      setVerifyingOtp(false);
+    }
+  }
+
+  function returnToLogin() {
+    setChallengeId(null);
+    setChallengeMessage(null);
+    setDevOtpCode(null);
+    setOtpCode("");
+    setError(null);
   }
 
   function handleOAuthUnavailable(provider: "google" | "facebook") {
@@ -60,6 +91,57 @@ export default function CustomerLoginPage() {
         </>
       }
     >
+      {challengeId ? (
+        <form onSubmit={handleVerifyOtp} className="space-y-4" noValidate>
+          <p role="status" className="rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+            {challengeMessage}
+          </p>
+
+          {devOtpCode && (
+            <div role="status" className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900">
+              <p className="font-medium">Local development verification code</p>
+              <p className="mt-1 font-mono text-base tracking-wider">{devOtpCode}</p>
+            </div>
+          )}
+
+          <div>
+            <label htmlFor="customer-login-otp" className="mb-1 block text-sm font-medium text-slate-700">
+              Verification code
+            </label>
+            <input
+              id="customer-login-otp"
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              required
+              value={otpCode}
+              onChange={(e) => setOtpCode(e.target.value)}
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none focus:ring-1 focus:ring-emerald-600"
+            />
+          </div>
+
+          {error && (
+            <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
+              {error}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={verifyingOtp || !otpCode.trim()}
+            className="w-full rounded-lg bg-emerald-700 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-800 disabled:opacity-50"
+          >
+            {verifyingOtp ? "Verifying…" : "Verify code"}
+          </button>
+          <button
+            type="button"
+            onClick={returnToLogin}
+            className="w-full rounded-lg border border-slate-300 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+          >
+            Back to Log In
+          </button>
+        </form>
+      ) : (
       <form onSubmit={handleSubmit} className="space-y-4" noValidate>
         <div>
           <label htmlFor="customer-login-email" className="mb-1 block text-sm font-medium text-slate-700">
@@ -122,6 +204,7 @@ export default function CustomerLoginPage() {
         )}
         <OAuthButtons providers={["google", "facebook"]} onUnavailable={handleOAuthUnavailable} />
       </form>
+      )}
     </AuthShell>
   );
 }

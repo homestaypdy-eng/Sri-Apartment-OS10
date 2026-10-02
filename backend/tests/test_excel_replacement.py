@@ -71,16 +71,26 @@ def test_daily_cashbook_reflects_payment_and_expense(headers):
     guest = client.post("/api/v1/guests", headers=headers, json={"name": "Cashbook Guest", "phone": f"96{uuid.uuid4().int % 10**8:08d}"}).json()
     check_in = (date.today() + timedelta(days=50)).isoformat()
     check_out = (date.today() + timedelta(days=52)).isoformat()
-    booking = client.post("/api/v1/bookings", headers=headers, json={"unit_id": unit_id, "guest_id": guest["id"], "check_in": check_in, "check_out": check_out}).json()
+    booking_resp = client.post("/api/v1/bookings", headers=headers, json={"unit_id": unit_id, "guest_id": guest["id"], "check_in": check_in, "check_out": check_out})
+    assert booking_resp.status_code == 201, booking_resp.text
+    booking = booking_resp.json()
 
     today = date.today().isoformat()
-    client.post("/api/v1/payments", headers=headers, json={"booking_id": booking["id"], "amount": 2000, "mode": "cash", "reference_no": "CASHBOOKTEST"})
-    client.post("/api/v1/finance/expenses", headers=headers, json={"category": "electricity", "amount": 500, "expense_date": today})
+    payment_resp = client.post("/api/v1/payments", headers=headers, json={"booking_id": booking["id"], "amount": 2000, "mode": "cash", "reference_no": "CASHBOOKTEST"})
+    assert payment_resp.status_code == 201, payment_resp.text
+    expense_resp = client.post("/api/v1/finance/expenses", headers=headers, json={"category": "electricity", "amount": 500, "expense_date": today})
+    assert expense_resp.status_code == 201, expense_resp.text
+    expense_payment_resp = client.post(
+        f"/api/v1/finance/expenses/{expense_resp.json()['id']}/payments",
+        headers={**headers, "Idempotency-Key": f"cashbook-{uuid.uuid4().hex}"},
+        json={"amount": 500, "payment_date": today, "payment_method": "cash"},
+    )
+    assert expense_payment_resp.status_code == 201, expense_payment_resp.text
 
     cashbook = client.get("/api/v1/finance/cashbook", headers=headers, params={"cashbook_date": today}).json()
     descriptions = [l["description"] for l in cashbook["lines"]]
     assert any("Payment received" in d for d in descriptions)
-    assert any("Expense" in d for d in descriptions)
+    assert any("Expense payment" in d for d in descriptions)
     assert cashbook["total_in"] >= 2000.0
     assert cashbook["total_out"] >= 500.0
 

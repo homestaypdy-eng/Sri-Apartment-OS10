@@ -26,6 +26,12 @@ class Payment(Base):
     # rather than silently rewriting history.
     refund_of_payment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("payments.id"), nullable=True)
     refund_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Client-supplied, optional — lets a caller safely retry the exact same
+    # manual-refund request without creating a second refund row. Only ever
+    # set on a refund row (refund_of_payment_id IS NOT NULL); a real payment
+    # row never has one. Enforced unique at the DB level, partial (see
+    # additive_migrations.py's ux_payments_idempotency_key).
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="completed")
     reference_no: Mapped[str | None] = mapped_column(String(100), nullable=True)
     paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

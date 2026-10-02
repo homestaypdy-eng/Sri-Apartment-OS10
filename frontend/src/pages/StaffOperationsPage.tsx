@@ -39,6 +39,42 @@ const STATUS_FILTERS: { key: StatusFilter; label: string }[] = [
   { key: "completed", label: "Completed" },
 ];
 
+// Per-filter selected-state color (section 4 of the UX-polish brief) — only
+// the ACTIVE filter shows its own soft semantic tint; unselected filters
+// stay uniformly neutral (bg-slate-100), unchanged from before. "green"
+// here is the exact bg-brand-green/10/text-brand-green pair components/
+// ui.tsx's own Badge "green" tone already uses, for visual parity.
+const STATUS_FILTER_SELECTED_CLASSES: Record<StatusFilter, string> = {
+  all: "bg-slate-800 text-white",
+  pending: "bg-amber-100 text-amber-800",
+  in_progress: "bg-blue-100 text-blue-800",
+  completed: "bg-brand-green/10 text-brand-green",
+};
+
+type KpiTone = "blue" | "amber" | "teal" | "red" | "slate";
+
+// Soft border + tinted-number treatment (section 1) — mirrors the existing
+// DashboardPage AttentionRow precedent (white card, colored border, colored
+// accent) rather than a fully-colored card background, so these stay
+// "clean white-card OS10 style" per the brief's own explicit instruction
+// right after listing the colors.
+const KPI_TONE_CLASSES: Record<KpiTone, { border: string; text: string }> = {
+  blue: { border: "border-blue-200", text: "text-blue-700" },
+  amber: { border: "border-amber-200", text: "text-amber-700" },
+  teal: { border: "border-emerald-200", text: "text-brand-green" },
+  red: { border: "border-red-200", text: "text-red-700" },
+  slate: { border: "border-slate-200", text: "text-slate-700" },
+};
+
+interface KpiStat {
+  key: string;
+  label: string;
+  value: number;
+  tone: KpiTone;
+  onClick?: () => void;
+  ariaLabel?: string;
+}
+
 function decodeUserId(): string | null {
   const token = localStorage.getItem("access_token");
   if (!token) return null;
@@ -89,9 +125,24 @@ function priorityTone(priority: string): "slate" | "green" | "amber" | "red" {
   return "slate";
 }
 
+// Identity Verification, display-only at check-in (section 12/18 — this
+// page never blocks the Check In action on it, per the approved design;
+// see CheckInLine.guest_identity_status's own docstring). Separate from
+// Account Verification, which this page has no field for at all.
+function identityStatusMeta(status: string): { label: string; tone: "slate" | "green" | "amber" | "red" } {
+  if (status === "verified") return { label: "Identity ✓", tone: "green" };
+  if (status === "pending" || status === "submitted" || status === "under_review") return { label: "Identity Pending", tone: "amber" };
+  if (status === "rejected") return { label: "Identity Rejected", tone: "red" };
+  return { label: "Identity Not Verified", tone: "slate" };
+}
+
+// Explicit "en-GB" — `toLocaleString(undefined, ...)` falls back to the
+// browser/OS locale, which produced French month labels ("22 sept.") on a
+// fr-* machine. Same day/month/hour/minute fields and short-month style as
+// before; only the locale is now fixed instead of inherited.
 function relativeTimeShort(iso: string): string {
   const d = new Date(iso);
-  return d.toLocaleString(undefined, { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 export default function StaffOperationsPage() {
@@ -310,20 +361,33 @@ export default function StaffOperationsPage() {
 
   const urgentCount = useMemo(() => allOpenTasks.filter((t) => t.priority === "urgent").length, [allOpenTasks]);
 
-  const todayStats = dashboard
+  // Section 2 (KPI click behaviour): every onClick below reuses existing
+  // tab/status-filter state this page already has — setTab/setStatusFilter,
+  // the same functions the Tabs/Status-filter buttons themselves call. No
+  // new endpoint, no new business logic. Urgent/Occupied/Vacant have no
+  // existing filter/view on this page to safely map to (there is no
+  // priority filter, and no unit-occupancy list here at all), so per the
+  // brief they stay non-clickable rather than inventing one.
+  const todayStats: KpiStat[] = dashboard
     ? [
-        { label: "Check-ins", value: dashboard.check_ins_today },
-        { label: "Check-outs", value: dashboard.check_outs_today },
-        { label: "Open Tasks", value: dashboard.pending_staff_tasks },
-        { label: "Urgent", value: urgentCount, emphasize: urgentCount > 0 },
-        { label: "Guest Requests", value: dashboard.open_guest_requests },
+        { key: "check-ins", label: "Check-ins", value: dashboard.check_ins_today, tone: "blue", onClick: () => setTab("check-ins"), ariaLabel: "View check-ins" },
+        { key: "check-outs", label: "Check-outs", value: dashboard.check_outs_today, tone: "amber", onClick: () => setTab("check-outs"), ariaLabel: "View check-outs" },
+        {
+          key: "open-tasks", label: "Open Tasks", value: dashboard.pending_staff_tasks, tone: "teal",
+          onClick: () => { setTab("all"); setStatusFilter("pending"); }, ariaLabel: "View open tasks across all categories",
+        },
+        { key: "urgent", label: "Urgent", value: urgentCount, tone: urgentCount > 0 ? "red" : "slate" },
+        { key: "guest-requests", label: "Guest Requests", value: dashboard.open_guest_requests, tone: "blue", onClick: () => setTab("guest_request"), ariaLabel: "View guest requests" },
       ]
     : [];
-  const secondaryStats = dashboard
+  const secondaryStats: KpiStat[] = dashboard
     ? [
-        { label: "Occupied", value: dashboard.occupied_units },
-        { label: "Vacant", value: dashboard.vacant_units },
-        { label: "Needs Cleaning", value: dashboard.units_needing_cleaning },
+        { key: "occupied", label: "Occupied", value: dashboard.occupied_units, tone: "slate" },
+        { key: "vacant", label: "Vacant", value: dashboard.vacant_units, tone: "slate" },
+        {
+          key: "needs-cleaning", label: "Needs Cleaning", value: dashboard.units_needing_cleaning, tone: "amber",
+          onClick: () => { setTab("housekeeping"); setStatusFilter("pending"); }, ariaLabel: "View units needing cleaning",
+        },
       ]
     : [];
 
@@ -354,14 +418,32 @@ export default function StaffOperationsPage() {
       {/* TODAY — the numbers staff need at a glance */}
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-2">
         {dashboard
-          ? todayStats.map((s) => (
-              <Card key={s.label} className={`p-3 ${s.emphasize ? "border-red-300 bg-red-50" : ""}`}>
-                <p className={`text-2xl font-bold ${s.emphasize ? "text-red-700" : "text-slate-900"}`}>{s.value}</p>
-                <p className={`text-xs mt-0.5 ${s.emphasize ? "text-red-600 font-medium" : "text-slate-500"}`}>{s.label}</p>
-              </Card>
-            ))
+          ? todayStats.map((s) => {
+              const tone = KPI_TONE_CLASSES[s.tone];
+              const content = (
+                <>
+                  <p className={`text-2xl font-bold ${tone.text}`}>{s.value}</p>
+                  <p className="text-xs mt-0.5 text-slate-500">{s.label}</p>
+                </>
+              );
+              return s.onClick ? (
+                <button
+                  key={s.key}
+                  type="button"
+                  onClick={s.onClick}
+                  aria-label={s.ariaLabel}
+                  className={`rounded-[14px] border ${tone.border} bg-white shadow-sm p-3 text-left w-full transition hover:shadow hover:border-slate-300`}
+                >
+                  {content}
+                </button>
+              ) : (
+                <div key={s.key} className={`rounded-[14px] border ${tone.border} bg-white shadow-sm p-3`}>
+                  {content}
+                </div>
+              );
+            })
           : Array.from({ length: 5 }).map((_, i) => (
-              <Card key={i} className="p-3">
+              <Card key={i} className="!rounded-[14px] p-3 shadow-sm">
                 <SkeletonLine width="40%" />
                 <div className="mt-2">
                   <SkeletonLine width="70%" />
@@ -371,12 +453,30 @@ export default function StaffOperationsPage() {
       </div>
       <div className="grid grid-cols-3 gap-2 mb-6">
         {dashboard &&
-          secondaryStats.map((s) => (
-            <Card key={s.label} className="p-2.5">
-              <p className="text-base font-semibold text-slate-700">{s.value}</p>
-              <p className="text-[11px] text-slate-400">{s.label}</p>
-            </Card>
-          ))}
+          secondaryStats.map((s) => {
+            const tone = KPI_TONE_CLASSES[s.tone];
+            const content = (
+              <>
+                <p className={`text-base font-semibold ${tone.text}`}>{s.value}</p>
+                <p className="text-[11px] text-slate-400">{s.label}</p>
+              </>
+            );
+            return s.onClick ? (
+              <button
+                key={s.key}
+                type="button"
+                onClick={s.onClick}
+                aria-label={s.ariaLabel}
+                className={`rounded-[14px] border ${tone.border} bg-white shadow-sm p-2.5 text-left w-full transition hover:shadow hover:border-slate-300`}
+              >
+                {content}
+              </button>
+            ) : (
+              <div key={s.key} className={`rounded-[14px] border ${tone.border} bg-white shadow-sm p-2.5`}>
+                {content}
+              </div>
+            );
+          })}
       </div>
 
       {/* Tabs — My Tasks leads, matching what staff need first */}
@@ -387,8 +487,8 @@ export default function StaffOperationsPage() {
             role="tab"
             aria-selected={tab === t.key}
             onClick={() => setTab(t.key)}
-            className={`px-4 py-2.5 rounded-lg text-sm font-medium whitespace-nowrap transition focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-900 ${
-              tab === t.key ? "bg-slate-900 text-white" : "bg-white border border-slate-300 text-slate-700 hover:bg-slate-50"
+            className={`px-4 py-2.5 rounded-lg text-sm font-medium whitespace-nowrap transition focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-green ${
+              tab === t.key ? "bg-brand-green text-white" : "bg-white border border-slate-300 text-slate-700 hover:bg-slate-50"
             }`}
           >
             {t.label}
@@ -405,7 +505,7 @@ export default function StaffOperationsPage() {
               aria-selected={statusFilter === f.key}
               onClick={() => setStatusFilter(f.key)}
               className={`px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-900 ${
-                statusFilter === f.key ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                statusFilter === f.key ? STATUS_FILTER_SELECTED_CLASSES[f.key] : "bg-slate-100 text-slate-600 hover:bg-slate-200"
               }`}
             >
               {f.label}
@@ -417,7 +517,7 @@ export default function StaffOperationsPage() {
       {loading && (
         <div className="space-y-3">
           {Array.from({ length: 3 }).map((_, i) => (
-            <Card key={i} className="p-4">
+            <Card key={i} className="!rounded-[14px] p-4 shadow-sm">
               <SkeletonLine width="30%" />
               <div className="mt-2">
                 <SkeletonLine width="60%" />
@@ -428,7 +528,7 @@ export default function StaffOperationsPage() {
       )}
 
       {!loading && (tab === "today" || tab === "check-ins") && (
-        <Card className="mb-6">
+        <Card className="!rounded-[14px] mb-6 shadow-sm">
           <h2 className="text-sm font-semibold text-slate-900 mb-4">Check-ins {tab === "today" ? "Today" : ""}</h2>
           {checkIns.length === 0 ? (
             <EmptyState message="No pending check-ins. All caught up." />
@@ -439,7 +539,10 @@ export default function StaffOperationsPage() {
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <p className="text-lg font-bold text-slate-900">{c.unit_name}</p>
-                      <p className="text-sm font-medium text-slate-700 mt-0.5">{c.guest_name}</p>
+                      <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+                        <p className="text-sm font-medium text-slate-700">{c.guest_name}</p>
+                        <Badge tone={identityStatusMeta(c.guest_identity_status).tone}>{identityStatusMeta(c.guest_identity_status).label}</Badge>
+                      </div>
                       <p className="text-xs text-slate-500 mt-1">
                         {c.adults} adult{c.adults !== 1 ? "s" : ""}{c.children ? `, ${c.children} child${c.children !== 1 ? "ren" : ""}` : ""}
                         {c.arrival_time ? ` · Arriving ${c.arrival_time}` : ""}
@@ -448,6 +551,13 @@ export default function StaffOperationsPage() {
                     </div>
                     <Badge tone={statusTone(c.status)}>{statusLabel(c.status)}</Badge>
                   </div>
+                  {/*
+                    Display-only per the approved design (section 18): the
+                    Check In action itself is never blocked by identity
+                    status here — no backend enforcement exists for it
+                    either, so there is nothing to bypass and nothing to
+                    audit for an "override" that was never a gate.
+                  */}
                   <Button variant="primary" className="w-full mt-3" onClick={() => handleCheckIn(c.booking_id)}>
                     Check In
                   </Button>
@@ -459,7 +569,7 @@ export default function StaffOperationsPage() {
       )}
 
       {!loading && (tab === "today" || tab === "check-outs") && (
-        <Card className="mb-6">
+        <Card className="!rounded-[14px] mb-6 shadow-sm">
           <h2 className="text-sm font-semibold text-slate-900 mb-4">Check-outs {tab === "today" ? "Today" : ""}</h2>
           {checkOuts.length === 0 ? (
             <EmptyState message="No pending check-outs. All caught up." />
@@ -488,7 +598,7 @@ export default function StaffOperationsPage() {
       )}
 
       {!loading && tab === "guest_request" && (
-        <Card className="mb-4">
+        <Card className="!rounded-[14px] mb-4 shadow-sm">
           {!showRequestForm ? (
             <button
               onClick={() => setShowRequestForm(true)}
@@ -565,7 +675,7 @@ export default function StaffOperationsPage() {
 
       {!loading && showTaskList && (
         visibleTasks.length === 0 ? (
-          <Card>
+          <Card className="!rounded-[14px] shadow-sm">
             <EmptyState
               message={
                 tab === "mine"
@@ -580,10 +690,11 @@ export default function StaffOperationsPage() {
               const action = NEXT_ACTION[t.category][t.status];
               const expanded = expandedId === t.id;
               return (
-                <Card key={`${t.category}-${t.id}`} className="p-0 overflow-hidden">
+                <Card key={`${t.category}-${t.id}`} className="!rounded-[14px] p-0 overflow-hidden shadow-sm">
                   <button
                     onClick={() => setExpandedId(expanded ? null : t.id)}
                     aria-expanded={expanded}
+                    aria-label={`${expanded ? "Hide" : "View"} details — ${t.unit_name ?? "task"} ${t.label}`}
                     className="w-full text-left p-4 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-900"
                   >
                     <div className="flex items-start justify-between gap-3">

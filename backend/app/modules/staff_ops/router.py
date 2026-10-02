@@ -27,8 +27,10 @@ from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
 from app.modules.bookings.models import Booking, Guest
-from app.modules.housekeeping.models import TASK_STATUSES as HK_STATUSES, HousekeepingTask
+from app.modules.housekeeping.models import HousekeepingTask
+from app.modules.housekeeping.service import update_housekeeping_task
 from app.modules.maintenance.models import TICKET_STATUSES as MAINT_STATUSES, MaintenanceTicket
+from app.modules.notifications.service import trigger_maintenance_ticket_resolved
 from app.modules.payments.models import Payment
 from app.modules.portal.models import REQUEST_STATUSES as REQ_STATUSES, GuestRequest
 from app.modules.properties.models import Unit
@@ -121,6 +123,7 @@ def _check_in_lines(db: Session, bookings: list[Booking]) -> list[CheckInLine]:
             children=b.children,
             status=b.status,
             net_paid=round(paid_by_booking.get(b.id, 0.0), 2),
+            guest_identity_status=guests_by_id[b.guest_id].identity_status if b.guest_id in guests_by_id else "not_required",
         )
         for b in bookings
     ]
@@ -250,35 +253,28 @@ def update_task(
     Housekeeping/Maintenance/Guest Requests page.
     """
     if category == "housekeeping":
-        task = db.get(HousekeepingTask, task_id)
+        # Phase 6: locked FOR UPDATE, matching the maintenance branch below
+        # (MaintenanceTicket already uses with_for_update=True) — closes the
+        # one place this table's own PATCH was fetched unlocked, which the
+        # dedicated /housekeeping-tasks/{id} endpoint now also fixes.
+        task = db.get(HousekeepingTask, task_id, with_for_update=True)
         if task is None:
             raise HTTPException(404, "Task not found")
-        changes = []
-        if payload.status is not None:
-            if payload.status not in HK_STATUSES:
-                raise HTTPException(400, f"Invalid status '{payload.status}'")
-            changes.append(f"status: {task.status} -> {payload.status}")
-            task.status = payload.status
-            if payload.status == "in_progress" and task.started_at is None:
-                task.started_at = datetime.now(timezone.utc)
-            if payload.status == "completed":
-                if task.completed_at is None:
-                    task.completed_at = datetime.now(timezone.utc)
-                unit = db.get(Unit, task.unit_id)
-                unit.housekeeping_status = "clean"
-        # model_fields_set (not `is not None`) distinguishes "field omitted"
-        # from an explicit `assigned_to: null` — the latter now clears the
-        # assignment. Every other field on this endpoint is untouched.
-        if "assigned_to" in payload.model_fields_set:
-            new_assignee = payload.assigned_to
-            if new_assignee is not None and db.get(User, new_assignee) is None:
-                raise HTTPException(404, "Assigned user not found")
-            changes.append(f"assigned_to: {task.assigned_to} -> {new_assignee}")
-            task.assigned_to = new_assignee
-        if payload.notes is not None:
-            task.notes = payload.notes
-        if changes:
-            record_audit_log(db, user.id, "housekeeping.update", entity_type="housekeeping_task", entity_id=str(task.id), details="; ".join(changes))
+
+        # Canonical mutation workflow (app/modules/housekeeping/service.py)
+        # — the same function the dedicated Housekeeping page's own PATCH
+        # /housekeeping-tasks/{id} endpoint calls, so a status change from
+        # either surface behaves identically (validation, timestamps,
+        # audit logging, notification) rather than two independently
+        # maintained copies silently drifting apart.
+        update_housekeeping_task(
+            db, task,
+            status=payload.status,
+            assigned_to=payload.assigned_to,
+            assigned_to_set="assigned_to" in payload.model_fields_set,
+            notes=payload.notes,
+            actor_user_id=user.id,
+        )
         db.commit()
         db.refresh(task)
         unit = db.get(Unit, task.unit_id)
@@ -294,6 +290,7 @@ def update_task(
         ticket = db.get(MaintenanceTicket, task_id, with_for_update=True)
         if ticket is None:
             raise HTTPException(404, "Task not found")
+        was_resolved_before = ticket.status in ("resolved", "closed")
         changes = []
         if payload.status is not None:
             if payload.status not in MAINT_STATUSES:
@@ -310,6 +307,13 @@ def update_task(
             ticket.assigned_to = new_assignee
         if changes:
             record_audit_log(db, user.id, "maintenance.update", entity_type="maintenance_ticket", entity_id=str(ticket.id), details="; ".join(changes))
+        # Matches the dedicated /maintenance-tickets/{id} endpoint's own
+        # resolved-once trigger — deliberately NOT the cost/Expense sync
+        # next to it there, which stays out of this module on purpose (see
+        # test_maintenance_resolution_via_unified_endpoint_does_not_set_cost_or_create_expense).
+        is_resolved_now = ticket.status in ("resolved", "closed")
+        if is_resolved_now and not was_resolved_before:
+            trigger_maintenance_ticket_resolved(db, ticket)
         db.commit()
         db.refresh(ticket)
         unit = db.get(Unit, ticket.unit_id)

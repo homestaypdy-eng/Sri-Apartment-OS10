@@ -1,4 +1,12 @@
+import logging
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
+
+ZOTEL_SYNC_INTERVAL_DEFAULT_MINUTES = 15
+ZOTEL_SYNC_INTERVAL_MIN_MINUTES = 5
+ZOTEL_SYNC_INTERVAL_MAX_MINUTES = 1440
+_config_logger = logging.getLogger("sri_apartment_os.config")
 
 
 class Settings(BaseSettings):
@@ -15,6 +23,19 @@ class Settings(BaseSettings):
     app_name: str = "Sri Apartment OS"
     environment: str = "development"
 
+    # LOCAL EMAIL OTP TESTING (customer login only) — consulted ONLY when
+    # environment != "production" (see customer_auth/router.py's
+    # login_customer). The production gate itself never reads these; a
+    # misconfigured value here cannot change production behavior at all.
+    # "dev_code" (default): no email is ever attempted, the response just
+    # carries dev_otp_code, exactly as before this setting existed.
+    # "real_email": sends a real email SYNCHRONOUSLY, but only when the
+    # customer's address exactly matches an entry in
+    # customer_auth_email_otp_test_allowlist — an empty allowlist (the
+    # default) means "real_email" mode can still never send to anyone.
+    customer_auth_email_otp_mode: str = "dev_code"
+    customer_auth_email_otp_test_allowlist: str = ""
+
     # Email (SMTP) — for sending quotations. Empty smtp_host means "not
     # configured"; the email-send endpoint returns a clear 501 rather than
     # silently failing or pretending to send.
@@ -24,6 +45,17 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from_email: str = "homestaypdy@gmail.com"
     smtp_use_tls: bool = True
+
+    # Email provider switch — "gmail_smtp" (default, unchanged production
+    # behavior) or "resend". send_email() in notifications/service.py
+    # branches on this; every existing SMTP setting above stays exactly as
+    # it is regardless of this value. resend_from_email is deliberately
+    # separate from smtp_from_email (never falls back to it) — Resend can
+    # only send from the domain verified with Resend (send.sriapartment.in),
+    # never from the Gmail address.
+    email_provider: str = "gmail_smtp"
+    resend_api_key: str = ""
+    resend_from_email: str = ""
 
     # WhatsApp click-to-chat — default country code prepended to 10-digit
     # phone numbers that don't already include one (see service.py).
@@ -59,6 +91,26 @@ class Settings(BaseSettings):
     # background thread nobody asked for — a real deployment sets this true.
     enable_scheduler: bool = False
     reminder_scan_interval_minutes: int = 60
+    zotel_sync_interval_minutes: int = ZOTEL_SYNC_INTERVAL_DEFAULT_MINUTES
+
+    @field_validator("zotel_sync_interval_minutes", mode="before")
+    @classmethod
+    def _safe_zotel_sync_interval(cls, value):
+        try:
+            if isinstance(value, bool):
+                raise ValueError("boolean is not an interval")
+            interval = int(value)
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError("interval must be a whole number")
+            if not ZOTEL_SYNC_INTERVAL_MIN_MINUTES <= interval <= ZOTEL_SYNC_INTERVAL_MAX_MINUTES:
+                raise ValueError("interval is outside the safe range")
+            return interval
+        except (TypeError, ValueError):
+            _config_logger.warning(
+                "Invalid ZOTEL_SYNC_INTERVAL_MINUTES; using the safe default of %s minutes",
+                ZOTEL_SYNC_INTERVAL_DEFAULT_MINUTES,
+            )
+            return ZOTEL_SYNC_INTERVAL_DEFAULT_MINUTES
 
     # Razorpay — order creation needs a real merchant account (not available
     # in this sandbox: no credentials, and api.razorpay.com is outside this

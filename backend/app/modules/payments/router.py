@@ -1,14 +1,18 @@
+import datetime as dt
+import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from app.db.session import get_db
 from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
 from app.modules.bookings.models import Booking, Guest
+from app.modules.bookings.cancellation_service import CancellationRefundAmountMismatch, enforce_standalone_refund_policy
 from app.modules.payments.models import CreditNote, Invoice, Payment
 from app.modules.payments.schemas import (
     CreditNoteCreate,
@@ -21,7 +25,7 @@ from app.modules.payments.schemas import (
     SendInvoiceEmailResponse,
     SendInvoiceWhatsAppResponse,
 )
-from app.modules.payments.service import calculate_gst, generate_credit_note_pdf, generate_invoice_pdf, next_credit_note_number, next_invoice_number
+from app.modules.payments.service import calculate_gst, credit_note_gst_breakdown, generate_credit_note_pdf, generate_credit_note_pdf_for_credit_note, generate_invoice_pdf, generate_invoice_pdf_for_booking, next_credit_note_number, next_invoice_number
 from app.modules.notifications.service import trigger_invoice_delivery, trigger_payment_received
 from app.modules.properties.models import Property, Unit
 from app.modules.settings.router import get_or_create_bank_settings, get_or_create_settings
@@ -63,12 +67,62 @@ def refund_payment(payment_id: uuid.UUID, payload: RefundCreate, db: Session = D
     across the codebase just sums Payment.amount for a booking, so this
     nets out correctly everywhere automatically, with the refund itself
     keeping its own timestamp and audit trail instead of rewriting history.
+
+    Phase 2 (payment/refund safety):
+    - Idempotent replay: if payload.idempotency_key matches an existing
+      refund row for this same payment, that row is returned as-is — no
+      new row, no re-validation, no double audit-log entry. This must be
+      checked BEFORE the row lock below, since a genuine retry should never
+      block on (or be blocked by) another request for the same payment.
+    - original is locked FOR UPDATE for the remainder of this (single,
+      fast, no-external-call) transaction, so two concurrent refund
+      requests against the same payment can never both pass the
+      cumulative-amount check before either commits — the second request
+      only proceeds once the first has committed, and then sees the
+      first's refund already counted in net_refunded.
     """
-    original = db.get(Payment, payment_id)
+    if payload.idempotency_key:
+        existing = db.scalar(
+            select(Payment).where(Payment.refund_of_payment_id == payment_id, Payment.idempotency_key == payload.idempotency_key)
+        )
+        if existing is not None:
+            return existing
+
+    unlocked = db.get(Payment, payment_id)
+    if unlocked is None:
+        raise HTTPException(404, "Payment not found")
+    # Match cancellation and gateway-refund lock order: booking first, then
+    # payment. This serializes policy cancellation refunds against the
+    # standalone ledger-refund endpoint, including refunds on other rows
+    # belonging to the same booking.
+    booking = db.get(Booking, unlocked.booking_id, with_for_update=True)
+    if booking is None:
+        raise HTTPException(404, "Booking not found")
+    original = db.scalar(select(Payment).where(Payment.id == payment_id).with_for_update())
     if original is None:
         raise HTTPException(404, "Payment not found")
+    # Same-key requests may both miss the optimistic lookup above. Recheck
+    # after the payment row lock so the waiter returns the committed refund
+    # rather than creating a second ledger row.
+    if payload.idempotency_key:
+        existing = db.scalar(
+            select(Payment).where(Payment.refund_of_payment_id == payment_id, Payment.idempotency_key == payload.idempotency_key)
+        )
+        if existing is not None:
+            return existing
     if original.amount < 0:
         raise HTTPException(400, "Cannot refund a refund")
+    if original.mode == "razorpay":
+        raise HTTPException(409, "Razorpay payments must be refunded through the payment-gateway refund workflow")
+    if original.mode == "zotel":
+        raise HTTPException(409, "OTA-collected payments must be reconciled/refunded through the original OTA payment channel")
+    if original.status != "completed":
+        raise HTTPException(409, "Only successfully completed payments can be refunded")
+
+    try:
+        enforce_standalone_refund_policy(db, booking, payload.refund_amount)
+    except CancellationRefundAmountMismatch as exc:
+        raise HTTPException(409, str(exc)) from None
 
     already_refunded = db.scalars(select(Payment).where(Payment.refund_of_payment_id == payment_id)).all()
     net_refunded = sum(abs(float(r.amount)) for r in already_refunded)
@@ -83,6 +137,7 @@ def refund_payment(payment_id: uuid.UUID, payload: RefundCreate, db: Session = D
         reference_no=f"REFUND-{original.reference_no or original.id}",
         refund_of_payment_id=payment_id,
         refund_reason=payload.reason,
+        idempotency_key=payload.idempotency_key,
         created_by=user.id,
     )
     db.add(refund)
@@ -216,9 +271,20 @@ def generate_invoice(booking_id: uuid.UUID, db: Session = Depends(get_db), user:
 @router.get("/invoices/{invoice_id}/pdf", dependencies=[Depends(require_role("admin", "staff"))])
 def download_invoice_pdf(invoice_id: uuid.UUID, db: Session = Depends(get_db)):
     invoice = db.get(Invoice, invoice_id)
-    if invoice is None or not invoice.pdf_path:
+    if invoice is None:
         raise HTTPException(404, "Invoice PDF not found")
-    return FileResponse(invoice.pdf_path, media_type="application/pdf", filename=f"{invoice.invoice_no.replace('/', '_')}.pdf")
+    booking = db.get(Booking, invoice.booking_id)
+    if booking is None:
+        raise HTTPException(404, "Invoice PDF not found")
+    # Preserve the issued invoice artifact when it is available: mutable
+    # bank/property/guest settings must not rewrite a historical document.
+    # Regenerate only when the stored file is unavailable (for example,
+    # ephemeral storage was lost); the invoice number and financial totals
+    # remain sourced from the immutable Invoice row.
+    pdf_path = invoice.pdf_path if invoice.pdf_path and os.path.isfile(invoice.pdf_path) else None
+    if pdf_path is None:
+        pdf_path = generate_invoice_pdf_for_booking(db, booking, invoice)
+    return FileResponse(pdf_path, media_type="application/pdf", filename=f"{invoice.invoice_no.replace('/', '_')}.pdf")
 
 
 @router.get("/invoices/by-booking/{booking_id}", response_model=InvoiceOut, dependencies=[Depends(require_role("admin", "staff"))])
@@ -235,14 +301,33 @@ def send_invoice_email(invoice_id: uuid.UUID, payload: SendInvoiceEmailRequest, 
     if invoice is None:
         raise HTTPException(404, "Invoice not found")
     booking = db.get(Booking, invoice.booking_id)
-    guest = db.get(Guest, booking.guest_id) if booking else None
+    if booking is None:
+        raise HTTPException(404, "Booking for this invoice not found")
+    guest = db.get(Guest, booking.guest_id)
     to_email = payload.to_email or (guest.email if guest else None)
     if not to_email:
         raise HTTPException(400, "No email address on file for this booking's guest — provide to_email in the request")
-    if not invoice.pdf_path:
-        raise HTTPException(400, "Generate the invoice PDF first (GET /invoices/{id}/pdf triggers generation during /invoices/generate)")
 
-    sent = trigger_invoice_delivery(db, invoice, invoice.pdf_path)
+    # OS10 Phase 4 Step 4A: regenerated fresh from current DB data, exactly
+    # like the staff invoice-download endpoint — never dependent on
+    # invoice.pdf_path still existing on disk. This is a synchronous,
+    # staff-initiated action (unlike the automatic post-payment path), so a
+    # generation failure is surfaced as a clear error rather than silently
+    # sending an attachment-less email — the resend action explicitly
+    # failed, and the staff member clicking it should know that.
+    try:
+        pdf_path = generate_invoice_pdf_for_booking(db, booking, invoice)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to generate the invoice PDF for this email: {e}") from None
+
+    try:
+        sent = trigger_invoice_delivery(db, invoice, pdf_path)
+    finally:
+        # Cleaned up on both success and failure — a fresh regeneration for
+        # this send only, never the historical invoice.pdf_path file.
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+
     record_audit_log(db, user.id, "invoice.send_email", entity_type="invoice", entity_id=str(invoice.id), details=f"To {to_email}: {'sent' if sent else 'attempted, see notification log for failure reason'}")
     db.commit()
     return SendInvoiceEmailResponse(sent=bool(sent), to_email=to_email)
@@ -281,20 +366,22 @@ def create_credit_note(invoice_id: uuid.UUID, payload: CreditNoteCreate, db: Ses
     if payload.amount > float(invoice.subtotal):
         raise HTTPException(400, f"Credit amount (Rs.{payload.amount}) cannot exceed the invoice's subtotal (Rs.{invoice.subtotal})")
 
-    # GST portion is proportional to the original invoice's own rate — a
-    # partial credit against a part-CGST/SGST invoice must reduce each
-    # component in the same ratio it was originally charged, not just
-    # zero out GST or apply today's rate.
-    ratio = payload.amount / float(invoice.subtotal) if invoice.subtotal else 0
-    cgst = round(float(invoice.cgst) * ratio, 2)
-    sgst = round(float(invoice.sgst) * ratio, 2)
-    igst = round(float(invoice.igst) * ratio, 2)
-    total = round(payload.amount + cgst + sgst + igst, 2)
+    # GST portion is proportional to the original invoice's own rate — see
+    # credit_note_gst_breakdown's docstring (also used by the automatic
+    # cancellation-refund flow, so both compute this the same way).
+    breakdown = credit_note_gst_breakdown(invoice, payload.amount)
+    cgst, sgst, igst, total = breakdown["cgst"], breakdown["sgst"], breakdown["igst"], breakdown["total"]
 
     credit_note_no = next_credit_note_number(db)
     booking = db.get(Booking, invoice.booking_id)
     guest = db.get(Guest, booking.guest_id) if booking else None
     property_ = db.get(Property, booking.unit.property_id) if booking and booking.unit else None
+
+    # OS10 Phase 4 Step 4C: issued_at is captured once, here, and used for
+    # BOTH the PDF's printed "Issue Date" and the stored CreditNote row —
+    # so a later regeneration (download_credit_note_pdf) prints the exact
+    # same date this creation call did, never today's date.
+    issued_at = dt.datetime.now(dt.timezone.utc)
 
     pdf_path = generate_credit_note_pdf(
         credit_note_no=credit_note_no, invoice_no=invoice.invoice_no,
@@ -302,12 +389,13 @@ def create_credit_note(invoice_id: uuid.UUID, payload: CreditNoteCreate, db: Ses
         property_gst_number=property_.gst_number if property_ else None,
         guest_name=guest.name if guest else "Guest",
         amount=payload.amount, cgst=cgst, sgst=sgst, igst=igst, total=total, reason=payload.reason,
+        issue_date=issued_at.date(),
     )
 
     credit_note = CreditNote(
         invoice_id=invoice_id, credit_note_no=credit_note_no, amount=payload.amount,
         cgst=cgst, sgst=sgst, igst=igst, total=total, reason=payload.reason,
-        pdf_path=pdf_path, created_by=user.id,
+        pdf_path=pdf_path, created_by=user.id, issued_at=issued_at,
     )
     db.add(credit_note)
     db.flush()
@@ -325,6 +413,32 @@ def list_credit_notes(invoice_id: uuid.UUID, db: Session = Depends(get_db)):
 @router.get("/credit-notes/{credit_note_id}/pdf", dependencies=[Depends(require_role("admin", "staff"))])
 def download_credit_note_pdf(credit_note_id: uuid.UUID, db: Session = Depends(get_db)):
     credit_note = db.get(CreditNote, credit_note_id)
-    if credit_note is None or not credit_note.pdf_path:
+    if credit_note is None:
         raise HTTPException(404, "Credit note PDF not found")
-    return FileResponse(credit_note.pdf_path, media_type="application/pdf", filename=f"{credit_note.credit_note_no.replace('/', '_')}.pdf")
+
+    filename = f"{credit_note.credit_note_no.replace('/', '_')}.pdf"
+
+    # OS10 Phase 4 Step 4C: the common case (stored file still present) is
+    # left exactly as before — unchanged behavior, zero regeneration risk.
+    # Only when the stored file is missing (the ephemeral-storage failure
+    # mode the Step 4 audit found) do we fall back to regenerating from
+    # DB data, exactly as CreditNote.issued_at/amount/cgst/sgst/igst/
+    # total/reason/credit_note_no already recorded them — see
+    # generate_credit_note_pdf_for_credit_note's docstring for the
+    # historical-integrity guarantees.
+    if credit_note.pdf_path and os.path.exists(credit_note.pdf_path):
+        return FileResponse(credit_note.pdf_path, media_type="application/pdf", filename=filename)
+
+    try:
+        regenerated_path = generate_credit_note_pdf_for_credit_note(db, credit_note)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to regenerate this credit note's PDF: {e}") from None
+
+    def _cleanup():
+        if os.path.exists(regenerated_path):
+            os.remove(regenerated_path)
+
+    return FileResponse(
+        regenerated_path, media_type="application/pdf", filename=filename,
+        background=BackgroundTask(_cleanup),
+    )

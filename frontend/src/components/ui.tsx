@@ -35,15 +35,19 @@ export function Button({
   children: ReactNode;
   onClick?: () => void;
   type?: "button" | "submit";
-  variant?: "primary" | "secondary" | "danger";
+  variant?: "primary" | "secondary" | "danger" | "warning";
   disabled?: boolean;
   className?: string;
 }) {
-  const base = "px-4 py-2 rounded-lg text-sm font-medium transition disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-slate-900";
+  const base = "px-4 py-2 rounded-lg text-sm font-medium transition disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-brand-green";
   const variants = {
-    primary: "bg-slate-900 text-white hover:bg-slate-800",
+    primary: "bg-brand-green text-white hover:bg-brand-green-2",
     secondary: "bg-white border border-slate-300 text-slate-700 hover:bg-slate-50",
     danger: "bg-red-600 text-white hover:bg-red-700",
+    // Soft, mild warning treatment for a destructive-but-recoverable action
+    // (e.g. Cancel Booking) — visually distinct from "danger" (permanent
+    // delete) without being a bright, aggressive color.
+    warning: "bg-amber-50 border border-amber-300 text-amber-800 hover:bg-amber-100",
   };
   return (
     <button type={type} onClick={onClick} disabled={disabled} className={`${base} ${variants[variant]} ${className}`}>
@@ -84,7 +88,7 @@ export type BadgeTone = "slate" | "green" | "red" | "amber" | "blue" | "violet" 
 export function Badge({ children, tone = "slate", variant = "tint" }: { children: ReactNode; tone?: BadgeTone; variant?: "tint" | "solid" }) {
   const tintTones: Record<BadgeTone, string> = {
     slate: "bg-slate-100 text-slate-700",
-    green: "bg-emerald-100 text-emerald-700",
+    green: "bg-brand-green/10 text-brand-green",
     red: "bg-red-100 text-red-700",
     amber: "bg-amber-100 text-amber-700",
     blue: "bg-blue-100 text-blue-700",
@@ -95,7 +99,7 @@ export function Badge({ children, tone = "slate", variant = "tint" }: { children
   };
   const solidTones: Record<BadgeTone, string> = {
     slate: "bg-slate-500 text-white",
-    green: "bg-emerald-600 text-white",
+    green: "bg-brand-green text-white",
     red: "bg-red-600 text-white",
     amber: "bg-amber-500 text-white",
     blue: "bg-blue-600 text-white",

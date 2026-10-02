@@ -134,6 +134,7 @@ class CustomerAccountOut(BaseModel):
     email: EmailStr
     phone: str | None
     email_verified_at: datetime | None
+    phone_verified_at: datetime | None
     created_at: datetime
 
     class Config:
@@ -166,6 +167,13 @@ class CustomerLoginOtpRequestResponse(BaseModel):
     # Only ever populated outside production — same convention as every
     # other dev_otp_code/dev_reset_token field in this codebase.
     dev_otp_code: str | None = None
+    # LOCAL EMAIL OTP TESTING: tells the caller exactly what actually
+    # happened, so the frontend never has to assume delivery succeeded —
+    # see customer_auth/router.py's login_customer docstring for the full
+    # set of values. Always "sent" in production (the same meaning this
+    # response always had before this field existed — unchanged wording,
+    # just now named explicitly).
+    otp_delivery_status: str = "sent"
 
 
 class CustomerLoginVerifyRequest(BaseModel):

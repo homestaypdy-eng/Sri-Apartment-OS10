@@ -24,9 +24,9 @@ def headers():
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
-def _make_unit(headers, rate=2000):
+def _make_unit(headers, rate=2000, max_occupancy=2):
     prop = client.post("/api/v1/properties", headers=headers, json={"name": f"BkProp {uuid.uuid4().hex[:6]}", "address": "Test", "state_code": "34"}).json()
-    unit = client.post("/api/v1/units", headers=headers, json={"property_id": prop["id"], "name": f"BkUnit {uuid.uuid4().hex[:6]}", "base_rate": rate}).json()
+    unit = client.post("/api/v1/units", headers=headers, json={"property_id": prop["id"], "name": f"BkUnit {uuid.uuid4().hex[:6]}", "base_rate": rate, "max_occupancy": max_occupancy}).json()
     return unit["id"]
 
 
@@ -254,7 +254,8 @@ def test_edit_booking_still_allowed_after_invoice_for_non_invoice_fields(headers
     """The guard only blocks the fields that feed GST/total calculation —
     everything else (notes, guest count, arrival time, etc.) must remain
     editable even after an invoice exists."""
-    booking, _ = _make_booking(headers)
+    unit_id = _make_unit(headers, max_occupancy=3)
+    booking, _ = _make_booking(headers, unit_id=unit_id)
     client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
 
     resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"internal_notes": "Post-invoice note", "adults": 3})

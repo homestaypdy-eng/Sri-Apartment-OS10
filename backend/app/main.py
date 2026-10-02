@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
+from app.modules.bookings.document_storage import validate_production_storage_config
 
 # Completes SQLAlchemy's Base.metadata for this process — see
 # app/db/model_registry.py's docstring for why this is needed and why it
@@ -97,6 +98,7 @@ def _validate_production_config() -> None:
             "in production. Set CORS_ALLOWED_ORIGINS to your real frontend domain(s) before running "
             "in production."
         )
+    validate_production_storage_config(environment=settings.environment)
 
 
 @asynccontextmanager

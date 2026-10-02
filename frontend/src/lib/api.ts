@@ -1,6 +1,7 @@
 import axios from "axios";
+import { resolveApiBaseUrl } from "./apiBaseUrl";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api/v1";
+const API_BASE_URL = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 export const api = axios.create({ baseURL: API_BASE_URL });
 
@@ -226,6 +227,7 @@ export interface GuestOut {
   id_proof_type: string | null;
   id_proof_number: string | null;
   id_proof_url: string | null;
+  state_code: string | null;
   date_of_birth: string | null;
   gender: string | null;
   nationality: string | null;
@@ -238,6 +240,48 @@ export interface GuestOut {
   is_vip: boolean;
   is_blacklisted: boolean;
   merged_into_guest_id: string | null;
+  // Identity Verification — separate from Account Verification (which
+  // this app doesn't surface on Guest at all). Only ever changed via the
+  // dedicated /guests/{id}/identity/* endpoints below, never by editing a
+  // guest directly.
+  identity_status: "not_required" | "pending" | "submitted" | "under_review" | "verified" | "rejected" | "expired";
+  identity_verified_at: string | null;
+  identity_verified_by: string | null;
+  identity_rejection_reason: string | null;
+  identity_verified_document_id: string | null;
+}
+
+export interface IdentityVerifyRequest {
+  document_id: string;
+}
+
+export interface IdentityRejectRequest {
+  reason: string;
+}
+
+export interface IdentityResetRequest {
+  reason: string;
+}
+
+export interface BookingGuestOut {
+  id: string;
+  guest_id: string;
+  name: string;
+  phone: string;
+  identity_status: GuestOut["identity_status"];
+  added_at: string;
+}
+
+export interface PrincipalGuestOut {
+  guest_id: string;
+  name: string;
+  phone: string;
+  identity_status: GuestOut["identity_status"];
+}
+
+export interface BookingGuestsOut {
+  principal_guest: PrincipalGuestOut;
+  additional_guests: BookingGuestOut[];
 }
 
 export interface GuestSegment {
@@ -325,6 +369,9 @@ export interface CheckInLine {
   children: number;
   status: string;
   net_paid: number;
+  // Identity Verification (display-only at check-in) — the Principal
+  // Guest's Guest.identity_status. Never implies Account Verification.
+  guest_identity_status: GuestOut["identity_status"];
 }
 
 export interface CheckOutLine {
@@ -557,6 +604,8 @@ export interface AIStrategistFinanceCashFlow {
   cash_in_payments: number;
   cash_in_deposits: number;
   cash_in_ota_payouts: number;
+  /** Informational only, excluded from cash_in_total — see backend cash_flow()'s docstring. */
+  cash_in_zotel_pending: number;
   cash_in_total: number;
   cash_out_expenses: number;
   cash_out_withdrawals: number;
@@ -1191,6 +1240,19 @@ export interface GuestProfileOut {
   name: string;
   phone: string;
   email: string | null;
+  // Identity Verification — separate from this session's own login (which
+  // only ever proved control of the phone/email/magic-link channel used
+  // to sign in, never a government ID). See GuestIdentityStatusOut below
+  // for the fuller guest-facing view (document type, verified date,
+  // rejection message).
+  identity_status: GuestOut["identity_status"];
+}
+
+export interface GuestIdentityStatusOut {
+  status: GuestOut["identity_status"];
+  document_type: string | null;
+  verified_at: string | null;
+  message: string | null;
 }
 
 // --- Guest OTP login (phone/email) — see backend app/modules/portal/
@@ -1251,6 +1313,23 @@ export interface CustomerLoginResponse {
   customer: CustomerAccountOut;
 }
 
+export interface CustomerIdentityStatusOut {
+  status: "not_required" | "pending" | "submitted" | "verified" | "rejected";
+  document_type: string | null;
+  document_id: string | null;
+  verified_at: string | null;
+  message: string | null;
+}
+
+export interface CustomerLoginOtpRequestResponse {
+  challenge_id: string;
+  message: string;
+  // The backend returns this only outside production when its configured
+  // local OTP mode intentionally avoids external email/SMS delivery.
+  dev_otp_code?: string | null;
+  otp_delivery_status: string;
+}
+
 export interface CustomerForgotPasswordResponse {
   message: string;
   // Dev/testability-only — see backend CustomerForgotPasswordResponse.
@@ -1273,8 +1352,26 @@ export function customerRegister(payload: {
   return customerApi.post("/customer-auth/register", payload).then((r) => r.data);
 }
 
-export function customerLogin(email: string, password: string): Promise<CustomerLoginResponse> {
-  return customerApi.post("/customer-auth/login", { email, password }).then((r) => r.data);
+export function customerLogin(email: string, password: string): Promise<CustomerLoginOtpRequestResponse> {
+  return customerApi.post("/customer-auth/login", {
+    channel: "email",
+    identifier: email,
+    password,
+  }).then((r) => r.data);
+}
+
+export function customerVerifyLoginOtp(challengeId: string, code: string): Promise<CustomerLoginResponse> {
+  return customerApi.post("/customer-auth/login/verify-otp", {
+    challenge_id: challengeId,
+    code,
+  }).then((r) => r.data);
+}
+
+export function initializeCustomerIdentityProfile(): Promise<CustomerIdentityStatusOut> {
+  // The server derives the CustomerAccount from its authenticated session
+  // and performs the only permitted Guest resolution. Never accept a
+  // guest_id from the browser for this association.
+  return customerApi.post("/customer-auth/me/identity/profile").then((r) => r.data);
 }
 
 export function customerLogout(): Promise<void> {
@@ -1320,12 +1417,28 @@ export interface ExpenseOut {
   id: string;
   category: string;
   amount: number;
+  paid_amount: number;
+  remaining_amount: number;
+  payment_status: "unpaid" | "partially_paid" | "paid";
   expense_date: string;
   unit_id: string | null;
   notes: string | null;
   approval_status: string;
   approved_by: string | null;
   approved_at: string | null;
+  created_at: string;
+  created_by: string | null;
+}
+
+export interface ExpensePaymentOut {
+  id: string;
+  expense_id: string;
+  amount: number;
+  payment_date: string;
+  payment_method: "cash" | "bank_transfer" | "upi" | "card" | "cheque";
+  reference_no: string | null;
+  created_by: string | null;
+  created_by_name: string | null;
   created_at: string;
 }
 
@@ -1492,6 +1605,8 @@ export interface CashFlowReport {
   cash_in_payments: number;
   cash_in_deposits: number;
   cash_in_ota_payouts: number;
+  /** Informational only, excluded from cash_in_total — see backend cash_flow()'s docstring. */
+  cash_in_zotel_pending: number;
   cash_in_total: number;
   cash_out_expenses: number;
   cash_out_withdrawals: number;

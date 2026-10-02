@@ -576,7 +576,7 @@ def test_login_rate_limiting_blocks_after_threshold(db):
 
 
 # ---------------------------------------------------------------------------
-# 32-34: no auto-linking, no GuestIdentity, no booking access
+# 32-34: no auto-linking at login, no GuestIdentity, no booking access
 # ---------------------------------------------------------------------------
 
 def test_matching_guest_email_does_not_link_on_login(db):
@@ -591,7 +591,9 @@ def test_matching_guest_email_does_not_link_on_login(db):
 
     reloaded_guest = db.get(Guest, guest.id)
     assert reloaded_guest.email == shared_email  # untouched
-    assert not hasattr(CustomerAccount, "guest_id")
+    account = db.scalar(select(CustomerAccount).where(CustomerAccount.email == shared_email))
+    assert account is not None
+    assert account.guest_id is None  # linking occurs only through the explicit identity-profile flow
 
 
 def test_login_creates_no_guest_identity(db):
@@ -677,7 +679,9 @@ def test_login_schedules_background_otp_email_dispatch(monkeypatch, db):
         mock_dispatch.assert_called_once()
         args = mock_dispatch.call_args[0]
         assert str(args[0]) == account["id"]
-        assert "Sri Apartment" in args[2]  # body
+        otp_code, expiry_minutes = args[1], args[2]
+        assert isinstance(otp_code, str) and otp_code.isdigit()
+        assert isinstance(expiry_minutes, int) and expiry_minutes > 0
 
 
 def test_login_schedules_background_otp_sms_dispatch(monkeypatch, db):
@@ -747,3 +751,237 @@ def test_otp_delivery_failure_is_logged_via_notification_log(monkeypatch, db):
     assert row.success is False
     # Internal admin-only log — never contains the OTP code itself.
     assert "Errno 101" in (row.error_message or "")
+
+
+# ---------------------------------------------------------------------------
+# OTP email visual redesign — branded HTML card, unchanged OTP/security
+# behavior (see dispatch_customer_login_otp_email / _render_customer_otp_
+# html in notifications/service.py). These assert content/structure only —
+# OTP generation, verification, expiry, and rate-limiting are untouched
+# and already covered by the tests above.
+# ---------------------------------------------------------------------------
+
+def test_otp_email_subject_is_exact(monkeypatch, db):
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200
+        subject = mock_send.call_args[0][1]
+        assert subject == "Your Sri Apartment Verification Code"
+
+
+def test_otp_email_html_contains_code_logo_expiry_and_branding(monkeypatch, db):
+    import re
+    from app.modules.portal.auth_service import OTP_EXPIRY_MINUTES
+
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200
+        args, kwargs = mock_send.call_args
+        body = args[2]
+        html_body = kwargs.get("html_body") or ""
+        inline_images = kwargs.get("inline_images") or {}
+
+        # Confirms *a* 6-digit code is present and consistent between the
+        # HTML and plain-text fallback, without asserting/printing its
+        # literal value (the real code is never exposed outside the
+        # intended OTP display, matching the design requirement).
+        html_codes = re.findall(r"\b\d{6}\b", html_body)
+        assert html_codes, "expected a 6-digit code in the HTML"
+        assert html_codes[0] in body
+
+        assert "cid:logo" in html_body
+        assert "height:72px" in html_body  # noticeably larger than the 44px used elsewhere
+        assert "logo" in inline_images
+        assert f"expire in {OTP_EXPIRY_MINUTES} minutes" in html_body
+        assert "do not share this verification code" in html_body.lower()
+        assert "if you did not request this code" in html_body.lower()
+        assert "Sri Apartment Homestay" in html_body
+        assert "Pondicherry, India" in html_body
+
+
+def test_otp_email_plain_text_fallback_still_present(monkeypatch, db):
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+
+    with patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200
+        args, kwargs = mock_send.call_args
+        body = args[2]
+        assert "expire in 10 minutes" in body
+        assert "do not share this verification code" in body.lower()
+        assert kwargs.get("html_body")  # HTML is an addition, not a replacement
+
+
+# ---------------------------------------------------------------------------
+# LOCAL EMAIL OTP TESTING (CUSTOMER_AUTH_EMAIL_OTP_MODE) — the production
+# `if settings.environment == "production":` branch in login_customer is
+# never touched by any of this; every test below runs with
+# environment="development" (explicitly set, not relying on ambient .env)
+# to prove the non-production branch's behavior deterministically.
+# ---------------------------------------------------------------------------
+
+def test_local_default_mode_never_attempts_a_send(monkeypatch, db):
+    """dev_code (the default) — no network attempt at all, exactly the
+    pre-existing behavior this whole feature was built to make honest
+    about, now with an explicit, checkable status on the response."""
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "development")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_mode", "dev_code")
+
+    with patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["otp_delivery_status"] == "dev_code_only"
+        assert body["dev_otp_code"]
+        mock_send.assert_not_called()
+
+
+def test_local_real_email_mode_non_allowlisted_address_falls_back_to_dev_code(monkeypatch, db):
+    """Flipping the mode alone must never be enough to send to an
+    arbitrary address — only an explicit, exact-match allowlist entry can."""
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "development")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_mode", "real_email")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_test_allowlist", "someone-else@example.com")
+
+    with patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["otp_delivery_status"] == "dev_real_email_not_allowlisted"
+        assert body["dev_otp_code"]
+        mock_send.assert_not_called()
+
+
+def test_local_real_email_mode_empty_allowlist_sends_to_no_one(monkeypatch, db):
+    """The documented safe default: turning on real_email mode WITHOUT
+    also configuring an allowlist must still never send anywhere."""
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "development")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_mode", "real_email")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_test_allowlist", "")
+
+    with patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["otp_delivery_status"] == "dev_real_email_not_allowlisted"
+        mock_send.assert_not_called()
+
+
+def test_local_real_email_mode_allowlisted_address_sends_synchronously_on_success(monkeypatch, db):
+    from app.modules.notifications.models import NotificationLog
+
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "development")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_mode", "real_email")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_test_allowlist", email)
+
+    with patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["otp_delivery_status"] == "dev_real_email_sent"
+        assert body["dev_otp_code"]  # still usable even though a real send also happened
+        mock_send.assert_called_once()
+        # The short LOCAL-only test timeout, never production's 15s default.
+        assert mock_send.call_args.kwargs.get("timeout") == 8
+
+    row = db.scalar(
+        select(NotificationLog).where(NotificationLog.event_type == "customer_login_otp", NotificationLog.recipient == email)
+    )
+    assert row is not None
+    assert row.success is True
+
+
+def test_local_real_email_mode_allowlisted_address_reports_failure_and_keeps_dev_code(monkeypatch, db):
+    from app.modules.notifications.models import NotificationLog
+
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "development")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_mode", "real_email")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_test_allowlist", email)
+
+    with patch("app.modules.notifications.service.send_email", side_effect=OSError("[Errno 101] Network is unreachable")):
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["otp_delivery_status"] == "dev_real_email_failed"
+        # The fallback path this feature exists to guarantee: a failed
+        # LOCAL real-email test must never lock the developer out.
+        assert body["dev_otp_code"]
+        verify = _verify_otp(body["challenge_id"], body["dev_otp_code"])
+        assert verify.status_code == 200, verify.text
+
+    row = db.scalar(
+        select(NotificationLog).where(NotificationLog.event_type == "customer_login_otp", NotificationLog.recipient == email)
+    )
+    assert row is not None
+    assert row.success is False
+    assert "Errno 101" in (row.error_message or "")
+
+
+def test_local_real_email_mode_allowlist_matches_case_insensitively(monkeypatch, db):
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "development")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_mode", "real_email")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_test_allowlist", email.upper())
+
+    with patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.json()["otp_delivery_status"] == "dev_real_email_sent"
+        mock_send.assert_called_once()
+
+
+def test_local_mode_never_applies_to_phone_channel(monkeypatch, db):
+    """Out of scope by design (see the audit): phone/SMS keeps its
+    pre-existing local behavior unchanged regardless of the email-only
+    mode setting."""
+    phone = _random_phone()
+    email = _random_email()
+    _register(email, phone=phone)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "development")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_mode", "real_email")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_test_allowlist", phone)
+
+    resp = _login_step1("phone", phone)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["otp_delivery_status"] == "dev_code_only"
+
+
+def test_production_ignores_local_email_otp_mode_entirely(monkeypatch, db):
+    """SAFETY REGRESSION TEST: even if CUSTOMER_AUTH_EMAIL_OTP_MODE=real_email
+    and the allowlist matches, production must behave EXACTLY as it did
+    before this feature existed — backgrounded dispatch, no dev_otp_code,
+    no synchronous send, otp_delivery_status == 'sent'."""
+    email = _random_email()
+    _register(email)
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.environment", "production")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_mode", "real_email")
+    monkeypatch.setattr("app.modules.customer_auth.router.settings.customer_auth_email_otp_test_allowlist", email)
+
+    with patch("app.modules.customer_auth.router.dispatch_customer_login_otp_email") as mock_dispatch, \
+         patch("app.modules.notifications.service.send_email") as mock_send:
+        resp = _login_step1("email", email)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["otp_delivery_status"] == "sent"
+        assert body.get("dev_otp_code") is None
+        mock_dispatch.assert_called_once()  # unchanged backgrounded path
+        mock_send.assert_not_called()  # nothing sent synchronously/inline

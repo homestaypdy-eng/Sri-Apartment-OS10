@@ -7,6 +7,7 @@ Run with: pytest tests/test_notifications_completion.py -v
 """
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -156,9 +157,18 @@ def test_urgent_guest_request_escalates_past_threshold(headers):
     from app.db.session import SessionLocal
     from app.modules.portal.models import GuestRequest
     from app.modules.notifications.service import scan_and_send_escalations
+    from app.modules.settings.router import get_or_create_settings
 
     db = SessionLocal()
     try:
+        # trigger_guest_request_escalated() only logs/sends when a
+        # BusinessSettings row with a contact_email exists — get_or_create_settings
+        # lazily creates the singleton (with its real default contact_email)
+        # the same way every other trigger-dependent test in this codebase
+        # ensures it exists (see test_owner_and_whatsapp_notifications.py's
+        # _owner_emails helper), rather than relying on some earlier,
+        # unrelated test in the suite having already created it as a side effect.
+        get_or_create_settings(db)
         gr = GuestRequest(
             guest_id=uuid.UUID(guest["id"]), booking_id=uuid.UUID(booking["id"]), request_type="service",
             description="Urgent escalation test", priority="urgent", status="open",
@@ -168,7 +178,13 @@ def test_urgent_guest_request_escalates_past_threshold(headers):
         db.commit()
         db.refresh(gr)
         request_id = str(gr.id)
-        results = scan_and_send_escalations(db)
+        # SAFETY: this environment has a real, live email provider
+        # configured (EMAIL_PROVIDER=resend) — now that a real
+        # contact_email exists above, trigger_guest_request_escalated
+        # would otherwise attempt a genuine outbound send. Mocked at the
+        # source, matching the pattern used throughout this codebase.
+        with patch("app.modules.notifications.service.send_email", return_value=None):
+            results = scan_and_send_escalations(db)
     finally:
         db.close()
 
@@ -187,9 +203,11 @@ def test_escalation_scan_does_not_duplicate_on_rerun(headers):
     from app.db.session import SessionLocal
     from app.modules.portal.models import GuestRequest
     from app.modules.notifications.service import scan_and_send_escalations
+    from app.modules.settings.router import get_or_create_settings
 
     db = SessionLocal()
     try:
+        get_or_create_settings(db)  # see test_urgent_guest_request_escalates_past_threshold for why
         gr = GuestRequest(
             guest_id=uuid.UUID(guest["id"]), booking_id=uuid.UUID(booking["id"]), request_type="service",
             description="Dup escalation test", priority="urgent", status="open",
@@ -199,14 +217,71 @@ def test_escalation_scan_does_not_duplicate_on_rerun(headers):
         db.commit()
         db.refresh(gr)
         request_id = str(gr.id)
-        scan_and_send_escalations(db)
-        scan_and_send_escalations(db)
+        with patch("app.modules.notifications.service.send_email", return_value=None):
+            scan_and_send_escalations(db)
+            scan_and_send_escalations(db)
     finally:
         db.close()
 
     logs = client.get("/api/v1/notifications/logs", headers=headers, params={"event_type": "guest_request_escalated"}).json()
     matching = [l for l in logs if l["guest_request_id"] == request_id]
     assert len(matching) == 1
+
+
+def test_escalation_counter_does_not_count_requests_that_were_not_actually_logged(headers):
+    """Regression test for a real counter-accuracy bug found in a
+    production-readiness audit: scan_and_send_escalations() used to
+    increment results["guest_request_escalated"] unconditionally,
+    even when trigger_guest_request_escalated() returned None (no
+    BusinessSettings.contact_email configured -> nothing logged, nothing
+    sent) — so the returned count could claim escalations happened when
+    zero NotificationLog rows were actually written. Verified directly by
+    temporarily blanking contact_email on the real settings singleton to
+    an empty string, not None: the column is DB-enforced NOT NULL (it can
+    never actually be NULL in production), but trigger_guest_request_escalated's
+    own guard is `not settings_row.contact_email`, which an empty string
+    also satisfies — the same "not configured" branch a NULL would have
+    hit, reached without violating the schema (restored in `finally`,
+    never left mutated for other tests)."""
+    from app.db.session import SessionLocal
+    from app.modules.portal.models import GuestRequest
+    from app.modules.notifications.service import scan_and_send_escalations
+    from app.modules.settings.router import get_or_create_settings
+
+    prop = client.post("/api/v1/properties", headers=headers, json={"name": f"EscNoCfgProp {uuid.uuid4().hex[:6]}", "address": "Test", "state_code": "34"}).json()
+    unit = client.post("/api/v1/units", headers=headers, json={"property_id": prop["id"], "name": f"EscNoCfgUnit {uuid.uuid4().hex[:6]}", "base_rate": 2000}).json()
+    guest = client.post("/api/v1/guests", headers=headers, json={"name": "No-Config Escalation Guest", "phone": f"93{uuid.uuid4().int % 10**8:08d}"}).json()
+    check_in = date.today() + timedelta(days=12300)
+    booking = client.post("/api/v1/bookings", headers=headers, json={"unit_id": unit["id"], "guest_id": guest["id"], "check_in": check_in.isoformat(), "check_out": (check_in + timedelta(days=2)).isoformat()}).json()
+
+    db = SessionLocal()
+    try:
+        settings_row = get_or_create_settings(db)
+        original_contact_email = settings_row.contact_email
+        settings_row.contact_email = ""
+        db.commit()
+        try:
+            gr = GuestRequest(
+                guest_id=uuid.UUID(guest["id"]), booking_id=uuid.UUID(booking["id"]), request_type="service",
+                description="No business contact configured", priority="urgent", status="open",
+            )
+            gr.created_at = datetime.now(timezone.utc) - timedelta(hours=5)
+            db.add(gr)
+            db.commit()
+            db.refresh(gr)
+            request_id = str(gr.id)
+            with patch("app.modules.notifications.service.send_email", return_value=None) as mock_send:
+                results = scan_and_send_escalations(db)
+            mock_send.assert_not_called()
+        finally:
+            settings_row.contact_email = original_contact_email
+            db.commit()
+    finally:
+        db.close()
+
+    assert results["guest_request_escalated"] == 0
+    logs = client.get("/api/v1/notifications/logs", headers=headers, params={"event_type": "guest_request_escalated"}).json()
+    assert not any(l["guest_request_id"] == request_id for l in logs)
 
 
 def test_manual_escalation_scan_endpoint(headers):

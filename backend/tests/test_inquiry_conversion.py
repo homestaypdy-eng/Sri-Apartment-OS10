@@ -32,11 +32,11 @@ def _make_property(headers):
     return resp.json()["id"]
 
 
-def _make_unit(headers, property_id, base_rate=2500):
+def _make_unit(headers, property_id, base_rate=2500, max_occupancy=2):
     resp = client.post(
         "/api/v1/units",
         headers=headers,
-        json={"property_id": property_id, "name": f"ConvUnit {uuid.uuid4().hex[:6]}", "base_rate": base_rate},
+        json={"property_id": property_id, "name": f"ConvUnit {uuid.uuid4().hex[:6]}", "base_rate": base_rate, "max_occupancy": max_occupancy},
     )
     assert resp.status_code == 201
     return resp.json()["id"]
@@ -67,6 +67,25 @@ def test_conversion_requires_advance_payment(headers):
     resp = client.post(f"/api/v1/inquiries/{inquiry['id']}/convert-to-booking", headers=headers, json={})
     assert resp.status_code == 400
     assert "advance" in resp.json()["detail"].lower()
+
+
+def test_inquiry_conversion_enforces_guest_count_capacity(headers):
+    property_id = _make_property(headers)
+    unit_id = _make_unit(headers, property_id, max_occupancy=1)
+    inquiry = _make_inquiry(headers, unit_id, f"98{uuid.uuid4().int % 10**8:08d}", "2038-01-01", "2038-01-03", num_guests=2)
+    response = client.post(f"/api/v1/inquiries/{inquiry['id']}/convert-to-booking", headers=headers, json={})
+    assert response.status_code == 422
+    assert "maximum occupancy" in response.json()["detail"]
+    assert client.get(f"/api/v1/inquiries/{inquiry['id']}", headers=headers).json()["booking_id"] is None
+
+
+def test_inquiry_guest_count_must_be_positive(headers):
+    response = client.post("/api/v1/inquiries", headers=headers, json={
+        "client_name": "Invalid Count", "client_phone": f"98{uuid.uuid4().int % 10**8:08d}",
+        "flat_room_label": "Test Room", "check_in_date": "2038-02-01", "check_out_date": "2038-02-02",
+        "rate_per_night": 2000, "num_guests": 0,
+    })
+    assert response.status_code == 422
 
 
 def test_successful_conversion_creates_booking_guest_payment(headers):

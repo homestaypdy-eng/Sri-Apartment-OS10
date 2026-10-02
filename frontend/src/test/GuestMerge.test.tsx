@@ -63,8 +63,8 @@ async function openGuestDetailAs(role: string) {
       </AuthProvider>
     </MemoryRouter>
   );
-  await waitFor(() => expect(screen.getByRole("button", { name: "View / Edit" })).toBeInTheDocument());
-  await user.click(screen.getByRole("button", { name: "View / Edit" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "View / Edit →" })).toBeInTheDocument());
+  await user.click(screen.getByRole("button", { name: "View / Edit →" }));
   await waitFor(() => expect(screen.getByRole("button", { name: /Mark VIP/ })).toBeInTheDocument());
   return user;
 }

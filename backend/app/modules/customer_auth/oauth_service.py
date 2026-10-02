@@ -226,7 +226,9 @@ def resolve_customer_for_oauth(
     from app.modules.customer_auth.service import create_customer_account_via_oauth
 
     signup_email = email if (email and email_verified) else f"{provider}-{subject}@oauth.invalid"
-    new_account = create_customer_account_via_oauth(db, signup_email, first_name, last_name)
+    new_account = create_customer_account_via_oauth(
+        db, signup_email, first_name, last_name, email_verified=bool(email and email_verified),
+    )
     link_social_identity(db, new_account.id, provider, subject, email)
     db.commit()
     db.refresh(new_account)

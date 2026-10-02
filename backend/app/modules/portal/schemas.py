@@ -31,9 +31,43 @@ class GuestProfileOut(BaseModel):
     name: str
     phone: str
     email: str | None
+    # Identity Verification, read-only — entirely separate from this
+    # session's own login (which only ever proved control of the
+    # magic-link's delivery channel; see get_current_guest). Never implies
+    # "identity verified" just because this profile call succeeded.
+    identity_status: str = "not_required"
 
     class Config:
         from_attributes = True
+
+
+class GuestIdentityStatusOut(BaseModel):
+    """
+    Guest-facing Identity Verification view — deliberately narrower than
+    the OS10 staff-side GuestOut: never exposes identity_verified_by (an
+    internal user id) or the admin's raw identity_rejection_reason
+    (section 21 — an internal review note isn't guest-facing by design;
+    a rejected guest instead gets `message`, a fixed, generic string).
+    """
+    status: str
+    document_type: str | None = None  # type of the most recently uploaded document, if any
+    document_id: uuid.UUID | None = None  # caller's own document, for a later submission request
+    verified_at: datetime | None = None
+    message: str | None = None  # set only when status == "rejected"
+
+
+class GuestIdentityDocumentOut(BaseModel):
+    id: uuid.UUID
+    document_type: str
+    filename: str
+    uploaded_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class GuestIdentitySubmitRequest(BaseModel):
+    document_id: uuid.UUID
 
 
 class GuestBookingOut(BaseModel):

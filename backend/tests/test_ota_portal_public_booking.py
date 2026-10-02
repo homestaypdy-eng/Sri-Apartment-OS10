@@ -440,9 +440,138 @@ def test_public_quote_invalid_promo_rejected(headers):
     assert resp.status_code == 400
 
 
+def test_public_availability_estimated_total_matches_canonical_quote_with_seasonal_rate(headers):
+    """
+    Dynamic Pricing hardening: GET /public/availability used to compute
+    estimated_total as a naive base_rate*nights, completely ignoring
+    seasonal rates/weekend rates/long-stay discounts — silently disagreeing
+    with GET /public/quote (and therefore with what a guest is actually
+    charged) whenever any of those applied. Both endpoints must now agree
+    exactly, since both go through the same _get_full_price_quote helper.
+    """
+    _, unit_id = _make_property_and_unit(headers, base_rate=1500)
+    check_in = date.today() + timedelta(days=300)
+    check_out = check_in + timedelta(days=2)
+    seasonal = client.post(
+        f"/api/v1/units/{unit_id}/seasonal-rates", headers=headers,
+        json={"name": "Peak Season", "start_date": check_in.isoformat(), "end_date": check_out.isoformat(), "rate_per_night": 9999},
+    )
+    assert seasonal.status_code == 201, seasonal.text
+
+    availability = client.get("/api/v1/public/availability", params={"unit_id": unit_id, "check_in": check_in.isoformat(), "check_out": check_out.isoformat()})
+    assert availability.status_code == 200
+    quote = client.get("/api/v1/public/quote", params={"unit_id": unit_id, "check_in": check_in.isoformat(), "check_out": check_out.isoformat()})
+    assert quote.status_code == 200
+
+    # 2 nights at the seasonal rate = 19998, NOT the naive 1500*2 = 3000
+    # the old formula would have returned.
+    assert availability.json()["estimated_total"] == 19998.0
+    assert availability.json()["estimated_total"] == quote.json()["subtotal_after_discount"]
+
+
+def test_promo_code_negative_value_rejected(headers):
+    resp = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": f"NEG{uuid.uuid4().hex[:6].upper()}", "discount_type": "flat", "value": -500,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    assert resp.status_code == 422
+
+
+def test_promo_code_zero_value_rejected(headers):
+    resp = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": f"ZERO{uuid.uuid4().hex[:6].upper()}", "discount_type": "percent", "value": 0,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    assert resp.status_code == 422
+
+
+def test_promo_code_percent_over_100_rejected_on_create(headers):
+    """A percent discount above 100 would produce a negative subtotal_after_promo
+    (discount exceeding the price) — compute_discount only clamps 'flat'
+    discounts to the subtotal, not 'percent' ones, so this must be rejected
+    up front at creation."""
+    resp = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": f"OVER{uuid.uuid4().hex[:6].upper()}", "discount_type": "percent", "value": 150,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    assert resp.status_code == 422
+
+
+def test_promo_code_percent_over_100_rejected_on_update(headers):
+    """Same bound enforced on PATCH, against the EFFECTIVE post-merge state
+    — a request that only sends `value` on an existing discount_type=
+    'percent' promo must still be bounded."""
+    code = f"UPD{uuid.uuid4().hex[:6].upper()}"
+    create = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": code, "discount_type": "percent", "value": 10,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    promo_id = create.json()["id"]
+    resp = client.patch(f"/api/v1/promo-codes/{promo_id}", headers=headers, json={"value": 250})
+    assert resp.status_code == 400
+
+    # Confirm nothing was actually changed by the rejected update.
+    validate = client.post("/api/v1/public/promo/validate", json={"code": code, "subtotal": 1000})
+    assert validate.json()["discount_amount"] == 100.0  # still the original 10%
+
+
+def test_promo_code_valid_to_before_valid_from_rejected(headers):
+    resp = client.post("/api/v1/promo-codes", headers=headers, json={
+        "code": f"DATE{uuid.uuid4().hex[:6].upper()}", "discount_type": "flat", "value": 100,
+        "valid_from": "2027-06-10", "valid_to": "2027-06-01",
+    })
+    assert resp.status_code == 422
+
+
+def test_anonymous_cannot_create_promo_code():
+    resp = client.post("/api/v1/promo-codes", json={
+        "code": f"ANON{uuid.uuid4().hex[:6].upper()}", "discount_type": "flat", "value": 500,
+        "valid_from": "2020-01-01", "valid_to": "2099-01-01",
+    })
+    assert resp.status_code == 401
+
+
+def test_anonymous_cannot_create_seasonal_rate(headers):
+    _, unit_id = _make_property_and_unit(headers)
+    resp = client.post(f"/api/v1/units/{unit_id}/seasonal-rates", json={
+        "name": "Anon Attempt", "start_date": "2027-01-01", "end_date": "2027-01-05", "rate_per_night": 9999,
+    })
+    assert resp.status_code == 401
+
+
+def test_hold_cannot_be_manipulated_via_extra_pricing_fields(headers):
+    """Adversarial check (Dynamic Pricing hardening): a public hold request
+    cannot inject a discount amount, a pricing-rule id, or a per-unit price
+    override — CreateHoldRequest has no such fields, so FastAPI/Pydantic
+    silently drops them and the server computes the total from scratch."""
+    _, unit_id = _make_property_and_unit(headers, base_rate=2000)
+    check_in = date.today() + timedelta(days=470)
+    check_out = check_in + timedelta(days=2)  # 2 nights x 2000 = 4000 + 5% GST = 4200
+
+    fake_order_id = f"order_{uuid.uuid4().hex[:12]}"
+    with patch("app.modules.public_booking.router.create_order") as mock_order:
+        mock_order.return_value = {"id": fake_order_id}
+        resp = client.post("/api/v1/public/holds", json={
+            "unit_id": str(unit_id),
+            "check_in": check_in.isoformat(),
+            "check_out": check_out.isoformat(),
+            "guest_name": "Rule Hack Attempt",
+            "guest_phone": f"71{uuid.uuid4().int % 10**8:08d}",
+            "guest_email": "rulehack@example.com",
+            "discount_amount": 4000.0,      # attacker-supplied — must be ignored
+            "discount_percent": 100,        # attacker-supplied — must be ignored
+            "pricing_rule_id": str(uuid.uuid4()),  # attacker-supplied — must be ignored
+            "unit_price": 1.0,              # attacker-supplied — must be ignored
+            "rate_per_night": 1.0,          # attacker-supplied — must be ignored
+        })
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["amount"] == 4200.0
+
+
 def test_hold_requires_razorpay_configuration(headers, monkeypatch):
     """POST /holds returns 501 when Razorpay credentials are not configured."""
     from app.core.config import settings
+    from app.modules.payment_gateway import service as gateway_service
     # WEBSITE-04A: force the not-configured path explicitly — real
     # RAZORPAY_KEY_ID/SECRET are legitimately configured in this
     # environment since WEBSITE-03, so the ambient state can no longer be
@@ -450,6 +579,12 @@ def test_hold_requires_razorpay_configuration(headers, monkeypatch):
     # Razorpay's TEST API during the test suite).
     monkeypatch.setattr(settings, "razorpay_key_id", "")
     monkeypatch.setattr(settings, "razorpay_key_secret", "")
+    # Pin the route to the real gateway function and the same configuration
+    # object that function reads. This test must not inherit a patched order
+    # factory from another public-booking scenario in the full suite.
+    monkeypatch.setattr(gateway_service.settings, "razorpay_key_id", "")
+    monkeypatch.setattr(gateway_service.settings, "razorpay_key_secret", "")
+    monkeypatch.setattr("app.modules.public_booking.router.create_order", gateway_service.create_order)
     _, unit_id = _make_property_and_unit(headers, base_rate=2000)
     resp = client.post("/api/v1/public/holds", json={
         "unit_id": unit_id,
@@ -457,5 +592,6 @@ def test_hold_requires_razorpay_configuration(headers, monkeypatch):
         "check_out": (date.today() + timedelta(days=183)).isoformat(),
         "guest_name": "Hold Tester",
         "guest_phone": f"89{uuid.uuid4().int % 10**8:08d}",
+        "guest_email": "holdtester@example.com",
     })
     assert resp.status_code == 501
