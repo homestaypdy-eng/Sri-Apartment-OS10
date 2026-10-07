@@ -60,6 +60,7 @@ from app.modules.bookings import cancellation_service
 from app.modules.bookings.models import Booking, Guest
 from app.modules.notifications.service import dispatch_cancellation_notifications
 from app.modules.payments.models import Payment
+from app.modules.portal.auth_service import normalize_phone
 from app.modules.properties.models import Unit
 from app.modules.zotel import client
 from app.modules.zotel.client import ZotelAPIError, ZotelNotConfiguredError
@@ -198,9 +199,24 @@ def _extract_customer(detail: dict) -> dict:
         first = customer.get("first_name", "")
         last = customer.get("last_name", "")
         name = f"{first} {last}".strip() or "Zotel Guest"
+    # Normalize the incoming phone to OS10's canonical Guest.phone form
+    # (bare national digits, no country code — see
+    # portal.auth_service.normalize_phone) BEFORE it is used to match or
+    # create a Guest. Zotel hands us whatever shape the OTA captured
+    # ("+91 98765 43210", "919876543210", "098765 43210", or a tel:+91...
+    # target); normalize_phone strips to digits and drops the country
+    # code / trunk prefix so every one of those converges to the same
+    # value an OS10-native guest is already stored under. Without this the
+    # raw OTA string never equals the stored bare-10-digit Guest.phone, so
+    # _find_or_create_guest silently creates a DUPLICATE guest on every
+    # import. An absent/blank phone is left blank here — not back-filled
+    # with a fabricated number; _find_or_create_guest keeps its existing
+    # "unknown" sentinel for that case.
+    raw_phone = customer.get("phone") or ""
+    phone = normalize_phone(raw_phone) if raw_phone else ""
     return {
         "name": name,
-        "phone": customer.get("phone") or "",
+        "phone": phone,
         "email": customer.get("email"),
     }
 

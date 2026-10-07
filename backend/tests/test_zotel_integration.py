@@ -459,6 +459,54 @@ def test_sync_is_idempotent_on_repeated_runs_for_same_transaction_id(headers, co
         db.close()
 
 
+def test_sync_reuses_existing_guest_when_ota_phone_has_country_code(headers, configured_zotel):
+    """Regression: the Zotel import must normalize the OTA customer phone to
+    OS10's canonical Guest.phone convention (bare national digits, no country
+    code) BEFORE matching/creating a Guest. A guest already stored under
+    "9876543210" must be REUSED for a Zotel reservation whose customer phone
+    is the country-code form "+91 98765 43210" of the same number — not have
+    a duplicate Guest row created on every import."""
+    db = _db_session()
+    try:
+        _, unit_id = _make_property_and_unit(headers)
+        room_type_id = f"rt-{uuid.uuid4().hex[:8]}"
+        _mapping_for(db, unit_id, room_type_id)
+
+        # Pre-create an OS10-native guest stored under the bare-10-digit form.
+        existing_guest = api_client.post(
+            "/api/v1/guests", headers=headers,
+            json={"name": "Canonical Guest", "phone": "9876543210"},
+        ).json()
+        existing_guest_id = uuid.UUID(existing_guest["id"])
+
+        guests_before = db.scalars(select(Guest).where(Guest.phone == "9876543210")).all()
+        assert len(guests_before) == 1  # exactly the one we just created
+
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=620)
+        check_out = check_in + timedelta(days=2)
+        # Country-code-prefixed, spaced OTA form of the SAME number.
+        detail = _fake_detail(txn_id, room_type_id, check_in, check_out)
+        detail["data"]["customer"]["phone"] = "+91 98765 43210"
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=detail):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_imported == 1
+
+        # No second Guest row for this number — the existing one was reused.
+        guests_after = db.scalars(select(Guest).where(Guest.phone == "9876543210")).all()
+        assert len(guests_after) == 1
+        assert guests_after[0].id == existing_guest_id
+
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is not None
+        assert booking.guest_id == existing_guest_id  # linked to the pre-existing guest
+    finally:
+        db.close()
+
+
 def test_sync_does_not_overwrite_existing_confirmed_os10_booking_on_conflict(headers, configured_zotel):
     """A Zotel reservation whose dates overlap an existing, unrelated OS10
     booking must never silently take over that unit — it's logged as
