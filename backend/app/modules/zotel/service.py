@@ -50,12 +50,14 @@ WHAT THIS FILE DELIBERATELY DOES NOT DO:
   nothing operationally irreversible has happened locally yet).
 """
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.modules.bookings import cancellation_service
 from app.modules.bookings.models import Booking, Guest
 from app.modules.notifications.service import dispatch_cancellation_notifications
@@ -68,6 +70,58 @@ from app.shared.availability import lock_unit_for_reservation, unit_is_available
 from app.shared.occupancy import enforce_unit_max_occupancy
 
 logger = logging.getLogger("sri_apartment_os")
+
+# Derive the real DB column limit for Guest.phone (String(20)); fall back to 20.
+_MAX_PHONE_LEN = getattr(Guest.phone.property.columns[0].type, "length", None) or 20
+
+# Zotel sometimes wraps a number as "<tel:+E164|human display>".
+_TEL_URI_RE = re.compile(r"<tel:([^|>]+)\|[^>]*>", re.IGNORECASE)
+
+
+def _canonicalize_phone(value: str) -> str:
+    """Reduce a cleaned phone string to the OS10 convention.
+
+    Indian numbers collapse to the bare 10-digit form (matching
+    portal.normalize_phone); valid non-Indian numbers keep a stable
+    E.164-style identity with the leading '+'. Output never exceeds the
+    Guest.phone column width.
+    """
+    has_plus = value.strip().startswith("+")
+    digits = "".join(c for c in value if c.isdigit())
+    if not digits:
+        return ""
+    cc = settings.default_country_code  # e.g. "91"
+    if len(digits) == len(cc) + 10 and digits.startswith(cc):
+        return digits[len(cc):]
+    if len(digits) == 11 and digits.startswith("0"):
+        return digits[1:]
+    if len(digits) == 10:
+        return digits
+    candidate = ("+" + digits) if has_plus else digits
+    return candidate[:_MAX_PHONE_LEN]
+
+
+def _normalize_zotel_phone(raw: object) -> str:
+    """Safely normalize a Zotel-supplied phone value for Guest lookup/storage.
+
+    Returns "" when the value is missing or too ambiguous to trust, so the
+    caller falls back to the 'unknown' placeholder instead of fabricating an
+    identity. The result is always safe to store in Guest.phone.
+    """
+    if raw is None:
+        return ""
+    value = str(raw).strip()
+    if not value:
+        return ""
+    if "<tel:" in value.lower():
+        # A trustworthy wrapped value is EXACTLY one <tel:...|...> token.
+        # Extra content around it (e.g. "+91 <tel:+33...|...>") is
+        # ambiguous/untrusted — never invent a number from it.
+        match = _TEL_URI_RE.fullmatch(value)
+        if match is None:
+            return ""
+        value = match.group(1).strip()
+    return _canonicalize_phone(value)
 
 # Reservation lifecycle states this file treats as "still open" locally —
 # an OS10 booking imported from Zotel that has moved past this set has had
@@ -200,17 +254,22 @@ def _extract_customer(detail: dict) -> dict:
         name = f"{first} {last}".strip() or "Zotel Guest"
     return {
         "name": name,
-        "phone": customer.get("phone") or "",
+        "phone": _normalize_zotel_phone(customer.get("phone")),
         "email": customer.get("email"),
     }
 
 
 def _find_or_create_guest(db: Session, customer: dict) -> Guest:
     guest = None
-    if customer["phone"]:
-        guest = db.scalar(select(Guest).where(Guest.phone == customer["phone"]))
+    phone = customer["phone"]               # already normalized by _extract_customer
+    if phone:
+        guest = db.scalar(select(Guest).where(Guest.phone == phone))
     if guest is None:
-        guest = Guest(name=customer["name"], phone=customer["phone"] or "unknown", email=customer.get("email"))
+        guest = Guest(
+            name=customer["name"],
+            phone=(phone or "unknown")[:_MAX_PHONE_LEN],
+            email=customer.get("email"),
+        )
         db.add(guest)
         db.flush()
     return guest
