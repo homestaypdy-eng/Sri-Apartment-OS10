@@ -21,7 +21,7 @@ Covers:
 - reconciliation report is read-only (no DB writes) and correctly categorizes matched/missing/duplicate/cancelled-mismatch
 """
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -581,6 +581,250 @@ def test_cancelled_new_reservation_is_skipped_not_imported(headers, configured_z
         assert sync_log.records_skipped == 1
         booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
         assert booking is None
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# New-reservation import policy: status + stay-recency gate
+# (applies ONLY to brand-new reservations with no existing OS10 booking;
+# reconciliation of an already-imported booking is unaffected — see the
+# dedicated regression at the end of this block.) "today" is computed with
+# the same timezone-aware convention the service uses
+# (datetime.now(timezone.utc).date()).
+# ---------------------------------------------------------------------------
+
+def _mapped_unit(headers, db):
+    _, unit_id = _make_property_and_unit(headers)
+    room_type_id = f"rt-{uuid.uuid4().hex[:8]}"
+    _mapping_for(db, unit_id, room_type_id)
+    return unit_id, room_type_id
+
+
+def test_new_reservation_completed_status_is_skipped_not_imported(headers, configured_zotel):
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=700)
+        check_out = check_in + timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="completed")):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_skipped == 1
+        assert sync_log.records_imported == 0
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is None
+    finally:
+        db.close()
+
+
+def test_new_reservation_enquired_status_is_skipped_not_imported(headers, configured_zotel):
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=705)
+        check_out = check_in + timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="enquired")):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_skipped == 1
+        assert sync_log.records_imported == 0
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is None
+    finally:
+        db.close()
+
+
+def test_new_reservation_cancelled_status_is_skipped_not_imported_regression(headers, configured_zotel):
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=710)
+        check_out = check_in + timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="cancelled")):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_skipped == 1
+        assert sync_log.records_imported == 0
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is None
+    finally:
+        db.close()
+
+
+def test_new_reservation_created_status_future_checkout_is_imported_confirmed(headers, configured_zotel):
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=715)
+        check_out = check_in + timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="created")):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_imported == 1
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is not None
+        assert booking.status == "confirmed"
+        assert booking.source == "zotel"
+        assert booking.unit_id == uuid.UUID(unit_id)
+    finally:
+        db.close()
+
+
+def test_new_reservation_modified_status_future_checkout_is_imported_confirmed(headers, configured_zotel):
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=720)
+        check_out = check_in + timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="modified")):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_imported == 1
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is not None
+        assert booking.status == "confirmed"
+        assert booking.source == "zotel"
+    finally:
+        db.close()
+
+
+def test_new_reservation_confirmed_status_future_checkout_is_imported_confirmed(headers, configured_zotel):
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=725)
+        check_out = check_in + timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="confirmed")):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_imported == 1
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is not None
+        assert booking.status == "confirmed"
+        assert booking.source == "zotel"
+    finally:
+        db.close()
+
+
+def test_new_reservation_created_status_historical_checkout_is_skipped(headers, configured_zotel):
+    """A brand-new active-status reservation whose stay is already in the
+    past (check_out on or before today) is a historical record, not a
+    future booking — it is skipped, never imported. No Booking is created,
+    so the past-date CHECK/EXCLUDE constraints are never exercised."""
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        today = datetime.now(timezone.utc).date()
+        check_in = today - timedelta(days=6)
+        check_out = today - timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="created")):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_skipped == 1
+        assert sync_log.records_imported == 0
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is None
+    finally:
+        db.close()
+
+
+def test_new_reservation_unknown_status_is_conflicted_not_imported(headers, configured_zotel):
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=730)
+        check_out = check_in + timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="garbage_unknown")):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_conflicted == 1
+        assert sync_log.records_imported == 0
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is None
+    finally:
+        db.close()
+
+
+def test_new_reservation_missing_status_is_conflicted_not_imported(headers, configured_zotel):
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=735)
+        check_out = check_in + timedelta(days=2)
+
+        # Build a normal detail then overwrite status to None, mirroring a
+        # Zotel response that omits/nulls the status field entirely.
+        detail = _fake_detail(txn_id, room_type_id, check_in, check_out, status="created")
+        detail["data"]["status"] = None
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=detail):
+            sync_log = zotel_service.sync_bookings(db)
+
+        assert sync_log.records_conflicted == 1
+        assert sync_log.records_imported == 0
+        booking = db.scalar(select(Booking).where(Booking.external_reservation_id == txn_id))
+        assert booking is None
+    finally:
+        db.close()
+
+
+def test_new_import_gate_does_not_affect_reconciliation_of_existing_booking(headers, configured_zotel):
+    """Regression: the new-reservation status gate must NOT touch an
+    already-imported booking. Import an active future reservation, then
+    re-sync the SAME transaction id reporting 'completed'. The second run
+    must take the existing-booking reconciliation path (not the new-import
+    'completed -> skip' branch) and leave exactly one Booking in place."""
+    db = _db_session()
+    try:
+        unit_id, room_type_id = _mapped_unit(headers, db)
+        txn_id = f"txn-{uuid.uuid4().hex[:10]}"
+        check_in = date.today() + timedelta(days=740)
+        check_out = check_in + timedelta(days=2)
+
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="created")):
+            first_run = zotel_service.sync_bookings(db)
+        assert first_run.records_imported == 1
+
+        # Re-sync same txn id as "completed". A completed re-sync of an
+        # already-confirmed booking is a no-op reconciliation (no date/unit
+        # change, not a cancellation) and does not dispatch notifications.
+        with patch("app.modules.zotel.client.get_all_bookings", return_value=[_fake_summary(txn_id)]), \
+             patch("app.modules.zotel.client.get_booking_detail", return_value=_fake_detail(txn_id, room_type_id, check_in, check_out, status="completed")):
+            second_run = zotel_service.sync_bookings(db)
+
+        # Reconciliation path, not the new-import skip: booking preserved.
+        assert second_run.records_skipped == 1
+        bookings = db.scalars(select(Booking).where(Booking.external_reservation_id == txn_id)).all()
+        assert len(bookings) == 1
+        assert bookings[0].status == "confirmed"
     finally:
         db.close()
 

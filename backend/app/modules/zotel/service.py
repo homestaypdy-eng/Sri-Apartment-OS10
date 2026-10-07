@@ -131,6 +131,22 @@ def _normalize_zotel_phone(raw: object) -> str:
 # handled separately and only from this same state).
 SAFE_TO_AUTO_UPDATE_STATUSES = ("confirmed",)
 
+# New-reservation import policy (applies ONLY to a brand-new Zotel
+# reservation with no existing OS10 booking for its transaction id — NOT
+# to reconciliation of an already-imported booking, which is handled by
+# _reconcile_existing and left deliberately unchanged). Statuses are
+# normalized (stripped + lowercased) before comparison.
+#   - SKIP: terminal/non-bookable states that aren't worth occupying a
+#     slot for (cancelled/completed/enquired) — nothing to protect.
+#   - ACTIVE: states that represent a live reservation worth importing as
+#     an OS10 "confirmed" booking, but only when the stay is still in the
+#     future (check_out strictly after today).
+# Any status outside both sets (or a missing/None status) is treated as
+# unrecognized and flagged "conflicted" for manual review rather than
+# guessed at.
+ZOTEL_NEW_IMPORT_SKIP_STATUSES = ("cancelled", "completed", "enquired")
+ZOTEL_NEW_IMPORT_ACTIVE_STATUSES = ("created", "modified", "confirmed")
+
 # Stable, application-specific PostgreSQL session advisory-lock key (ASCII
 # "ZOTELSYN"). It is constant across every worker and never comes from input.
 ZOTEL_SYNC_ADVISORY_LOCK_KEY = 0x5A4F54454C53594E
@@ -470,10 +486,34 @@ def _import_one(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: 
     if existing is not None:
         return _reconcile_existing(db, sync_log, existing, zotel_status, check_in, check_out, data, mapping.unit_id)
 
-    # New reservation. Cancelled-on-arrival reservations aren't worth
-    # occupying a slot for — nothing to protect, nothing to book.
-    if zotel_status == "cancelled":
-        return _record(sync_log.id, transaction_id, "skipped", None, "Zotel reservation is already cancelled; not imported")
+    # New reservation. Gate import by the Zotel reservation status and the
+    # stay's recency (see ZOTEL_NEW_IMPORT_* constants above). This policy
+    # applies ONLY to the new-reservation path — reconciliation of an
+    # already-imported booking is handled above by _reconcile_existing and
+    # is intentionally left untouched.
+    normalized = (zotel_status or "").strip().lower()
+    if normalized in ZOTEL_NEW_IMPORT_SKIP_STATUSES:
+        return _record(
+            sync_log.id, transaction_id, "skipped", None,
+            f"Zotel reservation status '{normalized}' is not imported as a new booking",
+        )
+    if normalized in ZOTEL_NEW_IMPORT_ACTIVE_STATUSES:
+        today = datetime.now(timezone.utc).date()
+        if check_out <= today:
+            return _record(
+                sync_log.id, transaction_id, "skipped", None,
+                f"Historical Zotel reservation (check_out {check_out} on or before today); not imported",
+            )
+        # Active, future-dated reservation: fall through into the existing
+        # import logic below (unit-status check, locking, availability,
+        # occupancy, guest/booking creation, payment capture).
+    else:
+        # Unknown status, or a missing/None status — never guess; flag it
+        # for a human to review rather than create a booking.
+        return _record(
+            sync_log.id, transaction_id, "conflicted", None,
+            f"Unrecognized Zotel reservation status {zotel_status!r}; flagged for manual review",
+        )
 
     # Phase 5A: checked explicitly, before the overlap check, so the
     # detail message tells staff WHY this was rejected (maintenance/
