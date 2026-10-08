@@ -723,7 +723,7 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
         for d in descriptors:
             if not d["allocatable"] or d["booking"] is None:
                 continue
-            _maybe_record_payment(db, d["booking"], data, paid_by_idx.get(d["idx"], 0) / 100.0)
+            _maybe_record_payment(db, d["booking"], data, paid_by_idx.get(d["idx"], 0))
 
     return records
 
@@ -873,31 +873,62 @@ def _reconcile_existing(db: Session, sync_log: ZotelSyncLog, booking: Booking, z
     return _record(sync_log.id, booking.external_reservation_id, "skipped", booking.id, "No safe change detected; already in sync")
 
 
-def _maybe_record_payment(db: Session, booking: Booking, data: dict, amount: float) -> None:
-    """Record this room-booking's allocated share of the single reservation
-    payment. `amount` is the per-room share the caller computed from the
-    reservation-level paid_amount (exact minor-unit allocation — see
-    _import_reservation), NEVER the full paid_amount per room. Only records a
-    positive share, and never a second time for the same booking (so a re-sync
-    cannot double it)."""
-    if amount is None or round(float(amount), 2) <= 0:
-        return
-    already = db.scalar(
-        select(Payment.id).where(
+# Tolerance (in integer paise) below which a target-vs-recorded difference is
+# treated as rounding noise and not acted on. Keeps delta recording stable
+# against sub-paise float representation of rupee amounts.
+_PAYMENT_DELTA_TOLERANCE_MINOR = 1
+
+
+def _maybe_record_payment(db: Session, booking: Booking, data: dict, target_minor: int) -> None:
+    """Record this room-booking's allocated share of the reservation payment,
+    DELTA-BASED and idempotent. `target_minor` is the per-room share in exact
+    integer paise the caller computed from the reservation-level paid_amount
+    (see _import_reservation's _allocate_minor_units), NEVER the full
+    paid_amount per room.
+
+    Behaviour:
+      - target - recorded > 1 paise  -> insert ONE new mode="zotel" Payment row
+        for the delta (so a later Zotel installment / top-up, where paid_amount
+        INCREASED, is captured — the previous silent under-recording is fixed).
+      - target <= recorded           -> no-op (an unchanged re-sync never
+        double-records; the row is still recorded exactly once overall).
+      - recorded > target            -> an OTA amount DECREASE is NEVER
+        auto-reversed with a negative row here; it is only logged and left for
+        run_reconciliation to surface as an amount_mismatch. Conservative by
+        design — money already recorded is not silently clawed back.
+
+    `recorded` is the sum of this booking's existing POSITIVE mode="zotel"
+    Payment rows, measured in the same exact integer paise unit (via _to_minor)
+    so the comparison never drifts on float rupee representation."""
+    existing = db.scalars(
+        select(Payment).where(
             Payment.booking_id == booking.id, Payment.mode == "zotel", Payment.amount > 0
-        ).limit(1)
-    )
-    if already is not None:
-        return
-    payment = Payment(
-        booking_id=booking.id,
-        amount=round(float(amount), 2),
-        mode="zotel",
-        status="completed",
-        reference_no=data.get("transaction_id"),
-    )
-    db.add(payment)
-    db.flush()
+        )
+    ).all()
+    recorded_minor = sum(_to_minor(p.amount) for p in existing)
+    delta_minor = int(target_minor) - recorded_minor
+
+    if delta_minor > _PAYMENT_DELTA_TOLERANCE_MINOR:
+        payment = Payment(
+            booking_id=booking.id,
+            amount=round(delta_minor / 100.0, 2),
+            mode="zotel",
+            status="completed",
+            reference_no=data.get("transaction_id"),
+        )
+        db.add(payment)
+        db.flush()
+    elif delta_minor < -_PAYMENT_DELTA_TOLERANCE_MINOR:
+        # OTA-reported amount decreased below what OS10 already recorded.
+        # Do NOT write a negative/reversing row automatically — leave it for
+        # reconciliation (run_reconciliation) to flag as an amount_mismatch.
+        logger.warning(
+            "Zotel import: reservation %s booking %s already has recorded zotel payments "
+            "(%d paise) exceeding the current allocated share (%d paise); not auto-reversing — "
+            "reconciliation will flag this as an amount mismatch.",
+            data.get("transaction_id"), booking.id, recorded_minor, int(target_minor),
+        )
+    # else: within tolerance -> idempotent no-op (already recorded in full).
 
 
 def _persist_reconciliation_log(db: Session, triggered_by: uuid.UUID | None, records_fetched: int, summary: dict, errored: bool, error_message: str | None) -> None:
