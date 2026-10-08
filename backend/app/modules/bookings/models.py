@@ -172,10 +172,20 @@ class Booking(Base):
     archive_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Zotel channel-manager sync identity — Zotel's transaction_id for a
     # booking imported from Zotel (see app/modules/zotel/service.py).
-    # Null for every direct/walk-in/phone/website booking. Unique when
-    # set (see additive_migrations.py) so the same reservation fetched
-    # on a later sync is found and reconciled, never re-created.
+    # Null for every direct/walk-in/phone/website booking. A single Zotel
+    # reservation (transaction_id) can contain multiple rooms, each imported
+    # as its own OS10 booking — so external_reservation_id is NOT unique on
+    # its own. Per-room identity is external_room_id below; idempotency is the
+    # composite (external_reservation_id, external_room_id), enforced by a
+    # partial unique index (see additive_migrations.py) so the same room of
+    # the same reservation fetched on a later sync is found and reconciled,
+    # never re-created.
     external_reservation_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Stable per-room identity within a Zotel reservation (Zotel's own room id
+    # when present, else a deterministic category-sequence key — see
+    # zotel/service.py::_room_external_id). Null for non-Zotel bookings and
+    # for legacy single-room Zotel imports made before this column existed.
+    external_room_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     unit = relationship("Unit")
     guest = relationship("Guest")

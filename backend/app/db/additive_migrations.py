@@ -289,7 +289,23 @@ MIGRATION_STATEMENTS = [
     # other optional identifier column added here. Unique only when set,
     # same partial-index pattern as customer_accounts.phone above.
     "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS external_reservation_id VARCHAR(100)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS ix_bookings_external_reservation_id_unique ON bookings (external_reservation_id) WHERE external_reservation_id IS NOT NULL",
+    # Multi-room Zotel reservations: one transaction_id can produce N OS10
+    # bookings (one per room), so external_reservation_id is no longer unique
+    # on its own. external_room_id carries the stable per-room identity (see
+    # zotel/service.py::_room_external_id); idempotency is now the COMPOSITE
+    # (external_reservation_id, external_room_id). Nullable — every existing
+    # direct/walk-in/phone/website booking (and any legacy single-room Zotel
+    # import made before this column existed) simply has none.
+    "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS external_room_id VARCHAR(100)",
+    # The old single-column unique would now be violated by a multi-room
+    # reservation (N rows sharing one external_reservation_id). Drop it and
+    # replace it with the composite partial unique. Defensive/idempotent, same
+    # style as the rest of this file — safe to run twice, and safe on a fresh
+    # database where the old index was never created.
+    "DROP INDEX IF EXISTS ix_bookings_external_reservation_id_unique",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_bookings_external_reservation_room_unique "
+    "ON bookings (external_reservation_id, external_room_id) "
+    "WHERE external_reservation_id IS NOT NULL AND external_room_id IS NOT NULL",
     # Booking-notification audit: second owner contact, additive alongside
     # the existing contact_email/whatsapp_business_number (which remain the
     # primary contact, unchanged). Nullable so a fresh install without a

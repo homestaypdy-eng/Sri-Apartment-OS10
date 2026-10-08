@@ -405,7 +405,10 @@ def _sync_bookings_locked(db: Session, triggered_by: uuid.UUID | None = None, st
             continue
 
         data = detail.get("data") or {}
-        records.append(_import_one(db, sync_log, transaction_id, data))
+        # A single Zotel reservation (transaction_id) can contain multiple
+        # rooms; each becomes its own OS10 booking, so this now yields one
+        # ZotelSyncRecord PER ROOM, not per reservation.
+        records.extend(_import_reservation(db, sync_log, transaction_id, data))
 
     for r in records:
         db.add(r)
@@ -446,127 +449,314 @@ def _sync_bookings_locked(db: Session, triggered_by: uuid.UUID | None = None, st
     return sync_log
 
 
-def _import_one(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: dict) -> ZotelSyncRecord:
+def _to_minor(amount) -> int:
+    """Rupees (float/str/None) -> integer paise. Non-numeric/None -> 0.
+    Used so every allocation is done in exact integer minor units and can
+    never drift by a rounding fraction."""
+    if amount is None:
+        return 0
+    try:
+        return int(round(float(amount) * 100))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _allocate_minor_units(total_minor: int, n: int) -> list[int]:
+    """Split an integer minor-unit total into n deterministic shares whose
+    sum is EXACTLY total_minor. Equal split; the rounding remainder is handed
+    to the earliest rooms (largest-remainder, index-stable), so there is zero
+    drift and the assignment is reproducible run to run."""
+    if n <= 0:
+        return []
+    base = total_minor // n
+    rem = total_minor - base * n
+    return [base + (1 if i < rem else 0) for i in range(n)]
+
+
+def _room_external_id(room: dict, category_id: str, seq: int) -> str:
+    """Stable per-room identity within a reservation. Prefer Zotel's own room
+    id when the object carries one; otherwise a deterministic key of the
+    room-type (category) id plus its occurrence index among rooms of that same
+    category. In the normal case (distinct categories, one room each) this is
+    just "<category_id>#0"; it stays stable across re-syncs regardless of array
+    reordering as long as the per-category counts are stable."""
+    return str(room.get("id") or f"{category_id}#{seq}")
+
+
+def _find_existing_room_booking(db: Session, transaction_id: str, external_room_id: str, *, single_room: bool) -> Booking | None:
+    """Idempotency lookup on the composite (external_reservation_id,
+    external_room_id). A legacy single-room Zotel booking imported before
+    external_room_id existed has it NULL; for a reservation that still has
+    exactly one room, adopt and backfill that legacy row rather than creating
+    a duplicate."""
+    existing = db.scalar(
+        select(Booking).where(
+            Booking.external_reservation_id == transaction_id,
+            Booking.external_room_id == external_room_id,
+        )
+    )
+    if existing is not None:
+        return existing
+    if single_room:
+        legacy = db.scalar(
+            select(Booking).where(
+                Booking.external_reservation_id == transaction_id,
+                Booking.external_room_id.is_(None),
+            )
+        )
+        if legacy is not None:
+            legacy.external_room_id = external_room_id
+            db.flush()
+            return legacy
+    return None
+
+
+def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: dict) -> list[ZotelSyncRecord]:
+    """
+    Import/reconcile ONE Zotel reservation, which may contain N rooms, into N
+    OS10 bookings (one per room). Returns one ZotelSyncRecord per room.
+
+    Room-type identity lives at rooms[i].category.id (name at
+    rooms[i].category.name) in the REAL, observed Zotel reservation shape;
+    there is no per-room amount and no per-room status — only the single
+    reservation-level total_amount/paid_amount/status (and shared
+    checkin/checkout/customer). Fails closed exactly as before when rooms is
+    empty or dates are missing/unparsable.
+
+    COMPOSITION of the two safeguards this reservation goes through:
+      1. The new-reservation STATUS + STAY-RECENCY gate (ZOTEL_NEW_IMPORT_*)
+         runs FIRST, per fresh (not-yet-imported) room, using that room's
+         effective status (its own `status` if Zotel ever carries one, else
+         the reservation status). A gated-out room is skipped/flagged exactly
+         as the single-room path intended; reconciliation of an ALREADY
+         imported room is untouched by the gate (handled by _reconcile_existing).
+      2. For rooms that PASS the gate, per-room placement + same-unit collision
+         handling then decides HOW they are placed and which are flagged.
+    """
     zotel_status = data.get("status")
-
-    existing = db.scalar(select(Booking).where(Booking.external_reservation_id == transaction_id))
-
-    # Room-type identity lives at rooms[0].category.id (name at
-    # rooms[0].category.name) in the REAL, observed Zotel reservation
-    # shape — confirmed directly against a live GET /bookings response
-    # during the read-only import preview. The documentation's own
-    # example response leaves "rooms" empty, giving no field detail, and
-    # an earlier version of this code assumed a flat rooms[0].room_type_id
-    # field that does not exist anywhere in real data — every real
-    # reservation was silently classified "failed" as a result. Fixed
-    # here; still fails closed exactly the same way when rooms is empty
-    # or category/id is missing, just via the correct path.
     rooms = data.get("rooms") or []
-    category = (rooms[0].get("category") or {}) if rooms else {}
-    room_type_id = category.get("id")
-    room_type_name = category.get("name")
-    if not room_type_id:
-        return _record(sync_log.id, transaction_id, "failed", existing.id if existing else None, "Reservation has no room/category data in its rooms[] list")
+    existing_any = db.scalar(select(Booking).where(Booking.external_reservation_id == transaction_id).limit(1))
 
-    mapping = _resolve_mapping(db, str(room_type_id))
-    if mapping is None:
-        name_suffix = f" (name={room_type_name!r})" if room_type_name else ""
-        return _record(sync_log.id, transaction_id, "unmapped", existing.id if existing else None, f"No OS10 unit mapped for Zotel room_type_id={room_type_id}{name_suffix}")
+    if not rooms:
+        return [_record(sync_log.id, transaction_id, "failed", existing_any.id if existing_any else None,
+                        "Reservation has no room/category data in its rooms[] list")]
 
     checkin_raw, checkout_raw = data.get("checkin"), data.get("checkout")
     if not checkin_raw or not checkout_raw:
-        return _record(sync_log.id, transaction_id, "failed", existing.id if existing else None, "Reservation missing checkin/checkout dates")
-
+        return [_record(sync_log.id, transaction_id, "failed", existing_any.id if existing_any else None,
+                        "Reservation missing checkin/checkout dates")]
     try:
         check_in = datetime.fromisoformat(checkin_raw).date() if isinstance(checkin_raw, str) else checkin_raw
         check_out = datetime.fromisoformat(checkout_raw).date() if isinstance(checkout_raw, str) else checkout_raw
     except ValueError:
-        return _record(sync_log.id, transaction_id, "failed", existing.id if existing else None, "Reservation checkin/checkout dates could not be parsed")
+        return [_record(sync_log.id, transaction_id, "failed", existing_any.id if existing_any else None,
+                        "Reservation checkin/checkout dates could not be parsed")]
 
-    if existing is not None:
-        return _reconcile_existing(db, sync_log, existing, zotel_status, check_in, check_out, data, mapping.unit_id)
+    nights = max((check_out - check_in).days, 1)
+    single_room = len(rooms) == 1
+    today = datetime.now(timezone.utc).date()
 
-    # New reservation. Gate import by the Zotel reservation status and the
-    # stay's recency (see ZOTEL_NEW_IMPORT_* constants above). This policy
-    # applies ONLY to the new-reservation path — reconciliation of an
-    # already-imported booking is handled above by _reconcile_existing and
-    # is intentionally left untouched.
-    normalized = (zotel_status or "").strip().lower()
-    if normalized in ZOTEL_NEW_IMPORT_SKIP_STATUSES:
-        return _record(
-            sync_log.id, transaction_id, "skipped", None,
-            f"Zotel reservation status '{normalized}' is not imported as a new booking",
+    # ---- Pass 1: build a descriptor per room (mapping + existing lookup) ----
+    descriptors: list[dict] = []
+    seq_by_cat: dict[str, int] = {}
+    for idx, raw_room in enumerate(rooms):
+        room = raw_room if isinstance(raw_room, dict) else {}
+        category = room.get("category") if isinstance(room.get("category"), dict) else {}
+        category_id = category.get("id")
+        room_type_name = category.get("name")
+        if not category_id:
+            descriptors.append({"idx": idx, "room": room, "allocatable": False, "category_id": None,
+                                "room_type_name": room_type_name, "external_room_id": None,
+                                "mapping": None, "existing": None, "booking": None,
+                                "disposition": None, "gate_detail": None})
+            continue
+        category_id = str(category_id)
+        seq = seq_by_cat.get(category_id, 0)
+        seq_by_cat[category_id] = seq + 1
+        external_room_id = _room_external_id(room, category_id, seq)
+        descriptors.append({"idx": idx, "room": room, "allocatable": True, "category_id": category_id,
+                            "room_type_name": room_type_name, "external_room_id": external_room_id,
+                            "mapping": _resolve_mapping(db, category_id),
+                            "existing": _find_existing_room_booking(db, transaction_id, external_room_id, single_room=single_room),
+                            "booking": None, "disposition": None, "gate_detail": None})
+
+    # ---- Allocation across allocatable (real) rooms, in exact minor units ----
+    allocatable_idxs = [d["idx"] for d in descriptors if d["allocatable"]]
+    n_alloc = len(allocatable_idxs)
+    acc_shares = _allocate_minor_units(_to_minor(data.get("total_amount")), n_alloc)
+    paid_shares = _allocate_minor_units(_to_minor(data.get("paid_amount")), n_alloc)
+    acc_by_idx = {idx: acc_shares[pos] for pos, idx in enumerate(allocatable_idxs)}
+    paid_by_idx = {idx: paid_shares[pos] for pos, idx in enumerate(allocatable_idxs)}
+
+    # ---- Pass 1.5: disposition per room (STATUS GATE composed here) ----
+    for d in descriptors:
+        if not d["allocatable"]:
+            d["disposition"] = "failed"
+        elif d["mapping"] is None:
+            d["disposition"] = "unmapped"
+        elif d["existing"] is not None:
+            d["disposition"] = "reconcile"
+        else:
+            # Fresh (not-yet-imported) room: apply the new-reservation status
+            # + stay-recency gate first, per room's effective status.
+            effective_status = d["room"].get("status") or zotel_status
+            normalized = (effective_status or "").strip().lower()
+            if normalized in ZOTEL_NEW_IMPORT_SKIP_STATUSES:
+                d["disposition"] = "skipped"
+                d["gate_detail"] = f"Zotel reservation status '{normalized}' is not imported as a new booking (room {d['external_room_id']})"
+            elif normalized in ZOTEL_NEW_IMPORT_ACTIVE_STATUSES:
+                if check_out <= today:
+                    d["disposition"] = "skipped"
+                    d["gate_detail"] = f"Historical Zotel reservation (check_out {check_out} on or before today); not imported (room {d['external_room_id']})"
+                else:
+                    d["disposition"] = "place"
+            else:
+                d["disposition"] = "conflicted_status"
+                d["gate_detail"] = f"Unrecognized Zotel reservation status {effective_status!r}; flagged for manual review (room {d['external_room_id']})"
+
+    # ---- Same-unit collision detection among rooms that PASSED the gate ----
+    # Two rooms of the same reservation that resolve (via mapping) to the same
+    # OS10 unit cannot both be placed without an overlapping booking.
+    candidate_units: dict[uuid.UUID, list[dict]] = {}
+    for d in descriptors:
+        if d["disposition"] == "place":
+            candidate_units.setdefault(d["mapping"].unit_id, []).append(d)
+    collided_idxs = {d["idx"] for group in candidate_units.values() if len(group) > 1 for d in group}
+    reservation_has_collision = bool(collided_idxs)
+    defer_note = (
+        " Reservation payment deferred: this reservation has an unresolved same-unit collision; "
+        "the single Zotel payment cannot be safely allocated until a human resolves it and it is re-synced."
+    )
+
+    # ---- Pass 2: produce a record per room ----
+    guest: Guest | None = None
+    records: list[ZotelSyncRecord] = []
+    for d in descriptors:
+        idx, disp, external_room_id = d["idx"], d["disposition"], d["external_room_id"]
+
+        if disp == "failed":
+            records.append(_record(sync_log.id, transaction_id, "failed", None,
+                                   f"Room #{idx} has no room/category data in its rooms[] entry"))
+            continue
+        if disp == "unmapped":
+            name_suffix = f" (name={d['room_type_name']!r})" if d["room_type_name"] else ""
+            records.append(_record(sync_log.id, transaction_id, "unmapped",
+                                   d["existing"].id if d["existing"] else None,
+                                   f"No OS10 unit mapped for Zotel room_type_id={d['category_id']}{name_suffix} (room {external_room_id})"))
+            continue
+        if disp == "reconcile":
+            effective_status = d["room"].get("status") or zotel_status
+            d["booking"] = d["existing"]
+            records.append(_reconcile_existing(db, sync_log, d["existing"], effective_status,
+                                               check_in, check_out, data, d["mapping"].unit_id, external_room_id))
+            continue
+        if disp == "skipped":
+            records.append(_record(sync_log.id, transaction_id, "skipped", None, d["gate_detail"]))
+            continue
+        if disp == "conflicted_status":
+            records.append(_record(sync_log.id, transaction_id, "conflicted", None, d["gate_detail"]))
+            continue
+
+        # disp == "place": gate passed; now placement / collision handling.
+        if idx in collided_idxs:
+            unit_id = d["mapping"].unit_id
+            peers = ", ".join(sorted(p["external_room_id"] for p in candidate_units[unit_id]))
+            records.append(_record(sync_log.id, transaction_id, "conflicted", None,
+                                   f"Zotel reservation {transaction_id} has multiple rooms ({peers}) that all map to the "
+                                   f"same OS10 unit {unit_id} for {check_in}..{check_out}; they cannot all be placed "
+                                   f"without an overlapping booking. Flagged for manual review — no booking created for "
+                                   f"room {external_room_id}.{defer_note}"))
+            continue
+
+        if guest is None:
+            guest = _find_or_create_guest(db, _extract_customer(data))
+        booking, fail_record = _place_new_booking(
+            db, sync_log, transaction_id, external_room_id, d["mapping"], d["room"],
+            check_in, check_out, nights, acc_by_idx[idx], data, guest,
         )
-    if normalized in ZOTEL_NEW_IMPORT_ACTIVE_STATUSES:
-        today = datetime.now(timezone.utc).date()
-        if check_out <= today:
-            return _record(
-                sync_log.id, transaction_id, "skipped", None,
-                f"Historical Zotel reservation (check_out {check_out} on or before today); not imported",
-            )
-        # Active, future-dated reservation: fall through into the existing
-        # import logic below (unit-status check, locking, availability,
-        # occupancy, guest/booking creation, payment capture).
-    else:
-        # Unknown status, or a missing/None status — never guess; flag it
-        # for a human to review rather than create a booking.
-        return _record(
-            sync_log.id, transaction_id, "conflicted", None,
-            f"Unrecognized Zotel reservation status {zotel_status!r}; flagged for manual review",
-        )
+        if fail_record is not None:
+            records.append(fail_record)
+            continue
+        d["booking"] = booking
+        detail = f"Imported room {external_room_id} into unit {d['mapping'].unit_id}"
+        if reservation_has_collision:
+            detail += defer_note
+        records.append(_record(sync_log.id, transaction_id, "imported", booking.id, detail))
 
-    # Phase 5A: checked explicitly, before the overlap check, so the
-    # detail message tells staff WHY this was rejected (maintenance/
-    # blocked status) rather than reusing the overlap message, which
-    # would misdescribe the actual cause. unit_is_available (below) now
-    # also covers unit.status internally as defense-in-depth, but relying
-    # on that alone here would report every maintenance-unit rejection as
-    # an "overlaps an existing OS10 booking/hold" conflict, which isn't
-    # true and wouldn't tell staff what to actually go fix. Zotel itself
-    # has no write API to receive a block (see zotel/client.py) — this
-    # cannot stop the OTA from selling the unit, only stop OS10 from
-    # silently creating a normal confirmed Booking for it.
+    # ---- Payment: per-room allocation summing EXACTLY to paid_amount ----
+    # Deferred entirely when the reservation has an unresolved same-unit
+    # collision (per spec): the single reservation payment cannot be correctly
+    # allocated across a partially-imported reservation without risking
+    # mis-stated amounts.
+    if not reservation_has_collision:
+        for d in descriptors:
+            if not d["allocatable"] or d["booking"] is None:
+                continue
+            _maybe_record_payment(db, d["booking"], data, paid_by_idx.get(d["idx"], 0) / 100.0)
+
+    return records
+
+
+def _place_new_booking(
+    db: Session, sync_log: ZotelSyncLog, transaction_id: str, external_room_id: str,
+    mapping: ZotelRoomMapping, room: dict, check_in, check_out, nights: int,
+    accommodation_minor: int, data: dict, guest: Guest,
+) -> tuple[Booking | None, ZotelSyncRecord | None]:
+    """Place a single fresh room-booking, reusing every existing new-import
+    safeguard (unit.status, per-unit advisory lock, occupancy, availability,
+    DB EXCLUDE backstop). The caller has already applied the status/recency
+    gate and collision check; this does the actual placement. Returns
+    (booking, None) on success or (None, record) with a conflicted record on
+    rejection. The guest passed in was created once per reservation from the
+    NORMALIZED customer (see _extract_customer/_find_or_create_guest), so
+    phone normalization is applied to every room-booking."""
+    # Phase 5A: unit.status checked explicitly first so the detail says WHY
+    # (maintenance/blocked) rather than reusing the overlap message. Zotel has
+    # no write API to receive a block (see client.py) — this only stops OS10
+    # from silently creating a confirmed Booking, not the OTA from selling it.
     local_unit = db.get(Unit, mapping.unit_id)
     if local_unit is not None and local_unit.status != "available":
-        return _record(
+        return None, _record(
             sync_log.id, transaction_id, "conflicted", None,
             f"Zotel reservation for unit {mapping.unit_id} ({check_in}..{check_out}) was not imported — "
             f"the local unit is currently marked '{local_unit.status}' in OS10 (not 'available'); "
             "review this reservation manually — Zotel has no way to receive a block from OS10, so the "
-            "OTA listing itself must be updated separately if the unit should stop being sold there",
+            f"OTA listing itself must be updated separately if the unit should stop being sold there (room {external_room_id})",
         )
-    # Serialize imports with direct/public booking and hold creation. The
-    # database exclusion constraints cannot compare an imported booking with
-    # an active hold, so all reservation writers must share this per-unit
-    # transaction lock before checking availability and inserting.
+    # Serialize imports with direct/public booking and hold creation. The DB
+    # exclusion constraints cannot compare an imported booking with an active
+    # hold, so all reservation writers share this per-unit transaction lock
+    # before checking availability and inserting.
     lock_unit_for_reservation(db, mapping.unit_id)
+    adults, children = 1, 0
     if local_unit is not None:
         db.refresh(local_unit)
-        room = rooms[0] if rooms else {}
         try:
             adults = int(room.get("num_adults") or 1)
             children = int(room.get("num_children") or 0)
         except (TypeError, ValueError):
-            return _record(sync_log.id, transaction_id, "conflicted", None, "Zotel guest count is invalid; review manually")
+            return None, _record(sync_log.id, transaction_id, "conflicted", None,
+                                 f"Zotel guest count is invalid; review manually (room {external_room_id})")
         if adults + children > local_unit.max_occupancy:
-            return _record(
+            return None, _record(
                 sync_log.id, transaction_id, "conflicted", None,
                 f"Zotel reservation for unit {mapping.unit_id} has {adults + children} guests, exceeding "
-                f"the OS10 maximum occupancy of {local_unit.max_occupancy}; review manually",
+                f"the OS10 maximum occupancy of {local_unit.max_occupancy}; review manually (room {external_room_id})",
             )
+    else:
+        try:
+            adults = int(room.get("num_adults") or 1)
+            children = int(room.get("num_children") or 0)
+        except (TypeError, ValueError):
+            adults, children = 1, 0
     if not unit_is_available(db, mapping.unit_id, check_in, check_out):
-        return _record(
+        return None, _record(
             sync_log.id, transaction_id, "conflicted", None,
-            f"Zotel reservation for unit {mapping.unit_id} ({check_in}..{check_out}) overlaps an existing OS10 booking/hold — not imported; existing OS10 record left untouched",
+            f"Zotel reservation for unit {mapping.unit_id} ({check_in}..{check_out}) overlaps an existing OS10 "
+            f"booking/hold — not imported; existing OS10 record left untouched (room {external_room_id})",
         )
 
-    customer = _extract_customer(data)
-    guest = _find_or_create_guest(db, customer)
-
-    nights = max((check_out - check_in).days, 1)
-    total_amount = data.get("total_amount")
-    rate_applied = round(float(total_amount) / nights, 2) if total_amount else 0.0
-
+    rate_applied = round((accommodation_minor / 100.0) / nights, 2) if accommodation_minor else 0.0
     booking = Booking(
         unit_id=mapping.unit_id,
         guest_id=guest.id,
@@ -575,11 +765,12 @@ def _import_one(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: 
         status="confirmed",
         source="zotel",
         rate_applied=rate_applied,
-        adults=(rooms[0].get("num_adults") or 1) if rooms else 1,
-        children=(rooms[0].get("num_children") or 0) if rooms else 0,
+        adults=adults,
+        children=children,
         special_requests=data.get("special_requests"),
-        internal_notes=f"Imported from Zotel (booking_source={data.get('booking_source')}, ota_booking_id={data.get('ota_booking_id')})",
+        internal_notes=f"Imported from Zotel (booking_source={data.get('booking_source')}, ota_booking_id={data.get('ota_booking_id')}, room={external_room_id})",
         external_reservation_id=transaction_id,
+        external_room_id=external_room_id,
     )
     db.add(booking)
     try:
@@ -587,15 +778,13 @@ def _import_one(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: 
     except Exception as e:  # noqa: BLE001 — DB EXCLUDE constraint is the final guard; a race here must not corrupt the sync
         db.rollback()
         db.add(sync_log)  # sync_log itself was rolled back too — re-attach for the caller's later commit
-        logger.warning("Zotel import: DB rejected booking for reservation %s: %s", transaction_id, type(e).__name__)
-        return _record(sync_log.id, transaction_id, "conflicted", None, "Database rejected this booking as an overlapping reservation at insert time")
-
-    _maybe_record_payment(db, booking, data)
-
-    return _record(sync_log.id, transaction_id, "imported", booking.id, f"Imported into unit {mapping.unit_id}")
+        logger.warning("Zotel import: DB rejected booking for reservation %s (room %s): %s", transaction_id, external_room_id, type(e).__name__)
+        return None, _record(sync_log.id, transaction_id, "conflicted", None,
+                             f"Database rejected this booking as an overlapping reservation at insert time (room {external_room_id})")
+    return booking, None
 
 
-def _reconcile_existing(db: Session, sync_log: ZotelSyncLog, booking: Booking, zotel_status: str | None, check_in, check_out, data: dict, mapped_unit_id: uuid.UUID) -> ZotelSyncRecord:
+def _reconcile_existing(db: Session, sync_log: ZotelSyncLog, booking: Booking, zotel_status: str | None, check_in, check_out, data: dict, mapped_unit_id: uuid.UUID, external_room_id: str | None = None) -> ZotelSyncRecord:
     if booking.status not in SAFE_TO_AUTO_UPDATE_STATUSES:
         # Already checked in/out/cancelled locally — never let an external
         # feed reach back into an operationally-advanced record.
@@ -653,13 +842,25 @@ def _reconcile_existing(db: Session, sync_log: ZotelSyncLog, booking: Booking, z
     return _record(sync_log.id, booking.external_reservation_id, "skipped", booking.id, "No safe change detected; already in sync")
 
 
-def _maybe_record_payment(db: Session, booking: Booking, data: dict) -> None:
-    paid_amount = data.get("paid_amount")
-    if not paid_amount or float(paid_amount) <= 0:
+def _maybe_record_payment(db: Session, booking: Booking, data: dict, amount: float) -> None:
+    """Record this room-booking's allocated share of the single reservation
+    payment. `amount` is the per-room share the caller computed from the
+    reservation-level paid_amount (exact minor-unit allocation — see
+    _import_reservation), NEVER the full paid_amount per room. Only records a
+    positive share, and never a second time for the same booking (so a re-sync
+    cannot double it)."""
+    if amount is None or round(float(amount), 2) <= 0:
+        return
+    already = db.scalar(
+        select(Payment.id).where(
+            Payment.booking_id == booking.id, Payment.mode == "zotel", Payment.amount > 0
+        ).limit(1)
+    )
+    if already is not None:
         return
     payment = Payment(
         booking_id=booking.id,
-        amount=round(float(paid_amount), 2),
+        amount=round(float(amount), 2),
         mode="zotel",
         status="completed",
         reference_no=data.get("transaction_id"),
@@ -738,30 +939,39 @@ def run_reconciliation(db: Session, triggered_by: uuid.UUID | None = None) -> di
             "summary": summary,
         }
 
+    # A single Zotel reservation (transaction_id) can legitimately map to N
+    # OS10 bookings (one per room). get_all_bookings returns reservation
+    # SUMMARIES (no per-room breakdown), so dedupe by transaction_id and then
+    # compare at ROOM granularity against every OS10 booking that carries that
+    # external_reservation_id — multiple matches are expected now, not a
+    # "duplicate" error.
     zotel_ids_seen: set[str] = set()
+    reservations_by_txn: dict[str, dict] = {}
     for res in zotel_reservations:
         txn_id = res.get("transaction_id")
         if not txn_id:
             continue
+        reservations_by_txn[txn_id] = res  # dedupe; a later page wins
+
+    for txn_id, res in reservations_by_txn.items():
         zotel_ids_seen.add(txn_id)
 
         matches = db.scalars(select(Booking).where(Booking.external_reservation_id == txn_id)).all()
         if len(matches) == 0:
             summary["missing_in_os10"] += 1
             entries.append({"external_reservation_id": txn_id, "category": "missing_in_os10", "detail": "Reservation exists in Zotel but has no matching OS10 booking"})
-        elif len(matches) > 1:
-            summary["duplicate"] += 1
-            entries.append({"external_reservation_id": txn_id, "category": "duplicate", "detail": f"{len(matches)} OS10 bookings share this external_reservation_id"})
-        else:
-            os10_booking = matches[0]
-            zotel_cancelled = res.get("status") == "cancelled"
+            continue
+
+        zotel_cancelled = res.get("status") == "cancelled"
+        for os10_booking in matches:
             os10_cancelled = os10_booking.status == "cancelled"
+            room_label = f" room={os10_booking.external_room_id}" if os10_booking.external_room_id else ""
             if zotel_cancelled != os10_cancelled:
                 summary["cancelled_mismatch"] += 1
-                entries.append({"external_reservation_id": txn_id, "category": "cancelled_mismatch", "detail": f"Zotel status={res.get('status')}, OS10 status={os10_booking.status}"})
+                entries.append({"external_reservation_id": txn_id, "category": "cancelled_mismatch", "detail": f"Zotel status={res.get('status')}, OS10 status={os10_booking.status}{room_label}"})
             else:
                 summary["matched"] += 1
-                entries.append({"external_reservation_id": txn_id, "category": "matched", "detail": "OK"})
+                entries.append({"external_reservation_id": txn_id, "category": "matched", "detail": f"OK{room_label}"})
 
     os10_zotel_bookings = db.scalars(select(Booking).where(Booking.external_reservation_id.is_not(None))).all()
     for b in os10_zotel_bookings:
