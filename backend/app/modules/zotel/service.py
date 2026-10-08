@@ -678,17 +678,48 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
             records.append(fail_record)
             continue
         d["booking"] = booking
-        detail = f"Imported room {external_room_id} into unit {d['mapping'].unit_id}"
-        if reservation_has_collision:
-            detail += defer_note
-        records.append(_record(sync_log.id, transaction_id, "imported", booking.id, detail))
+        rec = _record(sync_log.id, transaction_id, "imported", booking.id,
+                      f"Imported room {external_room_id} into unit {d['mapping'].unit_id}")
+        d["record"] = rec
+        records.append(rec)
 
-    # ---- Payment: per-room allocation summing EXACTLY to paid_amount ----
-    # Deferred entirely when the reservation has an unresolved same-unit
-    # collision (per spec): the single reservation payment cannot be correctly
-    # allocated across a partially-imported reservation without risking
-    # mis-stated amounts.
-    if not reservation_has_collision:
+    # ---- Payment integrity gate: record the single reservation payment in
+    # FULL or defer it in FULL, never partially (R1) ----
+    # paid_amount is allocated across EVERY allocatable room. A room that was
+    # not placed into a booking — unplaceable (mapped unit in maintenance, an
+    # overlapping booking/hold, over max-occupancy, or the DB EXCLUDE
+    # backstop), unmapped, or carrying an unrecognized status — would
+    # otherwise have its allocated share silently dropped while the placeable
+    # rooms recorded theirs, leaving OS10 with a Payment total STRICTLY LESS
+    # than Zotel's paid_amount and nothing flagged (silent under-recording).
+    # So, mirroring the same-unit collision rule, defer the WHOLE reservation
+    # payment whenever any room that was handed a positive paid share could
+    # not be placed. It is recorded in full once the obstruction is resolved
+    # and the reservation is re-synced (idempotent — never double-recorded).
+    orphaned_paid_minor = sum(
+        paid_by_idx.get(d["idx"], 0)
+        for d in descriptors
+        if d["allocatable"] and d["booking"] is None
+    )
+    payment_incomplete = orphaned_paid_minor > 0
+    payment_deferred = reservation_has_collision or payment_incomplete
+
+    incomplete_note = (
+        " Reservation payment deferred: one or more rooms in this reservation could not be placed "
+        "in OS10, so the single Zotel payment cannot be safely allocated across a partially-imported "
+        "reservation without under-recording it; it will be recorded in full once the unplaceable "
+        "room(s) are resolved and the reservation is re-synced."
+    )
+    note = defer_note if reservation_has_collision else (incomplete_note if payment_incomplete else None)
+    if note:
+        # Surface the deferral on every room actually imported, so a short
+        # recorded amount is never silent — staff see WHY on the sync record.
+        for d in descriptors:
+            rec = d.get("record")
+            if rec is not None and rec.detail and note not in rec.detail:
+                rec.detail += note
+
+    if not payment_deferred:
         for d in descriptors:
             if not d["allocatable"] or d["booking"] is None:
                 continue
