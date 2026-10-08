@@ -143,6 +143,14 @@ class Settings(BaseSettings):
     zotel_api_secret: str = ""
     zotel_hotel_id: str = ""
 
+    # Zotel HTTP client tuning (see zotel/client.py::_get). Defaults match the
+    # previously-hardcoded constants, so an unchanged deployment behaves
+    # exactly as before; a real deployment can override via env to adapt to
+    # Zotel's observed rate limits / latency. Invalid/out-of-range values are
+    # ignored by the client, which falls back to these same defaults.
+    zotel_max_retries: int = 3
+    zotel_timeout_seconds: float = 15.0
+
     # Automatic WhatsApp (booking-notification audit, notifications/service.py).
     # No WhatsApp provider is configured anywhere in this project — these
     # fields exist so the architecture supports one without inventing or

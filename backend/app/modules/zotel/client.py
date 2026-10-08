@@ -31,9 +31,11 @@ token scheme; this is the one and only authentication method the
 document defines. Never log X-Api-Secret, or the full header dict.
 """
 import logging
+import random
 import time
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -44,6 +46,71 @@ logger = logging.getLogger("sri_apartment_os")
 DEFAULT_TIMEOUT_SECONDS = 15.0
 MAX_RETRIES = 3
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# Upper bound honored for a server-supplied Retry-After, so a hostile or
+# misconfigured header value can never park a request for minutes.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def _max_retries() -> int:
+    """Configured retry count (settings.zotel_max_retries), falling back to the
+    MAX_RETRIES default for a missing/invalid/non-positive value."""
+    try:
+        value = int(getattr(settings, "zotel_max_retries", MAX_RETRIES))
+        return value if value >= 1 else MAX_RETRIES
+    except (TypeError, ValueError):
+        return MAX_RETRIES
+
+
+def _timeout_seconds() -> float:
+    """Configured request timeout (settings.zotel_timeout_seconds), falling
+    back to the DEFAULT_TIMEOUT_SECONDS default for an invalid/non-positive
+    value."""
+    try:
+        value = float(getattr(settings, "zotel_timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+        return value if value > 0 else DEFAULT_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT_SECONDS
+
+
+def _parse_retry_after(resp: "httpx.Response") -> float | None:
+    """Parse a response's Retry-After header into a non-negative number of
+    seconds, capped at MAX_RETRY_AFTER_SECONDS. Supports both documented
+    forms — an integer number of seconds and an HTTP-date. Returns None when
+    the header is absent or unparseable (caller then uses jittered backoff)."""
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:  # noqa: BLE001 — a non-mapping headers object must not crash the retry path
+        return None
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    # Form 1: integer (or numeric) seconds.
+    try:
+        return max(0.0, min(float(raw), MAX_RETRY_AFTER_SECONDS))
+    except ValueError:
+        pass
+    # Form 2: HTTP-date — convert to seconds-from-now.
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delta = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(delta, MAX_RETRY_AFTER_SECONDS))
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Exponential backoff with FULL jitter: a random value in [0, base],
+    where base = 2 ** (attempt - 1). Jitter spreads retries so many clients
+    rate-limited at once do not all wake and re-hit Zotel in lockstep."""
+    base = 2 ** (attempt - 1)
+    return random.uniform(0, base)
 
 
 class ZotelNotConfiguredError(Exception):
@@ -98,18 +165,20 @@ def _get(path: str, params: dict, category: str) -> dict:
     url = f"{settings.zotel_base_url.rstrip('/')}{path}"
     correlation_id = uuid.uuid4().hex[:12]  # not sent to Zotel (undocumented) — for correlating our own logs only
 
+    max_retries = _max_retries()
+    timeout = _timeout_seconds()
     last_exc: Exception | None = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
-            with httpx.Client(timeout=DEFAULT_TIMEOUT_SECONDS) as client:
+            with httpx.Client(timeout=timeout) as client:
                 resp = client.get(url, params=params, headers=_headers())
         except httpx.TimeoutException as e:
             last_exc = e
-            logger.warning("Zotel %s request timed out (attempt %d/%d) [cid=%s]", category, attempt, MAX_RETRIES, correlation_id)
-            if attempt < MAX_RETRIES:
-                time.sleep(2 ** (attempt - 1))
+            logger.warning("Zotel %s request timed out (attempt %d/%d) [cid=%s]", category, attempt, max_retries, correlation_id)
+            if attempt < max_retries:
+                time.sleep(_backoff_seconds(attempt))
                 continue
-            raise ZotelAPIError(f"Zotel {category} request timed out after {MAX_RETRIES} attempts", category=category) from e
+            raise ZotelAPIError(f"Zotel {category} request timed out after {max_retries} attempts", category=category) from e
         except httpx.HTTPError as e:
             raise ZotelAPIError(f"Zotel {category} request failed: {type(e).__name__}", category=category) from e
 
@@ -122,16 +191,24 @@ def _get(path: str, params: dict, category: str) -> dict:
                 raise ZotelAPIError(f"Zotel {category} response missing the documented 'data' envelope field", status_code=200, category=category)
             return body
 
-        if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
-            logger.warning("Zotel %s returned %d (attempt %d/%d) [cid=%s] — retrying", category, resp.status_code, attempt, MAX_RETRIES, correlation_id)
-            time.sleep(2 ** (attempt - 1))
+        if resp.status_code in RETRYABLE_STATUS_CODES and attempt < max_retries:
+            # Honor a server-supplied Retry-After when present (capped);
+            # otherwise use exponential backoff with full jitter.
+            retry_after = _parse_retry_after(resp)
+            delay = retry_after if retry_after is not None else _backoff_seconds(attempt)
+            logger.warning(
+                "Zotel %s returned %d (attempt %d/%d) [cid=%s] — retrying%s",
+                category, resp.status_code, attempt, max_retries, correlation_id,
+                " after Retry-After" if retry_after is not None else "",
+            )
+            time.sleep(delay)
             continue
 
         safe_message = _safe_error_message(resp)
         logger.error("Zotel %s failed: HTTP %d [cid=%s]", category, resp.status_code, correlation_id)
         raise ZotelAPIError(safe_message, status_code=resp.status_code, category=category)
 
-    raise ZotelAPIError(f"Zotel {category} request failed after {MAX_RETRIES} attempts", category=category) from last_exc
+    raise ZotelAPIError(f"Zotel {category} request failed after {max_retries} attempts", category=category) from last_exc
 
 
 def _safe_error_message(resp: httpx.Response) -> str:
