@@ -53,6 +53,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -450,15 +451,23 @@ def _sync_bookings_locked(db: Session, triggered_by: uuid.UUID | None = None, st
 
 
 def _to_minor(amount) -> int:
-    """Rupees (float/str/None) -> integer paise. Non-numeric/None -> 0.
-    Used so every allocation is done in exact integer minor units and can
-    never drift by a rounding fraction."""
+    """Rupees (Decimal/float/int/str/None) -> integer paise. Non-numeric/None
+    -> 0. Parsed through decimal.Decimal (via str() so a binary float like
+    7000.01 is read from its decimal text, not its float noise) so every
+    allocation and comparison is done in exact integer minor units and can
+    never drift by a rounding fraction. Scoped to the Zotel module only."""
     if amount is None:
         return 0
     try:
-        return int(round(float(amount) * 100))
-    except (TypeError, ValueError):
+        return int((Decimal(str(amount)) * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, TypeError, ValueError):
         return 0
+
+
+def _minor_to_decimal(minor: int) -> Decimal:
+    """Integer paise -> exact rupee Decimal (two places) for storing in the
+    Numeric(10, 2) Payment.amount column without float representation error."""
+    return (Decimal(int(minor)) / 100).quantize(Decimal("0.01"))
 
 
 def _allocate_minor_units(total_minor: int, n: int) -> list[int]:
@@ -917,7 +926,7 @@ def _maybe_record_payment(db: Session, booking: Booking, data: dict, target_mino
     if delta_minor > _PAYMENT_DELTA_TOLERANCE_MINOR:
         payment = Payment(
             booking_id=booking.id,
-            amount=round(delta_minor / 100.0, 2),
+            amount=_minor_to_decimal(delta_minor),
             mode="zotel",
             status="completed",
             reference_no=data.get("transaction_id"),
@@ -937,6 +946,20 @@ def _maybe_record_payment(db: Session, booking: Booking, data: dict, target_mino
     # else: within tolerance -> idempotent no-op (already recorded in full).
 
 
+def _recorded_zotel_payment_minor(db: Session, booking_ids: list[uuid.UUID]) -> int:
+    """Sum (in exact integer paise) of the POSITIVE mode='zotel' payments
+    recorded in OS10 across the given room-bookings of one reservation. Used
+    by run_reconciliation's monetary comparison — read-only."""
+    if not booking_ids:
+        return 0
+    amounts = db.scalars(
+        select(Payment.amount).where(
+            Payment.booking_id.in_(booking_ids), Payment.mode == "zotel", Payment.amount > 0
+        )
+    ).all()
+    return sum(_to_minor(a) for a in amounts)
+
+
 def _persist_reconciliation_log(db: Session, triggered_by: uuid.UUID | None, records_fetched: int, summary: dict, errored: bool, error_message: str | None) -> None:
     """
     Records one ZotelSyncLog row per reconciliation run — the other half of
@@ -949,8 +972,10 @@ def _persist_reconciliation_log(db: Session, triggered_by: uuid.UUID | None, rec
     sync_types render in one consistent Sync Logs table):
       - records_fetched   = Zotel reservations retrieved for comparison
       - records_skipped   = "matched" — nothing needs action
-      - records_conflicted = duplicate + conflicting + cancelled_mismatch —
-        real disagreements between the two systems
+      - records_conflicted = duplicate + conflicting + cancelled_mismatch +
+        amount_mismatch — real disagreements between the two systems
+        (amount_mismatch = Zotel paid_amount differs from the OS10 recorded
+        mode="zotel" payment sum for a reservation)
       - records_unmapped  = missing_in_os10 + missing_in_zotel — present in
         only one system (reusing this field for "one-sided", the closest
         existing meaning; there is no dedicated counter for it)
@@ -966,13 +991,14 @@ def _persist_reconciliation_log(db: Session, triggered_by: uuid.UUID | None, rec
         db.commit()
         return
 
-    conflicted = summary.get("duplicate", 0) + summary.get("conflicting", 0) + summary.get("cancelled_mismatch", 0)
+    conflicted = summary.get("duplicate", 0) + summary.get("conflicting", 0) + summary.get("cancelled_mismatch", 0) + summary.get("amount_mismatch", 0)
     unmapped = summary.get("missing_in_os10", 0) + summary.get("missing_in_zotel", 0)
     status = "success" if (conflicted == 0 and unmapped == 0) else "partial"
     message = (
         f"reservations_fetched={records_fetched} matched={summary.get('matched', 0)} "
         f"missing_in_os10={summary.get('missing_in_os10', 0)} missing_in_zotel={summary.get('missing_in_zotel', 0)} "
-        f"duplicate={summary.get('duplicate', 0)} cancelled_mismatch={summary.get('cancelled_mismatch', 0)}"
+        f"duplicate={summary.get('duplicate', 0)} cancelled_mismatch={summary.get('cancelled_mismatch', 0)} "
+        f"amount_mismatch={summary.get('amount_mismatch', 0)}"
     )
     sync_log = ZotelSyncLog(
         sync_type="reconciliation", status=status, message=message,
@@ -995,7 +1021,7 @@ def run_reconciliation(db: Session, triggered_by: uuid.UUID | None = None) -> di
     the Sync Logs list afterward, not just in the immediate HTTP response.
     """
     entries: list[dict] = []
-    summary = {"matched": 0, "missing_in_os10": 0, "duplicate": 0, "unmapped": 0, "conflicting": 0, "cancelled_mismatch": 0}
+    summary = {"matched": 0, "missing_in_os10": 0, "duplicate": 0, "unmapped": 0, "conflicting": 0, "cancelled_mismatch": 0, "amount_mismatch": 0}
 
     try:
         zotel_reservations = client.get_all_bookings()
@@ -1040,6 +1066,29 @@ def run_reconciliation(db: Session, triggered_by: uuid.UUID | None = None) -> di
             else:
                 summary["matched"] += 1
                 entries.append({"external_reservation_id": txn_id, "category": "matched", "detail": f"OK{room_label}"})
+
+        # Monetary reconciliation (report-only): compare the Zotel
+        # reservation-level paid_amount against the OS10 recorded mode="zotel"
+        # payment sum across ALL of this reservation's room-bookings, in exact
+        # integer paise / Decimal (1-paise tolerance, never float). Only when
+        # Zotel's summary actually carries a paid_amount and the reservation is
+        # not cancelled (a cancelled booking's money is refund-pending, not a
+        # recording disagreement). A mismatch is a new amount_mismatch bucket
+        # that counts toward the conflicted/partial status; nothing is written
+        # to Booking/Payment/Guest.
+        if not zotel_cancelled and "paid_amount" in res:
+            zotel_paid_minor = _to_minor(res.get("paid_amount"))
+            recorded_minor = _recorded_zotel_payment_minor(db, [b.id for b in matches])
+            if abs(zotel_paid_minor - recorded_minor) > _PAYMENT_DELTA_TOLERANCE_MINOR:
+                summary["amount_mismatch"] += 1
+                entries.append({
+                    "external_reservation_id": txn_id, "category": "amount_mismatch",
+                    "detail": (
+                        f"Zotel reports paid_amount={_minor_to_decimal(zotel_paid_minor)} but OS10 has "
+                        f"recorded {_minor_to_decimal(recorded_minor)} in mode='zotel' payments for this "
+                        "reservation — amounts disagree (report-only; no write made)"
+                    ),
+                })
 
     os10_zotel_bookings = db.scalars(select(Booking).where(Booking.external_reservation_id.is_not(None))).all()
     for b in os10_zotel_bookings:
