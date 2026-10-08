@@ -151,6 +151,14 @@ class Settings(BaseSettings):
     zotel_max_retries: int = 3
     zotel_timeout_seconds: float = 15.0
 
+    # Optional lower-bound for which Zotel reservations to import, by CHECK-IN
+    # date (ISO 8601, e.g. "2026-01-01"). Empty (the default) means "no lower
+    # bound" — behaviour is identical to before this setting existed. When set,
+    # it is passed as the Zotel API's checkin_from filter AND enforced again as
+    # a local defense-in-depth gate on new imports (see zotel/service.py). An
+    # unparseable value is ignored (treated as unset).
+    zotel_import_from_date: str = ""
+
     # Automatic WhatsApp (booking-notification audit, notifications/service.py).
     # No WhatsApp provider is configured anywhere in this project — these
     # fields exist so the architecture supports one without inventing or

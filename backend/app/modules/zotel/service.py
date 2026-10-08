@@ -52,7 +52,7 @@ WHAT THIS FILE DELIBERATELY DOES NOT DO:
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from sqlalchemy import func, select
@@ -151,6 +151,21 @@ ZOTEL_NEW_IMPORT_ACTIVE_STATUSES = ("created", "modified", "confirmed")
 # Stable, application-specific PostgreSQL session advisory-lock key (ASCII
 # "ZOTELSYN"). It is constant across every worker and never comes from input.
 ZOTEL_SYNC_ADVISORY_LOCK_KEY = 0x5A4F54454C53594E
+
+
+def _configured_import_from_date() -> date | None:
+    """Parse settings.zotel_import_from_date (ISO date) into a date, or None
+    when unset/blank/unparseable. The default lower bound used when a caller
+    passes no explicit import_from_date; an unset setting means 'no bound',
+    keeping behaviour byte-for-byte unchanged from before this existed."""
+    raw = (getattr(settings, "zotel_import_from_date", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        logger.warning("Invalid ZOTEL_IMPORT_FROM_DATE %r; ignoring (no lower bound applied)", raw)
+        return None
 
 
 class ZotelSyncAlreadyRunning(Exception):
@@ -302,7 +317,7 @@ def _record(sync_log_id: uuid.UUID, external_reservation_id: str, outcome: str, 
     )
 
 
-def sync_bookings(db: Session, triggered_by: uuid.UUID | None = None, status_filter: str | None = None) -> ZotelSyncLog:
+def sync_bookings(db: Session, triggered_by: uuid.UUID | None = None, status_filter: str | None = None, import_from_date: date | None = None) -> ZotelSyncLog:
     """Serialize all booking syncs across processes using PostgreSQL.
 
     The session-level lock is held on its own pinned connection because the
@@ -310,7 +325,13 @@ def sync_bookings(db: Session, triggered_by: uuid.UUID | None = None, status_fil
     overlap race. Neither operation can release this lock connection's
     advisory lock. The lock is explicitly released (or its connection
     invalidated) on every exit path.
+
+    import_from_date (optional) is a CHECK-IN lower bound: only reservations
+    checking in on/after it are imported. When None, the configured default
+    (settings.zotel_import_from_date) is used; when that too is unset, there
+    is no lower bound and behaviour is byte-for-byte unchanged.
     """
+    effective_import_from_date = import_from_date if import_from_date is not None else _configured_import_from_date()
     lock_connection = None
     try:
         lock_connection = db.get_bind().connect()
@@ -336,7 +357,7 @@ def sync_bookings(db: Session, triggered_by: uuid.UUID | None = None, status_fil
         raise ZotelSyncAlreadyRunning()
 
     try:
-        return _sync_bookings_locked(db, triggered_by=triggered_by, status_filter=status_filter)
+        return _sync_bookings_locked(db, triggered_by=triggered_by, status_filter=status_filter, import_from_date=effective_import_from_date)
     except BaseException:
         # The import session must be reusable/clean after an exceptional exit.
         try:
@@ -364,19 +385,29 @@ def sync_bookings(db: Session, triggered_by: uuid.UUID | None = None, status_fil
             lock_connection.close()
 
 
-def _sync_bookings_locked(db: Session, triggered_by: uuid.UUID | None = None, status_filter: str | None = None) -> ZotelSyncLog:
+def _sync_bookings_locked(db: Session, triggered_by: uuid.UUID | None = None, status_filter: str | None = None, import_from_date: date | None = None) -> ZotelSyncLog:
     """
     Fetch Zotel reservations (paginated) and import/reconcile each one into
     the OS10 Booking table, keyed by external_reservation_id (Zotel's
     transaction_id) for idempotency — see this file's own module docstring
     for exactly what is and isn't auto-applied.
+
+    import_from_date (optional, CHECK-IN lower bound) is passed to Zotel as the
+    checkin_from filter AND re-enforced locally per new import (see
+    _import_reservation Pass 1.5). None means no lower bound (unchanged).
     """
     sync_log = ZotelSyncLog(sync_type="bookings_import", status="success", triggered_by=triggered_by)
     db.add(sync_log)
     db.flush()
 
     try:
-        summaries = client.get_all_bookings(status=status_filter)
+        # Pass checkin_from ONLY when a lower bound is in effect, so the None
+        # case is byte-for-byte the original call (client.get_all_bookings(
+        # status=...)) and existing callers/mocks are unaffected.
+        fetch_kwargs = {"status": status_filter}
+        if import_from_date is not None:
+            fetch_kwargs["checkin_from"] = import_from_date
+        summaries = client.get_all_bookings(**fetch_kwargs)
     except ZotelNotConfiguredError as e:
         sync_log.status = "failed"
         sync_log.message = str(e)
@@ -409,7 +440,7 @@ def _sync_bookings_locked(db: Session, triggered_by: uuid.UUID | None = None, st
         # A single Zotel reservation (transaction_id) can contain multiple
         # rooms; each becomes its own OS10 booking, so this now yields one
         # ZotelSyncRecord PER ROOM, not per reservation.
-        records.extend(_import_reservation(db, sync_log, transaction_id, data))
+        records.extend(_import_reservation(db, sync_log, transaction_id, data, import_from_date=import_from_date))
 
     for r in records:
         db.add(r)
@@ -520,7 +551,7 @@ def _find_existing_room_booking(db: Session, transaction_id: str, external_room_
     return None
 
 
-def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: dict) -> list[ZotelSyncRecord]:
+def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str, data: dict, import_from_date: date | None = None) -> list[ZotelSyncRecord]:
     """
     Import/reconcile ONE Zotel reservation, which may contain N rooms, into N
     OS10 bookings (one per room). Returns one ZotelSyncRecord per room.
@@ -617,6 +648,13 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
                 if check_out <= today:
                     d["disposition"] = "skipped"
                     d["gate_detail"] = f"Historical Zotel reservation (check_out {check_out} on or before today); not imported (room {d['external_room_id']})"
+                elif import_from_date is not None and check_in < import_from_date:
+                    # Defense-in-depth lower bound, re-enforced locally even
+                    # though Zotel was also asked to filter by checkin_from.
+                    # The comparison uses the CHECK-IN date (not stay-overlap)
+                    # to match the Zotel API's checkin_from semantics.
+                    d["disposition"] = "skipped"
+                    d["gate_detail"] = f"Zotel reservation check-in {check_in} is before the configured import_from_date {import_from_date}; not imported (room {d['external_room_id']})"
                 else:
                     d["disposition"] = "place"
             else:

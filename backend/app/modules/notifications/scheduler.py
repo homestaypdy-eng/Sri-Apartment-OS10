@@ -98,6 +98,9 @@ def _run_zotel_sync():
         db = SessionLocal()
         # triggered_by remains NULL for this automatic run; manual route
         # invocations pass the authenticated user's ID into the same service.
+        # import_from_date is left unset here so the automatic sync picks up
+        # the configured default (settings.zotel_import_from_date) inside
+        # sync_bookings — no lower bound when that setting is unset.
         sync_log = zotel_service.sync_bookings(db, triggered_by=None)
         log_method = logger.warning if sync_log.status == "failed" else logger.info
         log_method(

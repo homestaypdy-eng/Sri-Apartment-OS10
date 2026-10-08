@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -140,9 +141,16 @@ def delete_mapping(mapping_id: uuid.UUID, db: Session = Depends(get_db), user: U
 
 
 @router.post("/sync/bookings", response_model=ZotelSyncLogOut, dependencies=[Depends(require_role("admin"))])
-def trigger_bookings_sync(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+def trigger_bookings_sync(
+    import_from_date: date | None = None,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Trigger a Zotel booking sync. An optional import_from_date (CHECK-IN
+    lower bound, ISO date) overrides the configured default for this run;
+    omitting it uses settings.zotel_import_from_date (or no bound if unset)."""
     try:
-        return service.sync_bookings(db, triggered_by=current_user.id)
+        return service.sync_bookings(db, triggered_by=current_user.id, import_from_date=import_from_date)
     except service.ZotelSyncAlreadyRunning:
         raise HTTPException(
             status_code=409,
