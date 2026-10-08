@@ -350,6 +350,43 @@ def test_maintenance_unit_never_offered_by_batch_endpoint(headers):
     assert not any(row["unit_id"] == unit_id for row in r.json()), "Maintenance unit must not appear as a candidate at all"
 
 
+def test_batch_availability_route_not_captured_by_unit_patch_route():
+    """Regression for HTTP 405 on GET /api/v1/units/availability.
+
+    The properties router (included before the bookings router in
+    app/main.py) defines a parametrized `PATCH /units/{unit_id}` route.
+    Because the literal path `/units/availability` structurally matches
+    `/units/{unit_id}`, a mis-ordered or missing GET handler lets Starlette
+    resolve the path to the PATCH route only and return `405 Method Not
+    Allowed` with `Allow: PATCH` for the batch GET — the route gets captured
+    by the parametrized unit route instead of reaching its own GET handler.
+
+    This test runs without the DB `headers` fixture on purpose: route and
+    method resolution happen before any auth/DB access, so the behavior is
+    observable from the raw status code alone.
+    """
+    # The GET must resolve to its own handler, not be captured by the
+    # parametrized PATCH /units/{unit_id} route. Without a token it's 401,
+    # which still proves the GET route is wired; a 405 here would mean the
+    # path was captured by PATCH /units/{unit_id} (Allow: PATCH).
+    resp = client.get("/api/v1/units/availability")
+    assert resp.status_code == 401, (
+        "GET /api/v1/units/availability must resolve to its own batch handler "
+        f"(expected 401 without auth), got {resp.status_code} "
+        f"(Allow: {resp.headers.get('Allow')!r}). A 405 here means the path was "
+        "captured by the parametrized PATCH /units/{unit_id} route."
+    )
+
+    # The route is GET-only, so a non-GET verb on the same literal path must
+    # be 405 — this is what makes a 405 on the GET above specifically diagnose
+    # the capture regression rather than a generic routing error.
+    delete_resp = client.request("DELETE", "/api/v1/units/availability")
+    assert delete_resp.status_code == 405, (
+        "DELETE /api/v1/units/availability must be 405 (route is GET-only), "
+        f"got {delete_resp.status_code}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Real concurrency (section 10/17.10) — genuine threads, real DB, real
 # EXCLUDE constraint, not a mocked/serialized simulation.
