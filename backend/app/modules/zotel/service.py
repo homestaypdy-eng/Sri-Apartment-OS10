@@ -803,12 +803,18 @@ def _place_new_booking(
         external_reservation_id=transaction_id,
         external_room_id=external_room_id,
     )
-    db.add(booking)
+    # Wrap the risky add/flush in a SAVEPOINT (begin_nested) rather than a
+    # whole-Session rollback. This batch commits only ONCE, at the end of
+    # _sync_bookings_locked, so a plain db.rollback() here would discard every
+    # EARLIER reservation's already-placed booking/payment in the same batch.
+    # The savepoint confines a flush-time EXCLUDE rejection (the final race
+    # backstop) to just this offending row; the batch's prior work survives to
+    # the single end-of-batch commit, and this room is recorded as conflicted.
     try:
-        db.flush()
+        with db.begin_nested():
+            db.add(booking)
+            db.flush()
     except Exception as e:  # noqa: BLE001 — DB EXCLUDE constraint is the final guard; a race here must not corrupt the sync
-        db.rollback()
-        db.add(sync_log)  # sync_log itself was rolled back too — re-attach for the caller's later commit
         logger.warning("Zotel import: DB rejected booking for reservation %s (room %s): %s", transaction_id, external_room_id, type(e).__name__)
         return None, _record(sync_log.id, transaction_id, "conflicted", None,
                              f"Database rejected this booking as an overlapping reservation at insert time (room {external_room_id})")
