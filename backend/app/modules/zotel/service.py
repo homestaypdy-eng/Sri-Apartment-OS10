@@ -481,6 +481,23 @@ def _sync_bookings_locked(db: Session, triggered_by: uuid.UUID | None = None, st
     return sync_log
 
 
+_ZOTEL_CURRENCY_KEYS = ("currency", "currency_code")
+
+
+def _currency_problem(data: dict) -> str | None:
+    """None when the reservation's amounts can be recorded as INR, otherwise
+    the reason they can't (F7). OS10 stores every amount in INR with no
+    currency column. The documented Zotel booking-detail shape carries no
+    currency field, so an absent currency means the property's INR; any
+    explicit value other than INR (or a malformed one) is never treated as
+    rupees and never converted."""
+    reported = {key: data[key] for key in _ZOTEL_CURRENCY_KEYS if data.get(key) is not None}
+    for key, value in reported.items():
+        if not isinstance(value, str) or value.strip().upper() != "INR":
+            return f"{key}={value!r}"
+    return None
+
+
 def _to_minor(amount) -> int:
     """Rupees (Decimal/float/int/str/None) -> integer paise. Non-numeric/None
     -> 0. Parsed through decimal.Decimal (via str() so a binary float like
@@ -642,6 +659,14 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
     acc_by_idx = {idx: acc_shares[pos] for pos, idx in enumerate(allocatable_idxs)}
     paid_by_idx = {idx: paid_shares[pos] for pos, idx in enumerate(allocatable_idxs)}
 
+    # ---- Currency gate (F7) ----
+    # A non-INR (or malformed) currency never becomes a rupee amount: rooms are
+    # still imported/reconciled so the unit stays blocked, but with no nightly
+    # rate derived from the foreign total and no payment recorded.
+    currency_problem = _currency_problem(data)
+    if currency_problem:
+        acc_by_idx = {idx: 0 for idx in acc_by_idx}
+
     # ---- Pass 1.5: disposition per room (STATUS GATE composed here) ----
     for d in descriptors:
         if not d["allocatable"]:
@@ -772,7 +797,7 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
         if d["allocatable"] and d["booking"] is None
     )
     payment_incomplete = orphaned_paid_minor > 0
-    payment_deferred = reservation_has_collision or payment_incomplete or room_set_drift
+    payment_deferred = reservation_has_collision or payment_incomplete or room_set_drift or bool(currency_problem)
 
     for booking in drifted_bookings:
         records.append(_record(
@@ -802,6 +827,14 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
             if not d["allocatable"] or d["booking"] is None:
                 continue
             _maybe_record_payment(db, d["booking"], data, paid_by_idx.get(d["idx"], 0))
+
+    if currency_problem:
+        currency_note = (
+            f" Zotel reports {currency_problem}; OS10 records amounts only in INR, so the reservation's amounts "
+            "were not recorded (no payment, no nightly rate) and are left for manual reconciliation."
+        )
+        for rec in records:
+            rec.detail = (rec.detail or "") + currency_note
 
     return records
 
