@@ -620,6 +620,20 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
                             "existing": _find_existing_room_booking(db, transaction_id, external_room_id, single_room=single_room),
                             "booking": None, "disposition": None, "gate_detail": None})
 
+    # ---- Room-set drift (F4) ----
+    # An OS10 booking already imported for this reservation whose room is no
+    # longer in Zotel's rooms[] is left untouched (never auto-cancelled), but
+    # its presence means paid_amount can't be re-allocated across only the
+    # remaining rooms: their shares would grow and the delta recording below
+    # would add money on top of what the removed room's booking already holds.
+    matched_booking_ids = {d["existing"].id for d in descriptors if d["existing"] is not None}
+    drifted_bookings = [
+        b for b in db.scalars(select(Booking).where(Booking.external_reservation_id == transaction_id)).all()
+        if b.id not in matched_booking_ids
+        and (b.status != "cancelled" or _recorded_zotel_payment_minor(db, [b.id]) > 0)
+    ]
+    room_set_drift = bool(drifted_bookings)
+
     # ---- Allocation across allocatable (real) rooms, in exact minor units ----
     allocatable_idxs = [d["idx"] for d in descriptors if d["allocatable"]]
     n_alloc = len(allocatable_idxs)
@@ -693,9 +707,18 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
             continue
         if disp == "reconcile":
             effective_status = d["room"].get("status") or zotel_status
-            d["booking"] = d["existing"]
-            records.append(_reconcile_existing(db, sync_log, d["existing"], effective_status,
-                                               check_in, check_out, data, d["mapping"].unit_id, external_room_id))
+            rec = _reconcile_existing(db, sync_log, d["existing"], effective_status,
+                                      check_in, check_out, data, d["mapping"].unit_id, external_room_id)
+            # F5: only an existing booking that is confirmed and already in
+            # sync may receive this reservation's payment. A conflicted
+            # booking (dates/unit changed, or locally progressed) or one this
+            # sync just cancelled is left without a booking here, so the
+            # payment gate below defers the whole reservation payment.
+            if rec.outcome == "skipped" and d["existing"].status in SAFE_TO_AUTO_UPDATE_STATUSES:
+                d["booking"] = d["existing"]
+            elif rec.outcome == "conflicted" and paid_by_idx.get(idx, 0) > 0:
+                rec.detail += " Payment not recorded while this conflict is unresolved."
+            records.append(rec)
             continue
         if disp == "skipped":
             records.append(_record(sync_log.id, transaction_id, "skipped", None, d["gate_detail"]))
@@ -749,7 +772,15 @@ def _import_reservation(db: Session, sync_log: ZotelSyncLog, transaction_id: str
         if d["allocatable"] and d["booking"] is None
     )
     payment_incomplete = orphaned_paid_minor > 0
-    payment_deferred = reservation_has_collision or payment_incomplete
+    payment_deferred = reservation_has_collision or payment_incomplete or room_set_drift
+
+    for booking in drifted_bookings:
+        records.append(_record(
+            sync_log.id, transaction_id, "conflicted", booking.id,
+            f"OS10 booking {booking.id} (room {booking.external_room_id}, status={booking.status}) belongs to this "
+            "reservation but its room is no longer in Zotel's room list; left untouched for manual review. "
+            "Reservation payment deferred until the room set is reconciled.",
+        ))
 
     incomplete_note = (
         " Reservation payment deferred: one or more rooms in this reservation could not be placed "
