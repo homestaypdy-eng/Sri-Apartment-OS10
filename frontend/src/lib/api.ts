@@ -63,6 +63,7 @@ api.interceptors.response.use(
         });
         localStorage.setItem("access_token", data.access_token);
         localStorage.setItem("refresh_token", data.refresh_token);
+        window.dispatchEvent(new Event("os10:auth-updated"));
         original.headers.Authorization = `Bearer ${data.access_token}`;
         isRefreshing = false;
         return api(original);

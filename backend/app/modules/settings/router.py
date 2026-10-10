@@ -45,7 +45,7 @@ def get_or_create_bank_settings(db: Session, *, commit_if_created: bool = True) 
     return bank
 
 
-@router.get("", response_model=BusinessSettingsOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("", response_model=BusinessSettingsOut, dependencies=[Depends(require_role("admin"))])
 def read_settings(db: Session = Depends(get_db)):
     return get_or_create_settings(db)
 
@@ -157,7 +157,7 @@ def get_system_info(db: Session = Depends(get_db)):
     )
 
 
-@router.get("/roles-permissions", response_model=RolesPermissionsOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/roles-permissions", response_model=RolesPermissionsOut, dependencies=[Depends(require_role("admin"))])
 def get_roles_permissions():
     """
     A real, accurate reference of what the roles in this system can
@@ -196,9 +196,10 @@ def get_roles_permissions():
         # drifted — it described only "the two roles" from before Manager
         # existed. This entry mirrors the actual require_role(...) grants
         # verified across the codebase (properties/pricing, bookings/finance
-        # views, staff_ops, OTA view+sync) and exclusions (settings, users,
-        # audit, staff/HR, refunds/credit-notes, AI Strategist, property/unit
-        # CRUD) — informational only, no authorization code reads this.
+        # views, limited staff operations, and OTA view+sync) and exclusions
+        # (settings, users, audit, payroll/HR administration, refunds/credit
+        # note creation, AI Strategist, property/unit CRUD) — informational
+        # only, no authorization code reads this.
         RolePermission(
             role="manager",
             description="Operational management access — day-to-day operations and pricing, without administrative, financial-approval, or security functions.",
@@ -207,12 +208,14 @@ def get_roles_permissions():
                 "Record payments, generate invoices/quotations, and view existing credit notes",
                 "View reports, dashboards, staff operations, and OTA channel/sync status",
                 "Manage accommodation pricing: base/weekend rates, seasonal rates, and long-stay discount tiers",
+                "Record attendance and manage shifts, holidays, and apartment assignments for operational staff",
             ],
             cannot_do=[
                 "Create staff accounts, change any user's role, or access user administration",
                 "Access Bank & UPI settings, business settings, system configuration, or backups",
                 "View the audit log or login history",
-                "Access Staff/HR administration (attendance, leave, payroll, staff profiles)",
+                "Approve/finalize payroll or access staff profiles, leave administration, advances, or HR records",
+                "Modify attendance/leave records for Admin or Manager accounts",
                 "Issue payment refunds, security-deposit refunds, or credit notes",
                 "Delete, archive, or restore bookings, or merge guest records",
                 "Create, edit, or deactivate properties/units (pricing only)",

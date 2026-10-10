@@ -36,6 +36,7 @@ from app.modules.portal.models import REQUEST_STATUSES as REQ_STATUSES, GuestReq
 from app.modules.properties.models import Unit
 from app.modules.staff_ops.schemas import CheckInLine, CheckOutLine, StaffDashboardOut, StaffTaskOut, StaffTaskUpdate
 from app.shared.rbac import get_current_user, require_role
+from app.shared.staff_task_access import forbid_staff_reassignment, require_assigned_task, scoped_assignee
 
 router = APIRouter(prefix="/api/v1/staff", tags=["staff-operations"])
 
@@ -157,9 +158,12 @@ def list_tasks(
     status: str | None = None,
     assigned_to: uuid.UUID | None = Query(None, description="Pass the caller's own user id to see only tasks assigned to them"),
     db: Session = Depends(get_db),
+    actor: User = Depends(get_current_user),
 ):
     if category is not None and category not in ("housekeeping", "maintenance", "guest_request"):
         raise HTTPException(400, f"Invalid category '{category}'")
+
+    assigned_to = scoped_assignee(actor, assigned_to)
 
     unit_ids: set[uuid.UUID] = set()
     hk_tasks: list[HousekeepingTask] = []
@@ -252,6 +256,7 @@ def update_task(
     produces an identical audit trail to one updated from the dedicated
     Housekeeping/Maintenance/Guest Requests page.
     """
+    forbid_staff_reassignment(user, payload.model_fields_set)
     if category == "housekeeping":
         # Phase 6: locked FOR UPDATE, matching the maintenance branch below
         # (MaintenanceTicket already uses with_for_update=True) — closes the
@@ -260,6 +265,7 @@ def update_task(
         task = db.get(HousekeepingTask, task_id, with_for_update=True)
         if task is None:
             raise HTTPException(404, "Task not found")
+        require_assigned_task(user, task.assigned_to)
 
         # Canonical mutation workflow (app/modules/housekeeping/service.py)
         # — the same function the dedicated Housekeeping page's own PATCH
@@ -290,6 +296,9 @@ def update_task(
         ticket = db.get(MaintenanceTicket, task_id, with_for_update=True)
         if ticket is None:
             raise HTTPException(404, "Task not found")
+        require_assigned_task(user, ticket.assigned_to)
+        if user.role.name == "staff" and set(payload.model_fields_set) - {"status"}:
+            raise HTTPException(403, "Staff may only update the status of assigned maintenance work")
         was_resolved_before = ticket.status in ("resolved", "closed")
         changes = []
         if payload.status is not None:
@@ -326,9 +335,12 @@ def update_task(
         )
 
     if category == "guest_request":
-        req = db.get(GuestRequest, task_id)
+        req = db.get(GuestRequest, task_id, with_for_update=True)
         if req is None:
             raise HTTPException(404, "Task not found")
+        require_assigned_task(user, req.assigned_to)
+        if user.role.name == "staff" and set(payload.model_fields_set) - {"status", "notes"}:
+            raise HTTPException(403, "Staff may only update the status or work notes of assigned guest requests")
         changes = []
         if payload.status is not None:
             if payload.status not in REQ_STATUSES:

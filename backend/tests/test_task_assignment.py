@@ -371,14 +371,17 @@ def test_reassigned_task_disappears_from_previous_assignees_my_tasks(headers, st
     assert any(t["id"] == task["id"] for t in now_theirs)
 
 
-def test_staff_can_assign_and_reassign_task(staff_headers, headers, staff_user_id, second_staff_id):
-    """RBAC: staff (not just admin) can call the assignment PATCH — the
-    endpoint's role check is unchanged (admin,staff), this just confirms
-    the assignment code path itself doesn't add an admin-only gate."""
+def test_staff_cannot_claim_an_unassigned_task_by_direct_id(staff_headers, headers, staff_user_id):
+    """Staff may update assigned work but cannot claim an unassigned row by guessing its ID."""
     task = _make_hk_task(headers)
     resp = client.patch(f"/api/v1/staff/tasks/{task['id']}", headers=staff_headers, json={"assigned_to": staff_user_id}, params={"category": "housekeeping"})
-    assert resp.status_code == 200
-    assert resp.json()["assigned_to"] == staff_user_id
+    assert resp.status_code == 403
+
+    # The attempted claim does not change ownership; Admin/Manager retain
+    # their operational assignment capability.
+    still_unassigned = client.get("/api/v1/housekeeping-tasks", headers=headers).json()
+    row = next(item for item in still_unassigned if item["id"] == task["id"])
+    assert row["assigned_to"] is None
 
 
 def test_unauthenticated_cannot_assign(headers):

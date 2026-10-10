@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, extractErrorMessage } from "../lib/api";
+import { useRealtimeRefresh } from "../lib/realtime";
 import { Badge, Button, Card, Drawer, EmptyState, ErrorBanner, Spinner, type BadgeTone } from "../components/ui";
 
 interface DisplayStatus {
@@ -188,6 +189,8 @@ export default function MessagesPage() {
       setListLoading(false);
     }
   }, [filter, search]);
+
+  useRealtimeRefresh(["messages.changed", "bookings.changed", "guests.changed"], loadConversations);
 
   useEffect(() => {
     loadConversations();

@@ -34,6 +34,7 @@ import {
 } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 type Tab = "gst" | "deposits" | "withdrawals" | "commissions" | "outstanding" | "cashflow" | "budget" | "pnl" | "utility" | "purchases" | "cashbook" | "closing" | "advances" | "expenses" | "laundry" | "income_register" | "loans";
 
@@ -46,11 +47,7 @@ const monthStartStr = () => {
 export default function FinancePage() {
   const { role } = useAuth();
   const isAdmin = role === "admin";
-  // RBAC Phase B security fix (finding I-1): security-deposit refunds are
-  // admin+staff only on the backend (POST /finance/deposits/{id}/refund) —
-  // Manager was mistakenly swept into that route's role list during Phase B
-  // and has since been excluded again. This mirrors that exactly (not
-  // `isAdmin`, which would also hide the control from Staff).
+  // Security-deposit refunds are reserved for Admin/Owner only.
   const isManager = role === "manager";
   const [tab, setTab] = useState<Tab>("gst");
   const [error, setError] = useState<string | null>(null);
@@ -75,6 +72,7 @@ export default function FinancePage() {
     { key: "purchases", label: "Purchase Register" },
     { key: "laundry", label: "Laundry Register" },
   ];
+  const visibleTabs = tabs.filter((item) => isAdmin || !["withdrawals", "loans"].includes(item.key));
 
   return (
     <div>
@@ -83,7 +81,7 @@ export default function FinancePage() {
       <SuccessBanner message={success} />
 
       <div className="flex gap-1 mb-6 border-b border-slate-200 overflow-x-auto">
-        {tabs.map((t) => (
+        {visibleTabs.map((t) => (
           <button
             key={t.key}
             onClick={() => setTab(t.key)}
@@ -102,7 +100,7 @@ export default function FinancePage() {
       {tab === "cashbook" && <CashbookTab setError={setError} />}
       {tab === "closing" && <ClosingTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "advances" && <AdvancesTab setError={setError} />}
-      {tab === "deposits" && <DepositsTab isManager={isManager} setError={setError} setSuccess={setSuccess} />}
+      {tab === "deposits" && <DepositsTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "withdrawals" && <WithdrawalsTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "loans" && <LoansTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "commissions" && <CommissionsTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
@@ -155,6 +153,7 @@ function GstDashboardTab({ setError }: { setError: (e: string | null) => void })
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "payments.changed", "bookings.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -198,7 +197,7 @@ function GstDashboardTab({ setError }: { setError: (e: string | null) => void })
 }
 
 // --- Security Deposits ---
-function DepositsTab({ isManager, setError, setSuccess }: { isManager: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+function DepositsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [deposits, setDeposits] = useState<SecurityDepositOut[]>([]);
   const [form, setForm] = useState({ booking_id: "", amount: "", notes: "" });
   const [refundDrafts, setRefundDrafts] = useState<Record<string, string>>({});
@@ -211,6 +210,7 @@ function DepositsTab({ isManager, setError, setSuccess }: { isManager: boolean; 
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "payments.changed", "bookings.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -277,7 +277,7 @@ function DepositsTab({ isManager, setError, setSuccess }: { isManager: boolean; 
                   {/* RBAC Phase B security fix (finding I-1): refunding is
                       admin+staff only on the backend — Manager gets no
                       refund control here, matching that exactly. */}
-                  {d.pending_refund_amount > 0 && !isManager && (
+                  {d.pending_refund_amount > 0 && isAdmin && (
                     <div className="flex gap-2">
                       <input
                         type="number"
@@ -312,6 +312,7 @@ function WithdrawalsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; s
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed"], load);
   useEffect(() => {
     if (isAdmin) load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -395,6 +396,7 @@ function LoansTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setErro
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "properties.changed"], load);
   useEffect(() => {
     if (isAdmin) load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -629,6 +631,7 @@ function CommissionsTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; s
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "payments.changed", "bookings.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -836,6 +839,7 @@ function OutstandingTab({ setError, setSuccess }: { setError: (e: string | null)
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "payments.changed", "bookings.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -898,6 +902,7 @@ function CashFlowTab({ setError }: { setError: (e: string | null) => void }) {
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "payments.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -947,6 +952,7 @@ function BudgetTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setErr
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1016,11 +1022,13 @@ function ApartmentPnLTab({ setError }: { setError: (e: string | null) => void })
   const [year, setYear] = useState(new Date().getFullYear());
   const [month, setMonth] = useState(new Date().getMonth() + 1);
   const [pnl, setPnl] = useState<ApartmentPnL | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+  useRealtimeRefresh(["finance.changed", "payments.changed", "bookings.changed", "properties.changed"], () => setRefreshKey((key) => key + 1));
 
   useEffect(() => {
     api.get("/units").then((r) => setUnits(r.data)).catch((err) => setError(extractErrorMessage(err)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [refreshKey]);
 
   useEffect(() => {
     if (!unitId) {
@@ -1031,7 +1039,7 @@ function ApartmentPnLTab({ setError }: { setError: (e: string | null) => void })
       .then((r) => setPnl(r.data))
       .catch((err) => setError(extractErrorMessage(err)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [unitId, year, month]);
+  }, [unitId, year, month, refreshKey]);
 
   return (
     <div>
@@ -1099,13 +1107,15 @@ function ApartmentPnLTab({ setError }: { setError: (e: string | null) => void })
 function CashbookTab({ setError }: { setError: (e: string | null) => void }) {
   const [cashbookDate, setCashbookDate] = useState(todayStr());
   const [cashbook, setCashbook] = useState<DailyCashbook | null>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+  useRealtimeRefresh(["finance.changed", "payments.changed", "bookings.changed"], () => setRefreshKey((key) => key + 1));
 
   useEffect(() => {
     api.get("/finance/cashbook", { params: { cashbook_date: cashbookDate } })
       .then((r) => setCashbook(r.data))
       .catch((err) => setError(extractErrorMessage(err)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cashbookDate]);
+  }, [cashbookDate, refreshKey]);
 
   return (
     <div>
@@ -1164,6 +1174,7 @@ function ClosingTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setEr
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "payments.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1221,11 +1232,13 @@ function ClosingTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setEr
 // --- Advances ---
 function AdvancesTab({ setError }: { setError: (e: string | null) => void }) {
   const [advances, setAdvances] = useState<AdvanceSummaryLine[]>([]);
+  const [refreshKey, setRefreshKey] = useState(0);
+  useRealtimeRefresh(["payments.changed", "bookings.changed"], () => setRefreshKey((key) => key + 1));
 
   useEffect(() => {
     api.get("/finance/advances").then((r) => setAdvances(r.data)).catch((err) => setError(extractErrorMessage(err)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [refreshKey]);
 
   return (
     <Card>
@@ -1273,6 +1286,7 @@ function UtilityTab({ setError, setSuccess }: { setError: (e: string | null) => 
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "properties.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1483,6 +1497,7 @@ function PurchasesTab({ setError, setSuccess }: { setError: (e: string | null) =
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "inventory.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1647,6 +1662,7 @@ function ExpensesTab({ isAdmin, isManager, setError, setSuccess }: { isAdmin: bo
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "payments.changed", "properties.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2035,6 +2051,7 @@ function LaundryTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setEr
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "properties.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2177,6 +2194,7 @@ function IncomeRegisterTab({ setError }: { setError: (e: string | null) => void 
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["finance.changed", "payments.changed", "bookings.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps

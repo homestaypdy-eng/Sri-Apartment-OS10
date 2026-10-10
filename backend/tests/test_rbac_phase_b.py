@@ -155,6 +155,30 @@ def test_manager_cannot_access_payroll_or_staff_profiles(manager_ctx):
     assert client.post("/api/v1/staff/profiles", headers=h, json={"user_id": str(uuid.uuid4())}).status_code == 403
 
 
+def test_staff_self_service_leave_and_payroll_are_scoped(admin_headers, staff_ctx):
+    other_staff = _register_and_login(admin_headers, "staff")
+    payroll = client.post("/api/v1/staff/payroll", headers=admin_headers, json={
+        "user_id": other_staff["user_id"], "period_year": 2098, "period_month": 11, "basic_salary": 12000,
+    })
+    assert payroll.status_code == 201, payroll.text
+
+    staff_headers = staff_ctx["headers"]
+    own_payroll = client.get("/api/v1/staff/payroll", headers=staff_headers)
+    assert own_payroll.status_code == 200
+    assert payroll.json()["id"] not in {item["id"] for item in own_payroll.json()}
+    assert client.get("/api/v1/staff/payroll", headers=staff_headers, params={"user_id": other_staff["user_id"]}).status_code == 403
+
+    leave_payload = {
+        "user_id": other_staff["user_id"], "from_date": "2098-11-01", "to_date": "2098-11-02", "reason": "private test",
+    }
+    assert client.post("/api/v1/staff/leave", headers=staff_headers, json=leave_payload).status_code == 403
+    leave_payload["user_id"] = staff_ctx["user_id"]
+    own_leave = client.post("/api/v1/staff/leave", headers=staff_headers, json=leave_payload)
+    assert own_leave.status_code == 201, own_leave.text
+    assert client.get("/api/v1/staff/leave", headers=staff_headers).json()[0]["id"] == own_leave.json()["id"]
+    assert client.get("/api/v1/staff/leave", headers=staff_headers, params={"user_id": other_staff["user_id"]}).status_code == 403
+
+
 # ---------------------------------------------------------------------------
 # E. Manager cannot DELETE/archive/restore bookings
 # ---------------------------------------------------------------------------
@@ -178,7 +202,39 @@ def test_manager_cannot_issue_refunds(admin_headers, manager_ctx):
     _, payment = _make_booking_with_payment(admin_headers, unit["id"], days_offset=9780)
     h = manager_ctx["headers"]
     assert client.post(f"/api/v1/payments/{payment['id']}/refund", headers=h, json={"amount": 100}).status_code == 403
-    assert client.post("/api/v1/payment-gateway/refunds", headers=h, json={"payment_id": payment["id"], "amount": 100}).status_code == 403
+    missing_id = uuid.uuid4()
+    assert client.post(f"/api/v1/finance/deposits/{missing_id}/refund", headers=h, json={"refund_amount": 1}).status_code == 403
+    assert client.post(f"/api/v1/bookings/{missing_id}/retry-refund", headers=h, json={"refund_amount": 1}).status_code == 403
+
+
+def test_manager_expense_submission_requires_admin_approval_before_payment(admin_headers, manager_ctx):
+    h = manager_ctx["headers"]
+    submitted = client.post("/api/v1/finance/expenses", headers=h, json={
+        "category": "maintenance", "amount": 1250, "expense_date": date.today().isoformat(),
+        "approval_status": "approved",
+    })
+    assert submitted.status_code == 201, submitted.text
+    expense = submitted.json()
+    assert expense["approval_status"] == "pending"
+    assert expense["approved_by"] is None
+    assert client.post(f"/api/v1/finance/expenses/{expense['id']}/approval", headers=h, json={"approve": True}).status_code == 403
+    payment_payload = {"amount": 100, "payment_date": date.today().isoformat(), "payment_method": "cash"}
+    payment_headers = {**h, "Idempotency-Key": f"manager-expense-{uuid.uuid4().hex}"}
+    assert client.post(f"/api/v1/finance/expenses/{expense['id']}/payments", headers=payment_headers, json=payment_payload).status_code == 409
+
+    approved = client.post(f"/api/v1/finance/expenses/{expense['id']}/approval", headers=admin_headers, json={"approve": True})
+    assert approved.status_code == 200, approved.text
+    payment_headers["Idempotency-Key"] = f"manager-expense-{uuid.uuid4().hex}"
+    recorded = client.post(f"/api/v1/finance/expenses/{expense['id']}/payments", headers=payment_headers, json=payment_payload)
+    assert recorded.status_code == 201, recorded.text
+
+
+def test_staff_cannot_issue_sensitive_deposit_refund_or_manual_retry(staff_ctx):
+    h = staff_ctx["headers"]
+    missing_id = uuid.uuid4()
+    assert client.post(f"/api/v1/finance/deposits/{missing_id}/refund", headers=h, json={"refund_amount": 1}).status_code == 403
+    assert client.post(f"/api/v1/bookings/{missing_id}/retry-refund", headers=h, json={"refund_amount": 1}).status_code == 403
+    assert client.post("/api/v1/payment-gateway/refunds", headers=h, json={"payment_id": str(missing_id), "amount": 100}).status_code == 403
 
 
 # ---------------------------------------------------------------------------
@@ -428,16 +484,14 @@ def test_admin_can_still_refund_security_deposit(admin_headers):
     assert resp.status_code == 200, resp.text
 
 
-def test_staff_can_still_refund_security_deposit(admin_headers, staff_ctx):
-    # Staff's refund access predates Manager's existence and Phase B never
-    # intended to touch it — this pins down that the fix (removing "manager"
-    # from this route's allow-list) left "staff" exactly as it was.
+def test_staff_cannot_refund_security_deposit(admin_headers, staff_ctx):
+    # Staff remains below Manager for sensitive owner-level money movement.
     _, unit = _make_property_unit(admin_headers)
     booking, _ = _make_booking_with_payment(admin_headers, unit["id"], days_offset=9830, paid_amount=0)
     deposit = client.post("/api/v1/finance/deposits", headers=admin_headers, json={"booking_id": booking["id"], "amount": 1000}).json()
 
     resp = client.post(f"/api/v1/finance/deposits/{deposit['id']}/refund", headers=staff_ctx["headers"], json={"refund_amount": 250})
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 403, resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -576,10 +630,7 @@ def test_roles_permissions_admin_sees_manager_entry(admin_headers):
 
 def test_roles_permissions_staff_sees_manager_entry(staff_ctx):
     resp = client.get("/api/v1/settings/roles-permissions", headers=staff_ctx["headers"])
-    assert resp.status_code == 200, resp.text
-    manager_entry = _role_entry(resp.json()["roles"], "manager")
-    assert manager_entry is not None
-    assert "pricing" in " ".join(manager_entry["can_do"]).lower()
+    assert resp.status_code == 403, resp.text
 
 
 def test_roles_permissions_manager_still_denied(manager_ctx):

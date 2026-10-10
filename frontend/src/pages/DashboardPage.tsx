@@ -10,8 +10,8 @@ import {
 } from "../lib/api";
 import { Badge, Button, Card, EmptyState, ErrorBanner, Spinner, Table } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
-const REFRESH_INTERVAL_MS = 20_000;
 const RECENT_BOOKINGS_LIMIT = 6;
 const INITIAL_ALERT_LIMIT = 3;
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -140,11 +140,31 @@ export default function DashboardPage() {
     }
   }, []);
 
-  useEffect(() => {
-    void load();
-    const interval = setInterval(() => void load(true), REFRESH_INTERVAL_MS);
-    return () => clearInterval(interval);
-  }, [load]);
+  const loadRecent = useCallback(async () => {
+    try {
+      const [bookingsResponse, guestsResponse, unitsResponse] = await Promise.all([api.get("/bookings"), api.get("/guests"), api.get("/units")]);
+      setRecentBookings(bookingsResponse.data);
+      setGuests(guestsResponse.data);
+      setUnits(unitsResponse.data);
+      setRecentError(null);
+    } catch (err) {
+      setRecentError(extractErrorMessage(err));
+    } finally {
+      setRecentLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+  useRealtimeRefresh(
+    ["bookings.changed", "availability.changed", "guests.changed", "payments.changed", "finance.changed", "properties.changed", "notifications.changed"],
+    () => {
+      void load(true);
+      void loadRecent();
+      void api.get("/reports/dashboard/calendar", { params: { period_year: calYear, period_month: calMonth } })
+        .then(({ data: responseData }) => setCalendar(responseData))
+        .catch(() => setCalendar(null));
+    },
+  );
 
   useEffect(() => {
     api.get("/reports/dashboard/calendar", { params: { period_year: calYear, period_month: calMonth } })
@@ -152,16 +172,7 @@ export default function DashboardPage() {
       .catch(() => setCalendar(null));
   }, [calYear, calMonth]);
 
-  useEffect(() => {
-    Promise.all([api.get("/bookings"), api.get("/guests"), api.get("/units")])
-      .then(([bookingsResponse, guestsResponse, unitsResponse]) => {
-        setRecentBookings(bookingsResponse.data);
-        setGuests(guestsResponse.data);
-        setUnits(unitsResponse.data);
-      })
-      .catch((err) => setRecentError(extractErrorMessage(err)))
-      .finally(() => setRecentLoading(false));
-  }, []);
+  useEffect(() => { void loadRecent(); }, [loadRecent]);
 
   const topRecentBookings = useMemo(() => [...recentBookings]
     .sort((a, b) => b.updated_at.localeCompare(a.updated_at))

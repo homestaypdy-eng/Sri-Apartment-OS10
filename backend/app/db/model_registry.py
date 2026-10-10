@@ -53,3 +53,4 @@ from app.modules.customer_auth.models import CustomerAccount, CustomerSession, C
 from app.modules.public_booking.models import PromoCode, BookingHold, PublicRateLimitBucket  # noqa: F401
 from app.modules.finance.models import Expense, ExpenseAttachment, Budget, SecurityDeposit, OwnerWithdrawal, OTACommission, OTAPayoutReceipt, UtilityReading, UtilityReadingAllocation, PurchaseRecord, DailyClosing, LaundryEntry, Loan, LoanEmiPayment, ExpensePayment  # noqa: F401
 from app.modules.automation import models as _automation_models  # noqa: F401
+from app.shared.realtime_models import RealtimeOutbox  # noqa: F401

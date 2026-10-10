@@ -179,7 +179,7 @@ def test_audit_log_has_structured_previous_and_new_value(headers):
         "unit_id": unit_id, "guest_id": guest["id"],
         "check_in": (date.today() + timedelta(days=850)).isoformat(), "check_out": (date.today() + timedelta(days=852)).isoformat(),
     }).json()
-    client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 4321, "reason": "structured field test"})
+    client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 4321, "reason": "structured field test", "expected_updated_at": booking["updated_at"]})
 
     logs = client.get("/api/v1/audit/logs", headers=headers, params={"action": "booking.edit"}).json()
     match = next((l for l in logs if l["entity_id"] == booking["id"]), None)

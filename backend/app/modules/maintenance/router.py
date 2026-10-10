@@ -17,6 +17,7 @@ from app.modules.notifications.service import trigger_maintenance_ticket_created
 from app.modules.properties.models import Unit
 from app.shared.file_upload import read_and_validate_upload, IMAGE_CONTENT_TYPES
 from app.shared.rbac import get_current_user, require_role
+from app.shared.staff_task_access import forbid_staff_reassignment, require_assigned_task, scoped_assignee, validate_staff_task_creation
 
 PHOTO_STORAGE_DIR = os.environ.get("MAINTENANCE_PHOTO_STORAGE_DIR", "/tmp/sri_apartment_maintenance_photos")
 os.makedirs(PHOTO_STORAGE_DIR, exist_ok=True)
@@ -35,6 +36,7 @@ def create_ticket(payload: MaintenanceTicketCreate, db: Session = Depends(get_db
         raise HTTPException(400, f"Invalid category '{payload.category}'")
     if payload.assigned_to is not None and db.get(User, payload.assigned_to) is None:
         raise HTTPException(404, "Assigned user not found")
+    validate_staff_task_creation(user, payload.assigned_to)
 
     ticket = MaintenanceTicket(
         unit_id=payload.unit_id,
@@ -61,8 +63,12 @@ def list_tickets(
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     query = select(MaintenanceTicket)
+    assignee = scoped_assignee(user, None)
+    if user.role.name == "staff":
+        query = query.where(MaintenanceTicket.assigned_to == assignee)
     if unit_id:
         query = query.where(MaintenanceTicket.unit_id == unit_id)
     if status:
@@ -79,6 +85,10 @@ def update_ticket(ticket_id: uuid.UUID, payload: MaintenanceTicketUpdate, db: Se
     ticket = db.get(MaintenanceTicket, ticket_id, with_for_update=True)
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
+    require_assigned_task(user, ticket.assigned_to)
+    forbid_staff_reassignment(user, payload.model_fields_set)
+    if user.role.name == "staff" and set(payload.model_fields_set) - {"status"}:
+        raise HTTPException(403, "Staff may only update the status of assigned maintenance work")
 
     changes = []
     was_resolved_before = ticket.status in ("resolved", "closed")
@@ -163,6 +173,7 @@ async def upload_maintenance_photo(ticket_id: uuid.UUID, photo_type: str, file: 
     ticket = db.get(MaintenanceTicket, ticket_id)
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
+    require_assigned_task(user, ticket.assigned_to)
     if photo_type not in PHOTO_TYPES:
         raise HTTPException(400, f"Invalid photo_type '{photo_type}'. Must be one of {PHOTO_TYPES}")
 
@@ -189,15 +200,21 @@ async def upload_maintenance_photo(ticket_id: uuid.UUID, photo_type: str, file: 
 
 
 @router.get("/{ticket_id}/photos", response_model=list[MaintenancePhotoOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def list_maintenance_photos(ticket_id: uuid.UUID, db: Session = Depends(get_db)):
+def list_maintenance_photos(ticket_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    ticket = db.get(MaintenanceTicket, ticket_id)
+    if ticket is None:
+        raise HTTPException(404, "Ticket not found")
+    require_assigned_task(user, ticket.assigned_to)
     return db.scalars(select(MaintenancePhoto).where(MaintenancePhoto.ticket_id == ticket_id)).all()
 
 
 @router.get("/{ticket_id}/photos/{photo_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def download_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db)):
+def download_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     photo = db.get(MaintenancePhoto, photo_id)
     if photo is None or photo.ticket_id != ticket_id:
         raise HTTPException(404, "Photo not found")
+    ticket = db.get(MaintenanceTicket, ticket_id)
+    require_assigned_task(user, ticket.assigned_to if ticket else None)
     if not os.path.exists(photo.file_path):
         raise HTTPException(404, "The stored file is missing from disk")
     return FileResponse(photo.file_path, media_type=photo.content_type, filename=photo.filename)
@@ -205,6 +222,8 @@ def download_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Se
 
 @router.delete("/{ticket_id}/photos/{photo_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role.name == "staff":
+        raise HTTPException(403, "Staff cannot delete maintenance evidence")
     photo = db.get(MaintenancePhoto, photo_id)
     if photo is None or photo.ticket_id != ticket_id:
         raise HTTPException(404, "Photo not found")
@@ -216,7 +235,7 @@ def delete_maintenance_photo(ticket_id: uuid.UUID, photo_id: uuid.UUID, db: Sess
 
 
 @router.get("/{ticket_id}/timeline", dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def get_maintenance_timeline(ticket_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_maintenance_timeline(ticket_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Every audit-logged event for this ticket, oldest first — same
     pattern as the booking/housekeeping timelines."""
     from app.modules.audit.models import AuditLog
@@ -224,6 +243,7 @@ def get_maintenance_timeline(ticket_id: uuid.UUID, db: Session = Depends(get_db)
     ticket = db.get(MaintenanceTicket, ticket_id)
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
+    require_assigned_task(user, ticket.assigned_to)
 
     logs = db.scalars(
         select(AuditLog).where(AuditLog.entity_type == "maintenance_ticket", AuditLog.entity_id == str(ticket_id)).order_by(AuditLog.created_at.asc())

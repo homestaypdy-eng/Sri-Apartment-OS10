@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type InquiryOut, type UnitOut, type PriceQuoteOut, type InquiryAttachmentOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge } from "../components/ui";
 import QuotationPopup from "../components/QuotationPopup";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 const emptyForm = {
   client_name: "",
@@ -76,6 +77,8 @@ export default function InquiriesPage() {
       setError(extractErrorMessage(err));
     }
   }
+
+  useRealtimeRefresh(["inquiries.changed", "availability.changed", "properties.changed", "guests.changed"], loadAll);
 
   useEffect(() => {
     loadAll();

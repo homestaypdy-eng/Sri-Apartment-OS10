@@ -451,7 +451,7 @@ def test_booking_edit_cannot_raise_party_above_capacity(headers):
         "check_out": (base + timedelta(days=1)).isoformat(), "adults": 1, "children": 1,
     })
     assert created.status_code == 201, created.text
-    changed = client.patch(f"/api/v1/bookings/{created.json()['id']}", headers=headers, json={"adults": 3, "reason": "capacity test"})
+    changed = client.patch(f"/api/v1/bookings/{created.json()['id']}", headers=headers, json={"adults": 3, "reason": "capacity test", "expected_updated_at": created.json()["updated_at"]})
     assert changed.status_code == 422
 
 

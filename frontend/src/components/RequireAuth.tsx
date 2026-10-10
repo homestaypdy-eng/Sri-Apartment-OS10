@@ -3,12 +3,20 @@ import { Navigate } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 
 export function RequireAuth({ children }: { children: ReactNode }) {
-  const { isAuthenticated, isInitializing } = useAuth();
+  const { role, isAuthenticated, isInitializing } = useAuth();
   // Render nothing (briefly) while the localStorage session check is still
   // running, rather than redirecting on the first render before that check
   // has had a chance to restore a valid session.
   if (isInitializing) return null;
   if (!isAuthenticated) return <Navigate to="/login" replace />;
+  if (role !== "admin" && role !== "manager" && role !== "staff") return <Navigate to="/login" replace />;
+  return <>{children}</>;
+}
+
+export function RequireRoles({ children, allowed }: { children: ReactNode; allowed: readonly string[] }) {
+  const { role, isInitializing } = useAuth();
+  if (isInitializing) return null;
+  if (!role || !allowed.includes(role)) return <Navigate to="/" replace />;
   return <>{children}</>;
 }
 
@@ -28,8 +36,5 @@ export function RequireAdmin({ children }: { children: ReactNode }) {
 // mirrors the existing app convention rather than introducing a new
 // "forbidden" page/pattern.
 export function RequireNotManager({ children }: { children: ReactNode }) {
-  const { role, isInitializing } = useAuth();
-  if (isInitializing) return null;
-  if (role === "manager") return <Navigate to="/" replace />;
-  return <>{children}</>;
+  return <RequireRoles allowed={["admin", "staff"]}>{children}</RequireRoles>;
 }

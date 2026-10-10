@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type AttendanceOut, type LeaveRequestOut, type PayrollOut, type ShiftOut, type HolidayOut, type UserOut, type UnitOut, type StaffApartmentAssignmentOut, type StaffPerformanceNoteOut, type StaffProfileOut, type StaffAdvanceOut, type StaffDesignationOut, type ResolvedPolicyOut, type AttendanceMonthlySummaryOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 type Tab = "directory" | "attendance" | "leave" | "payroll" | "shifts" | "holidays" | "assignments" | "performance" | "designations";
 
@@ -26,7 +27,9 @@ const DESIGNATION_SUGGESTIONS = [
 export default function StaffPage() {
   const { role } = useAuth();
   const isAdmin = role === "admin";
-  const [tab, setTab] = useState<Tab>("directory");
+  const isManager = role === "manager";
+  const isStaff = role === "staff";
+  const [tab, setTab] = useState<Tab>(isManager ? "attendance" : "directory");
   const [users, setUsers] = useState<UserOut[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -34,19 +37,20 @@ export default function StaffPage() {
   useEffect(() => {
     if (isAdmin) {
       api.get("/users").then((r) => setUsers(r.data)).catch(() => {});
+    } else if (isManager) {
+      api.get("/staff/operational-users").then((r) => setUsers(r.data)).catch(() => {});
     }
-  }, [isAdmin]);
+  }, [isAdmin, isManager]);
 
   const tabs: { key: Tab; label: string }[] = [
-    { key: "directory", label: "Staff Directory" },
+    ...(!isManager ? [{ key: "directory" as Tab, label: "Staff Directory" }] : []),
     ...(isAdmin ? [{ key: "designations" as Tab, label: "Designations" }] : []),
     { key: "attendance", label: "Attendance" },
-    { key: "leave", label: "Leave" },
-    { key: "payroll", label: "Payroll" },
+    ...(!isManager ? [{ key: "leave" as Tab, label: "Leave" }, { key: "payroll" as Tab, label: "Payroll" }] : []),
     { key: "shifts", label: "Shifts" },
     { key: "holidays", label: "Holidays" },
     { key: "assignments", label: "Apartment Assignment" },
-    { key: "performance", label: "Performance Notes" },
+    ...(!isManager ? [{ key: "performance" as Tab, label: "Performance Notes" }] : []),
   ];
 
   return (
@@ -69,14 +73,14 @@ export default function StaffPage() {
         ))}
       </div>
 
-      {tab === "directory" && <DirectoryTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
+      {tab === "directory" && <DirectoryTab users={users} isAdmin={isAdmin} onUserCreated={(created) => setUsers((current) => current.some((user) => user.id === created.id) ? current.map((user) => user.id === created.id ? created : user) : [...current, created])} setError={setError} setSuccess={setSuccess} />}
       {tab === "designations" && isAdmin && <DesignationsTab setError={setError} setSuccess={setSuccess} />}
-      {tab === "attendance" && <AttendanceTab users={users} setError={setError} setSuccess={setSuccess} />}
+      {tab === "attendance" && <AttendanceTab users={users} isStaff={isStaff} ownUserId={currentStaffUserId()} setError={setError} setSuccess={setSuccess} />}
       {tab === "leave" && <LeaveTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
       {tab === "payroll" && <PayrollTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
-      {tab === "shifts" && <ShiftsTab users={users} isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
-      {tab === "holidays" && <HolidaysTab isAdmin={isAdmin} setError={setError} setSuccess={setSuccess} />}
-      {tab === "assignments" && <AssignmentsTab isAdmin={isAdmin} users={users} setError={setError} setSuccess={setSuccess} />}
+      {tab === "shifts" && <ShiftsTab users={users} canManage={isAdmin || isManager} setError={setError} setSuccess={setSuccess} />}
+      {tab === "holidays" && <HolidaysTab isAdmin={isAdmin || isManager} setError={setError} setSuccess={setSuccess} />}
+      {tab === "assignments" && <AssignmentsTab isAdmin={isAdmin || isManager} users={users} setError={setError} setSuccess={setSuccess} />}
       {tab === "performance" && <PerformanceTab isAdmin={isAdmin} users={users} setError={setError} setSuccess={setSuccess} />}
     </div>
   );
@@ -104,6 +108,7 @@ function DesignationsTab({ setError, setSuccess }: { setError: (e: string | null
   function load() {
     api.get("/staff/designations", { params: { include_inactive: showInactive } }).then((r) => setDesignations(r.data)).catch(() => {});
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(load, [showInactive]);
 
   function startEdit(d: StaffDesignationOut) {
@@ -247,15 +252,17 @@ function DesignationsTab({ setError, setSuccess }: { setError: (e: string | null
 
 // --- Staff Directory ---
 
-function DirectoryTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]; isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+function DirectoryTab({ users, isAdmin, onUserCreated, setError, setSuccess }: { users: UserOut[]; isAdmin: boolean; onUserCreated: (user: UserOut) => void; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [profiles, setProfiles] = useState<StaffProfileOut[]>([]);
   const [payroll, setPayroll] = useState<PayrollOut[]>([]);
   const [modalTarget, setModalTarget] = useState<{ user: UserOut; profile: StaffProfileOut | null } | null>(null);
+  const [showAddStaff, setShowAddStaff] = useState(false);
 
   async function load() {
     try {
       const { data } = await api.get("/staff/profiles");
       setProfiles(data);
+      setModalTarget((current) => current ? { ...current, profile: data.find((profile: StaffProfileOut) => profile.user_id === current.user.id) ?? current.profile } : current);
       if (isAdmin) {
         const p = await api.get("/staff/payroll");
         setPayroll(p.data);
@@ -264,6 +271,7 @@ function DirectoryTab({ users, isAdmin, setError, setSuccess }: { users: UserOut
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed", "users.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -308,7 +316,10 @@ function DirectoryTab({ users, isAdmin, setError, setSuccess }: { users: UserOut
   return (
     <div>
       <Card>
-        <h2 className="text-sm font-semibold text-slate-900 mb-4">Staff Directory</h2>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div><h2 className="text-sm font-semibold text-slate-900">Staff Directory</h2><p className="mt-1 text-xs text-slate-500">Staff accounts and their HR profiles share the existing User ID.</p></div>
+          <Button onClick={() => setShowAddStaff(true)}>+ Add Staff</Button>
+        </div>
         <div className="overflow-x-auto">
           <Table headers={["Employee", "Designation", "Role", "Phone", "Salary", "Join Date", "Status", "Actions"]}>
             {users.map((u) => {
@@ -354,6 +365,80 @@ function DirectoryTab({ users, isAdmin, setError, setSuccess }: { users: UserOut
           setSuccess={setSuccess}
         />
       )}
+      {showAddStaff && <AddStaffModal users={users} onClose={() => setShowAddStaff(false)} onCreated={(user) => { onUserCreated(user); setShowAddStaff(false); setSuccess("Staff account and profile created."); void load(); }} setError={setError} />}
+    </div>
+  );
+}
+
+const NEW_STAFF_PROFILE_FIELDS = [
+  "employee_id", "department", "employment_type", "join_date", "exit_date", "phone", "alternate_phone",
+  "date_of_birth", "address", "emergency_contact_name", "emergency_contact_phone", "emergency_contact_relationship",
+  "id_type", "id_number", "designation", "designation_id", "salary_override", "shift_start_override", "shift_end_override",
+  "lunch_break_override_minutes", "standard_working_hours_override", "leave_entitlement_override", "weekly_off_day",
+  "supervisor_user_id", "notes", "account_holder_name", "bank_name", "account_number", "ifsc", "payment_method",
+] as const;
+
+function AddStaffModal({ users, onClose, onCreated, setError }: { users: UserOut[]; onClose: () => void; onCreated: (user: UserOut) => void; setError: (e: string | null) => void }) {
+  const [form, setForm] = useState<Record<string, string>>({ name: "", email: "", password: "", employee_id: "", department: "", employment_type: "full_time", join_date: "", exit_date: "", phone: "", alternate_phone: "", date_of_birth: "", address: "", emergency_contact_name: "", emergency_contact_phone: "", emergency_contact_relationship: "", id_type: "", id_number: "", designation: "", designation_id: "", salary_override: "", shift_start_override: "", shift_end_override: "", lunch_break_override_minutes: "", standard_working_hours_override: "", leave_entitlement_override: "", weekly_off_day: "", supervisor_user_id: "", notes: "", account_holder_name: "", bank_name: "", account_number: "", ifsc: "", payment_method: "", is_active: "true" });
+  const [designations, setDesignations] = useState<StaffDesignationOut[]>([]);
+  const [units, setUnits] = useState<UnitOut[]>([]);
+  const [assignedUnitIds, setAssignedUnitIds] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.get("/staff/designations").then((response) => setDesignations(response.data)).catch(() => {});
+    api.get("/units").then((response) => setUnits(response.data.filter((unit: UnitOut) => unit.is_active))).catch(() => {});
+  }, []);
+
+  function field(name: string, label: string, type = "text", required = false) {
+    return <label key={name} className="block text-xs text-slate-600">{label}<input type={type} required={required} value={form[name] ?? ""} onChange={(event) => setForm((current) => ({ ...current, [name]: event.target.value }))} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label>;
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true); setFormError(null); setError(null);
+    try {
+      const profile: Record<string, string | number | boolean> = {};
+      for (const key of NEW_STAFF_PROFILE_FIELDS) {
+        const raw = (form[key] ?? "").trim();
+        if (!raw) continue;
+        if (["salary_override", "lunch_break_override_minutes", "standard_working_hours_override", "leave_entitlement_override"].includes(key)) profile[key] = Number(raw);
+        else if (["shift_start_override", "shift_end_override"].includes(key)) profile[key] = `${raw}:00`;
+        else profile[key] = raw;
+      }
+      profile.is_active = form.is_active === "true";
+      const { data } = await api.post("/staff/onboard", { name: form.name.trim(), email: form.email.trim(), password: form.password, profile, assigned_unit_ids: assignedUnitIds });
+      onCreated(data.user);
+    } catch (error) {
+      setFormError(extractErrorMessage(error));
+    } finally { setSaving(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/40 p-4" role="dialog" aria-modal="true" aria-labelledby="add-staff-title">
+      <form onSubmit={submit} className="my-6 w-full max-w-4xl rounded-xl bg-white p-5 shadow-xl">
+        <div className="mb-4 flex items-center justify-between"><div><h2 id="add-staff-title" className="text-lg font-semibold">Add Staff</h2><p className="text-xs text-slate-500">Creates a Staff login and its linked profile together. Loginless employees are not supported in this phase.</p></div><button type="button" onClick={onClose} aria-label="Close">×</button></div>
+        {formError && <div role="alert" className="mb-3 rounded bg-red-50 p-2 text-sm text-red-700">{formError}</div>}
+        <div className="grid gap-4 md:grid-cols-2">
+          <fieldset className="space-y-3 rounded-lg border border-slate-200 p-3"><legend className="px-1 text-sm font-semibold">Login / identity</legend>{field("name", "Full name", "text", true)}{field("email", "Login email", "email", true)}{field("password", "Initial password", "password", true)}<p className="text-xs text-slate-500">Share the initial password securely. The server enforces the existing password rules.</p>{field("employee_id", "Employee ID")}{field("phone", "Phone / mobile", "tel")}{field("alternate_phone", "Alternate phone", "tel")}</fieldset>
+          <fieldset className="space-y-3 rounded-lg border border-slate-200 p-3"><legend className="px-1 text-sm font-semibold">Employment & schedule</legend>
+            <label className="block text-xs text-slate-600">Designation<select value={form.designation_id} onChange={(event) => { const selected = designations.find((designation) => designation.id === event.target.value); setForm((current) => ({ ...current, designation_id: event.target.value, designation: selected?.name ?? current.designation })); }} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="">Choose designation default (optional)</option>{designations.map((designation) => <option key={designation.id} value={designation.id}>{designation.name}</option>)}</select></label>
+            {field("designation", "Designation label")}{field("department", "Department")}
+            <label className="block text-xs text-slate-600">Employment type<select value={form.employment_type} onChange={(event) => setForm({ ...form, employment_type: event.target.value })} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="full_time">Full time</option><option value="part_time">Part time</option><option value="contract">Contract</option></select></label>
+            <div className="grid grid-cols-2 gap-2">{field("join_date", "Joining date", "date")}{field("exit_date", "Exit date", "date")}</div>
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={form.is_active === "true"} onChange={(event) => setForm({ ...form, is_active: String(event.target.checked) })} />Active employment profile</label>
+            <label className="block text-xs text-slate-600">Supervisor<select value={form.supervisor_user_id} onChange={(event) => setForm({ ...form, supervisor_user_id: event.target.value })} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="">None</option>{users.filter((user) => user.is_active).map((user) => <option key={user.id} value={user.id}>{user.name} ({user.role})</option>)}</select></label>
+            <div className="grid grid-cols-2 gap-2">{field("shift_start_override", "Shift start", "time")}{field("shift_end_override", "Shift end", "time")}</div>
+            <div className="grid grid-cols-2 gap-2">{field("weekly_off_day", "Weekly off day")}{field("standard_working_hours_override", "Standard hours", "number")}</div>
+            {field("lunch_break_override_minutes", "Lunch break override (minutes)", "number")}{field("leave_entitlement_override", "Monthly leave override (days)", "number")}{field("salary_override", "Basic salary override (₹ / month)", "number")}
+            <div><p className="mb-1 text-xs text-slate-600">Apartment assignments</p><div className="max-h-28 space-y-1 overflow-y-auto">{units.map((unit) => <label key={unit.id} className="flex items-center gap-2 text-xs"><input type="checkbox" checked={assignedUnitIds.includes(unit.id)} onChange={(event) => setAssignedUnitIds((current) => event.target.checked ? [...current, unit.id] : current.filter((id) => id !== unit.id))} />{unit.name}</label>)}</div></div>
+          </fieldset>
+          <fieldset className="space-y-3 rounded-lg border border-slate-200 p-3"><legend className="px-1 text-sm font-semibold">Personal & emergency contact</legend>{field("date_of_birth", "Date of birth", "date")}{field("address", "Address")}{field("emergency_contact_name", "Emergency contact name")}{field("emergency_contact_phone", "Emergency contact phone", "tel")}{field("emergency_contact_relationship", "Relationship")}{field("id_type", "Existing ID type")}{field("id_number", "Existing ID number")}</fieldset>
+          <fieldset className="space-y-3 rounded-lg border border-slate-200 p-3"><legend className="px-1 text-sm font-semibold">Bank / payment</legend>{field("account_holder_name", "Account holder")}{field("bank_name", "Bank name")}{field("account_number", "Account number")}{field("ifsc", "IFSC")}{field("payment_method", "Payment method")}<label className="block text-xs text-slate-600">Notes<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} rows={3} className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></label></fieldset>
+        </div>
+        <div className="mt-5 flex justify-end gap-2"><Button type="button" variant="secondary" onClick={onClose}>Cancel</Button><Button type="submit" disabled={saving}>{saving ? "Creating…" : "Create Staff Account & Profile"}</Button></div>
+      </form>
     </div>
   );
 }
@@ -621,6 +706,7 @@ function CompensationPanel({
   function loadPolicy() {
     api.get(`/staff/policy/${profile.user_id}`).then((r) => setPolicy(r.data)).catch(() => {});
   }
+  useRealtimeRefresh(["staff_operations.changed"], loadPolicy);
   useEffect(() => {
     api.get("/staff/designations").then((r) => setDesignations(r.data)).catch(() => {});
     loadPolicy();
@@ -918,6 +1004,7 @@ function ScopedLeavePanel({ userId, setError, setSuccess }: { userId: string; se
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -991,6 +1078,7 @@ function ScopedPayrollPanel({ userId, setError, setSuccess }: { userId: string; 
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1064,6 +1152,7 @@ function ScopedAdvancesPanel({ userId, setError, setSuccess }: { userId: string;
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1207,6 +1296,7 @@ function ScopedPerformancePanel({ userId, setError, setSuccess }: { userId: stri
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1275,7 +1365,14 @@ function ScopedAuditPanel({ entityId, setError }: { entityId: string; setError: 
   );
 }
 
-function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+function currentStaffUserId(): string | null {
+  try {
+    const token = localStorage.getItem("access_token");
+    return token ? JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).sub ?? null : null;
+  } catch { return null; }
+}
+
+function AttendanceTab({ users, isStaff, ownUserId, setError, setSuccess }: { users: UserOut[]; isStaff: boolean; ownUserId: string | null; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [records, setRecords] = useState<AttendanceOut[]>([]);
   const [form, setForm] = useState({ user_id: "", date: "", status: "present", check_in_time: "", check_out_time: "" });
 
@@ -1287,6 +1384,7 @@ function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setE
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1297,8 +1395,10 @@ function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setE
     setError(null);
     setSuccess(null);
     try {
+      const userId = isStaff ? ownUserId : form.user_id;
+      if (!userId) throw new Error("The signed-in user could not be identified. Sign in again.");
       await api.post("/staff/attendance", {
-        user_id: form.user_id, date: form.date, status: form.status,
+        user_id: userId, date: form.date, status: form.status,
         check_in_time: form.check_in_time ? `${form.check_in_time}:00` : undefined,
         check_out_time: form.check_out_time ? `${form.check_out_time}:00` : undefined,
       });
@@ -1315,12 +1415,12 @@ function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setE
       <Card className="max-w-lg">
         <h2 className="text-sm font-semibold text-slate-900 mb-4">Mark Attendance</h2>
         <form onSubmit={handleSubmit} className="space-y-3">
-          <select required value={form.user_id} onChange={(e) => setForm({ ...form, user_id: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
-            <option value="">Select staff member...</option>
-            {users.map((u) => (
-              <option key={u.id} value={u.id}>{u.name}</option>
-            ))}
-          </select>
+          {isStaff ? <p className="text-sm text-slate-600">Recording for your account</p> : (
+            <select required value={form.user_id} onChange={(e) => setForm({ ...form, user_id: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
+              <option value="">Select staff member...</option>
+              {users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <input required type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
             <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })} className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm">
@@ -1349,7 +1449,7 @@ function AttendanceTab({ users, setError, setSuccess }: { users: UserOut[]; setE
           <Table headers={["Staff", "Date", "Status", "In → Out", "Worked / Overtime"]}>
             {records.map((r) => (
               <tr key={r.id}>
-                <td className="px-4 py-2.5 font-medium text-slate-800">{userName(users, r.user_id)}</td>
+                <td className="px-4 py-2.5 font-medium text-slate-800">{isStaff && r.user_id === ownUserId ? "You" : userName(users, r.user_id)}</td>
                 <td className="px-4 py-2.5 text-slate-500">{r.date}</td>
                 <td className="px-4 py-2.5"><Badge tone={r.status === "present" ? "green" : r.status === "absent" ? "red" : "amber"}>{r.status.replace("_", " ")}</Badge></td>
                 <td className="px-4 py-2.5 text-slate-500">{r.check_in_time?.slice(0, 5) ?? "—"} → {r.check_out_time?.slice(0, 5) ?? "—"}</td>
@@ -1377,6 +1477,7 @@ function LeaveTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]; 
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1466,6 +1567,7 @@ function PayrollTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1592,7 +1694,7 @@ function PayrollTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]
   );
 }
 
-function ShiftsTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[]; isAdmin: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
+function ShiftsTab({ users, canManage, setError, setSuccess }: { users: UserOut[]; canManage: boolean; setError: (e: string | null) => void; setSuccess: (s: string | null) => void }) {
   const [records, setRecords] = useState<ShiftOut[]>([]);
   const [form, setForm] = useState({ user_id: "", date: "", shift_start: "09:00", shift_end: "17:00" });
 
@@ -1604,6 +1706,7 @@ function ShiftsTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[];
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1624,7 +1727,7 @@ function ShiftsTab({ users, isAdmin, setError, setSuccess }: { users: UserOut[];
 
   return (
     <div className="space-y-6">
-      {isAdmin && (
+      {canManage && (
         <Card className="max-w-lg">
           <h2 className="text-sm font-semibold text-slate-900 mb-4">Create Shift</h2>
           <form onSubmit={handleSubmit} className="space-y-3">
@@ -1674,6 +1777,7 @@ function HolidaysTab({ isAdmin, setError, setSuccess }: { isAdmin: boolean; setE
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1737,6 +1841,7 @@ function AssignmentsTab({ isAdmin, users, setError, setSuccess }: { isAdmin: boo
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed", "properties.changed"], load);
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1834,6 +1939,7 @@ function PerformanceTab({ isAdmin, users, setError, setSuccess }: { isAdmin: boo
       setError(extractErrorMessage(err));
     }
   }
+  useRealtimeRefresh(["staff_operations.changed"], () => load(selectedUser || undefined));
   useEffect(() => {
     load(selectedUser || undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps

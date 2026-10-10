@@ -3,6 +3,7 @@ import { api, extractErrorMessage, type GuestOut, type GuestHistory, type GuestD
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, type BadgeTone } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 import { INDIAN_STATES } from "../lib/indianStates";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 // Identity Verification display — entirely separate from Account
 // Verification (which this app has no Guest-level field for at all).
@@ -112,6 +113,8 @@ export default function GuestsPage() {
       setError(extractErrorMessage(err));
     }
   }
+
+  useRealtimeRefresh(["guests.changed", "bookings.changed", "payments.changed"], () => { void loadGuests(); void loadSegments(); });
 
   useEffect(() => {
     loadGuests();

@@ -1,7 +1,9 @@
+import re
 import uuid
 from datetime import date, datetime, time
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+from app.modules.auth.schemas import UserOut
 
 
 class AttendanceCreate(BaseModel):
@@ -142,11 +144,13 @@ class StaffPerformanceNoteOut(StaffPerformanceNoteCreate):
 
 class StaffProfileCreate(BaseModel):
     user_id: uuid.UUID
-    employee_id: str | None = None
+    employee_id: str | None = Field(default=None, max_length=30)
     designation: str | None = None
     department: str | None = None
     employment_type: str | None = None
     join_date: date | None = None
+    exit_date: date | None = None
+    is_active: bool = True
     phone: str | None = None
     alternate_phone: str | None = None
     date_of_birth: date | None = None
@@ -176,7 +180,7 @@ class StaffProfileCreate(BaseModel):
 class StaffProfileUpdate(BaseModel):
     """All fields optional — user_id is intentionally excluded, the 1:1
     link to a User is set once at creation and never repointed."""
-    employee_id: str | None = None
+    employee_id: str | None = Field(default=None, max_length=30)
     designation: str | None = None
     department: str | None = None
     employment_type: str | None = None
@@ -248,6 +252,53 @@ class StaffProfileOut(BaseModel):
         from_attributes = True
 
 
+class StaffOnboardingCreate(BaseModel):
+    """One admin request that atomically creates a staff User + its profile.
+
+    User remains the canonical identity for all existing operational records;
+    role is deliberately fixed server-side to `staff`.
+    """
+    name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    password: str = Field(min_length=8)
+    profile: dict[str, object] = Field(default_factory=dict)
+    assigned_unit_ids: list[uuid.UUID] = Field(default_factory=list)
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def validate_profile_fields(cls, value):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("profile must be an object")
+        fields = StaffProfileCreate.model_fields.keys() - {"user_id"}
+        unknown = set(value) - set(fields)
+        if unknown:
+            raise ValueError(f"Unsupported staff profile fields: {', '.join(sorted(unknown))}")
+        validated = StaffProfileCreate.model_validate({**value, "user_id": uuid.uuid4()})
+        return validated.model_dump(exclude={"user_id"})
+
+    @field_validator("password")
+    @classmethod
+    def password_complexity(cls, value: str) -> str:
+        if not re.search(r"[A-Za-z]", value) or not re.search(r"\d", value):
+            raise ValueError("Password must contain at least one letter and one digit")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def nonblank_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Name cannot be blank")
+        return value
+
+
+class StaffOnboardingOut(BaseModel):
+    user: UserOut
+    profile: StaffProfileOut
+
+
 # --- Staff Designations (post/designation master: defaults an employee's
 # overrides fall back to — see StaffProfile.*_override and hr_policy.py) ---
 
@@ -295,6 +346,13 @@ class StaffDesignationOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class StaffOperationalUserOut(BaseModel):
+    """Least-privilege name/ID list for manager-run shift/attendance assignment."""
+    id: uuid.UUID
+    name: str
+    role: str
 
 
 # --- Resolved policy / monthly summary (read-only, computed) ---

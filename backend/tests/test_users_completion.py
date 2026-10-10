@@ -71,7 +71,7 @@ def test_forgot_password_always_returns_generic_message_for_unknown_email(mock_s
     assert "if that email is registered" in resp.json()["message"].lower()
 
 
-@patch("smtplib.SMTP")
+@patch("app.modules.notifications.service._PreferIPv6SMTP")
 def test_forgot_password_creates_a_real_token_for_known_email(mock_smtp_class, headers):
     from app.modules.auth import router as auth_router
 

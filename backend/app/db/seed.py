@@ -38,6 +38,7 @@ from app.modules.customer_auth.models import CustomerAccount, CustomerSession, C
 from app.modules.public_booking.models import PromoCode, BookingHold  # noqa: F401
 from app.modules.finance.models import Expense, ExpenseAttachment, Budget, SecurityDeposit, OwnerWithdrawal, OTACommission, OTAPayoutReceipt, UtilityReading, UtilityReadingAllocation, PurchaseRecord, DailyClosing, LaundryEntry, Loan, LoanEmiPayment  # noqa: F401
 from app.modules.automation.models import PolicyRow, ActionProposalRow, PolicyDecisionRow, ApprovalRow, AuditEntryRow, PolicyAuditEntryRow  # noqa: F401
+from app.shared.realtime_models import RealtimeOutbox  # noqa: F401
 from app.db.additive_migrations import apply_additive_migrations, migrate_business_settings_defaults, migrate_customer_phone_numbers_to_e164, migrate_legacy_bank_settings
 
 # RBAC finding I-5: this dict only seeds rows into the dormant Permission

@@ -110,10 +110,9 @@ def test_existing_admin_behavior_unchanged(admin_headers):
     assert client.get("/api/v1/users", headers=admin_headers).status_code == 200
 
 
-def test_existing_staff_behavior_unchanged(staff_ctx):
-    """Spot-check: staff can still reach the shared settings endpoint but
-    not the admin-only users endpoint — unchanged by this phase."""
-    assert client.get("/api/v1/settings", headers=staff_ctx["headers"]).status_code == 200
+def test_staff_cannot_read_sensitive_business_settings(staff_ctx):
+    """Company/bank settings are owner-only; staff use dedicated operational APIs."""
+    assert client.get("/api/v1/settings", headers=staff_ctx["headers"]).status_code == 403
     assert client.get("/api/v1/users", headers=staff_ctx["headers"]).status_code == 403
 
 

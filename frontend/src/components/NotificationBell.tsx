@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type NotificationLogOut } from "../lib/api";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 export default function NotificationBell() {
   const [open, setOpen] = useState(false);
@@ -15,10 +16,10 @@ export default function NotificationBell() {
     }
   }
 
+  useRealtimeRefresh(["notifications.changed", "bookings.changed", "inquiries.changed", "guest_requests.changed", "maintenance.changed"], load);
+
   useEffect(() => {
     load();
-    const interval = setInterval(load, 30_000);
-    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {

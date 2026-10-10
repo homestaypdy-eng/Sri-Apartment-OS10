@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, extractErrorMessage, type GuestRequestOut, type GuestOut, type UserOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Badge, EmptyState } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 const PRIORITIES = ["low", "medium", "high", "urgent"];
 
@@ -61,6 +62,8 @@ export default function GuestRequestsPage() {
       setError(extractErrorMessage(err));
     }
   }
+
+  useRealtimeRefresh(["guest_requests.changed", "guests.changed", "staff_operations.changed"], load);
 
   useEffect(() => {
     load();

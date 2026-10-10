@@ -493,6 +493,7 @@ def cancel_booking(
     refund_amount: float | None,
     refund_reason: str | None,
     source: str,
+    manual_review_only: bool = False,
 ) -> CancellationOutcome:
     """
     THE single authoritative cancellation workflow — see this module's
@@ -525,7 +526,7 @@ def cancel_booking(
     booking.cancellation_refund_source = decision.source
     booking.cancellation_requires_review = decision.requires_review
 
-    if issue_amount > 0 and not decision.requires_review:
+    if issue_amount > 0 and not decision.requires_review and not manual_review_only:
         # This is committed together with the durable `created` provider
         # reservation before the network call. A process crash at that point
         # therefore leaves the booking explicitly requiring reconciliation.
@@ -536,6 +537,8 @@ def cancel_booking(
             booking.cancellation_requires_review = _has_unresolved_provider_refund(db, booking.id)
     else:
         outcome = CancellationOutcome(booking=booking, old_status=old_status, refund_requested_amount=issue_amount)
+        if manual_review_only and issue_amount > 0:
+            booking.cancellation_requires_review = True
 
     details = f"{old_status} -> cancelled (source={source})"
     if outcome.refund_succeeded_amount:

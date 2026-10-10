@@ -39,7 +39,7 @@ def _new_user(admin_headers, role):
     return _headers(email, "ExpenseTest123!")
 
 
-def _create_expense(headers, *, amount="100.00", status="pending", expense_date=None, category=None, unit_id=None):
+def _create_expense(headers, *, amount="100.00", status="approved", expense_date=None, category=None, unit_id=None):
     response = client.post("/api/v1/finance/expenses", headers=headers, json={
         "category": category or f"Ledger-{uuid.uuid4().hex[:8]}",
         "amount": amount,
@@ -88,7 +88,7 @@ def test_full_and_partial_payments_derive_balance_and_are_audited_once(admin_hea
     assert second.status_code == 201, second.text
     row = next(item for item in client.get("/api/v1/finance/expenses", headers=admin).json() if item["id"] == expense["id"])
     assert (row["paid_amount"], row["remaining_amount"], row["payment_status"]) == (125.5, 0.0, "paid")
-    assert row["approval_status"] == "pending"
+    assert row["approval_status"] == "approved"
     assert row["amount"] == 125.5
     assert client.patch(f"/api/v1/finance/expenses/{expense['id']}", headers=admin, json={
         "category": "Edited", "amount": "100", "expense_date": date.today().isoformat(),
@@ -114,7 +114,7 @@ def test_payment_validation_rbac_and_approval_separation(monkeypatch, admin_head
     admin = admin_headers
     manager = _new_user(admin, "manager")
     staff = _new_user(admin, "staff")
-    expense = _create_expense(admin, amount="40.00")
+    expense = _create_expense(admin, amount="40.00", status="pending")
     path = f"/api/v1/finance/expenses/{expense['id']}/payments"
 
     assert _pay(staff, expense["id"], "10").status_code == 403
@@ -126,6 +126,10 @@ def test_payment_validation_rbac_and_approval_separation(monkeypatch, admin_head
     assert _pay(manager, str(uuid.uuid4()), "1").status_code == 404
     assert client.get(path, headers=staff).status_code == 200
 
+    assert _pay(manager, expense["id"], "10").status_code == 409
+    approved = client.post(f"/api/v1/finance/expenses/{expense['id']}/approval", headers=admin, json={"approve": True})
+    assert approved.status_code == 200, approved.text
+
     success = _pay(manager, expense["id"], "10", method="bank_transfer")
     assert success.status_code == 201
     spoofed = client.post(
@@ -136,19 +140,19 @@ def test_payment_validation_rbac_and_approval_separation(monkeypatch, admin_head
     assert spoofed.status_code == 201
     assert spoofed.json()["created_by"] == success.json()["created_by"]
     current = next(item for item in client.get("/api/v1/finance/expenses", headers=admin).json() if item["id"] == expense["id"])
-    assert current["approval_status"] == "pending"
+    assert current["approval_status"] == "approved"
     assert current["amount"] == 40.0
     # 10 (success) + 1 (spoofed created_by, otherwise a legitimate payment
     # that must still succeed) — the spoof attempt only ignores created_by,
     # it doesn't block the payment itself.
     assert current["paid_amount"] == 11.0
 
-    rejected = _create_expense(admin, amount="10.00")
+    rejected = _create_expense(admin, amount="10.00", status="pending")
     monkeypatch.setattr(finance_router, "trigger_expense_approval", lambda *args, **kwargs: None)
     decision = client.post(f"/api/v1/finance/expenses/{rejected['id']}/approval", headers=admin, json={"approve": False})
     assert decision.status_code == 200
     recorded = _pay(manager, rejected["id"], "5", method="card")
-    assert recorded.status_code == 201
+    assert recorded.status_code == 409
     current_rejected = next(item for item in client.get("/api/v1/finance/expenses", headers=admin).json() if item["id"] == rejected["id"])
     assert current_rejected["approval_status"] == "rejected"
 
@@ -202,15 +206,15 @@ def test_pnl_dashboard_maintenance_and_finance_bundle_exclude_rejected(monkeypat
     })
     assert before_bundle.status_code == 200, before_bundle.text
 
-    pending_unit = _create_expense(admin, amount="11", expense_date=today, category=category, unit_id=unit_id)
+    pending_unit = _create_expense(admin, amount="11", status="pending", expense_date=today, category=category, unit_id=unit_id)
     approved_unit = _create_expense(admin, amount="12", status="approved", expense_date=today, category=category, unit_id=unit_id)
-    rejected_unit = _create_expense(admin, amount="13", expense_date=today, category=category, unit_id=unit_id)
-    central_pending = _create_expense(admin, amount="21", expense_date=today, category=category)
+    rejected_unit = _create_expense(admin, amount="13", status="pending", expense_date=today, category=category, unit_id=unit_id)
+    central_pending = _create_expense(admin, amount="21", status="pending", expense_date=today, category=category)
     central_approved = _create_expense(admin, amount="22", status="approved", expense_date=today, category=category)
-    central_rejected = _create_expense(admin, amount="23", expense_date=today, category=category)
-    maintenance_pending = _create_expense(admin, amount="31", expense_date=today, category="maintenance", unit_id=unit_id)
+    central_rejected = _create_expense(admin, amount="23", status="pending", expense_date=today, category=category)
+    maintenance_pending = _create_expense(admin, amount="31", status="pending", expense_date=today, category="maintenance", unit_id=unit_id)
     maintenance_approved = _create_expense(admin, amount="32", status="approved", expense_date=today, category="maintenance", unit_id=unit_id)
-    maintenance_rejected = _create_expense(admin, amount="33", expense_date=today, category="maintenance", unit_id=unit_id)
+    maintenance_rejected = _create_expense(admin, amount="33", status="pending", expense_date=today, category="maintenance", unit_id=unit_id)
 
     monkeypatch.setattr(finance_router, "trigger_expense_approval", lambda *args, **kwargs: None)
     for expense in (rejected_unit, central_rejected, maintenance_rejected):

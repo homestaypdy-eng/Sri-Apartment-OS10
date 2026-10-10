@@ -49,6 +49,7 @@ def test_edit_booking_rate_and_dates(headers):
 
     resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={
         "check_in": new_check_in, "check_out": new_check_out, "rate_applied": 3500, "reason": "Guest requested new dates",
+        "expected_updated_at": booking["updated_at"],
     })
     assert resp.status_code == 200, resp.text
     assert resp.json()["check_in"] == new_check_in
@@ -58,7 +59,7 @@ def test_edit_booking_rate_and_dates(headers):
 
 def test_edit_booking_logs_audit_with_before_after(headers):
     booking, _ = _make_booking(headers)
-    client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 9999, "reason": "Test audit reason"})
+    client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 9999, "reason": "Test audit reason", "expected_updated_at": booking["updated_at"]})
 
     logs = client.get("/api/v1/audit/logs", headers=headers, params={"action": "booking.edit"}).json()
     match = next((l for l in logs if l["entity_id"] == booking["id"]), None)
@@ -75,13 +76,14 @@ def test_edit_booking_rejects_overlap(headers):
 
     resp = client.patch(f"/api/v1/bookings/{booking_b['id']}", headers=headers, json={
         "check_in": booking_a["check_in"], "check_out": booking_a["check_out"],
+        "expected_updated_at": booking_b["updated_at"],
     })
     assert resp.status_code == 409
 
 
 def test_edit_booking_invalid_guest_rejected(headers):
     booking, _ = _make_booking(headers)
-    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"guest_id": str(uuid.uuid4())})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"guest_id": str(uuid.uuid4()), "expected_updated_at": booking["updated_at"]})
     assert resp.status_code == 404
 
 
@@ -178,7 +180,7 @@ def test_status_change_logs_audit(headers):
 
 def test_booking_timeline_shows_chronological_events(headers):
     booking, _ = _make_booking(headers)
-    client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 2500, "reason": "Timeline test"})
+    client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 2500, "reason": "Timeline test", "expected_updated_at": booking["updated_at"]})
     client.patch(f"/api/v1/bookings/{booking['id']}/status", headers=headers, params={"new_status": "checked_in"})
 
     timeline = client.get(f"/api/v1/bookings/{booking['id']}/timeline", headers=headers).json()
@@ -226,7 +228,7 @@ def test_edit_booking_blocked_after_invoice_for_dates(headers):
 
     new_check_in = (date.today() + timedelta(days=500)).isoformat()
     new_check_out = (date.today() + timedelta(days=503)).isoformat()
-    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"check_in": new_check_in, "check_out": new_check_out})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"check_in": new_check_in, "check_out": new_check_out, "expected_updated_at": booking["updated_at"]})
     assert resp.status_code == 409
     assert "invoice" in resp.json()["detail"].lower()
 
@@ -235,7 +237,7 @@ def test_edit_booking_blocked_after_invoice_for_rate(headers):
     booking, _ = _make_booking(headers)
     client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
 
-    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 5000})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 5000, "expected_updated_at": booking["updated_at"]})
     assert resp.status_code == 409
     assert "invoice" in resp.json()["detail"].lower()
 
@@ -245,7 +247,7 @@ def test_edit_booking_blocked_after_invoice_for_unit(headers):
     other_unit_id = _make_unit(headers)
     client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
 
-    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"unit_id": other_unit_id})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"unit_id": other_unit_id, "expected_updated_at": booking["updated_at"]})
     assert resp.status_code == 409
     assert "invoice" in resp.json()["detail"].lower()
 
@@ -258,7 +260,7 @@ def test_edit_booking_still_allowed_after_invoice_for_non_invoice_fields(headers
     booking, _ = _make_booking(headers, unit_id=unit_id)
     client.post(f"/api/v1/invoices/generate/{booking['id']}", headers=headers)
 
-    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"internal_notes": "Post-invoice note", "adults": 3})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"internal_notes": "Post-invoice note", "adults": 3, "expected_updated_at": booking["updated_at"]})
     assert resp.status_code == 200, resp.text
     assert resp.json()["internal_notes"] == "Post-invoice note"
     assert resp.json()["adults"] == 3
@@ -269,7 +271,7 @@ def test_edit_booking_dates_still_works_before_invoice(headers):
     booking, _ = _make_booking(headers)
     new_check_in = (date.today() + timedelta(days=600)).isoformat()
     new_check_out = (date.today() + timedelta(days=602)).isoformat()
-    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"check_in": new_check_in, "check_out": new_check_out})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"check_in": new_check_in, "check_out": new_check_out, "expected_updated_at": booking["updated_at"]})
     assert resp.status_code == 200, resp.text
 
 
@@ -362,6 +364,7 @@ def test_edit_booking_notes(headers):
     booking, _ = _make_booking(headers)
     resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={
         "internal_notes": "VIP guest, upgrade if possible", "special_requests": "Late checkout requested",
+        "expected_updated_at": booking["updated_at"],
     })
     assert resp.status_code == 200, resp.text
     assert resp.json()["internal_notes"] == "VIP guest, upgrade if possible"
@@ -370,13 +373,11 @@ def test_edit_booking_notes(headers):
 
 # --- Edit: stale-update / optimistic concurrency protection ---
 
-def test_edit_booking_without_expected_updated_at_still_works(headers):
-    """Backward compatibility: omitting the concurrency token entirely
-    performs the edit unchecked, same as before this field existed."""
+def test_edit_booking_without_expected_updated_at_is_rejected(headers):
+    """Unchecked edits are rejected so older clients cannot overwrite a newer save."""
     booking, _ = _make_booking(headers)
     resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"rate_applied": 4321})
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["rate_applied"] == 4321.0
+    assert resp.status_code == 428, resp.text
 
 
 def test_edit_booking_with_fresh_expected_updated_at_succeeds(headers):

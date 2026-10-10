@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type BookingOut, type InvoiceOut, type CreditNoteOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 const PAYMENT_MODES = ["upi", "card", "bank_transfer", "cash"];
 
@@ -36,6 +37,8 @@ export default function BillingPage() {
       setError(extractErrorMessage(err));
     }
   }
+
+  useRealtimeRefresh(["bookings.changed", "payments.changed", "availability.changed"], loadBookings);
 
   useEffect(() => {
     loadBookings();

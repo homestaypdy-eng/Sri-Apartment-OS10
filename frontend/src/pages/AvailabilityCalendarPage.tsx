@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api, extractErrorMessage } from "../lib/api";
 import type { UnitOut, BookingOut, GuestOut } from "../lib/api";
 import { Card, PageHeader, Button, ErrorBanner, EmptyState, SkeletonLine } from "../components/ui";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 /**
  * Per-unit Availability Calendar (OS10 Phase — frontend only).
@@ -191,6 +192,7 @@ export default function AvailabilityCalendarPage() {
 
   const days = useMemo(() => Array.from({ length: WINDOW_DAYS }, (_, i) => isoDate(addDays(rangeStart, i))), [rangeStart]);
   const [refreshKey, setRefreshKey] = useState(0);
+  useRealtimeRefresh(["availability.changed", "bookings.changed", "properties.changed"], () => setRefreshKey((key) => key + 1));
 
   // Units + guests (for name-only lookup) + bookings — loaded once on
   // mount. Re-fetched only via the explicit Refresh button, matching the
@@ -266,7 +268,7 @@ export default function AvailabilityCalendarPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [days]);
+  }, [days, refreshKey]);
 
   const orderedUnits = useMemo(() => {
     return [...units].sort((a, b) => {

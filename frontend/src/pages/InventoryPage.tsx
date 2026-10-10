@@ -9,6 +9,7 @@ import {
   type StockMovementOut,
 } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState } from "../components/ui";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 export default function InventoryPage() {
   const [items, setItems] = useState<InventoryItemOut[]>([]);
@@ -46,6 +47,8 @@ export default function InventoryPage() {
       setError(extractErrorMessage(err));
     }
   }
+
+  useRealtimeRefresh(["inventory.changed", "finance.changed", "housekeeping.changed"], loadAll);
 
   useEffect(() => {
     loadAll();

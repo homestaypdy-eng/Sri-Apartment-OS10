@@ -185,37 +185,35 @@ def _reset_test_database():
 
 
 @pytest.fixture(autouse=True)
+def _disable_external_email_providers_in_tests(monkeypatch):
+    """Never let the developer's local email credentials escape in tests.
+
+    Provider-specific tests opt in explicitly with their own monkeypatches
+    and mock the HTTP/SMTP transport. The default suite runs with sending
+    unconfigured, regardless of credentials present in a developer .env.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "email_provider", "gmail_smtp")
+    monkeypatch.setattr(settings, "smtp_host", "")
+    monkeypatch.setattr(settings, "smtp_user", "")
+    monkeypatch.setattr(settings, "smtp_password", "")
+    monkeypatch.setattr(settings, "resend_api_key", "")
+    monkeypatch.setattr(settings, "resend_from_email", "")
+
+
+@pytest.fixture(autouse=True)
 def _fail_fast_on_real_smtp_connections(monkeypatch):
     """
-    Test-only speed/reliability guard — does NOT touch production code,
-    app.core.config.settings.smtp_host, or send_email()'s own logic/
-    exception types/messages in any way. This dev container has genuine
-    Gmail SMTP credentials configured (a long-documented environmental
-    quirk — see the handful of tests across this suite that already
-    expect "not configured" but instead observe a real Gmail rejection).
-    A real smtplib.SMTP(...) connection attempt can block for its full
-    timeout (up to 15s, per notifications/service.py::send_email); at the
-    volume this suite exercises the website-booking path — each booking
-    conversion can trigger several real send attempts (customer
-    confirmation, invoice delivery, and both configured owner addresses,
-    by deliberate design — see trigger_website_booking_owner_notification)
-    — that adds enough cumulative wall-clock time to expire 15-minute JWT
-    tokens held by unrelated, module-scoped fixtures in slower test files
-    later in the same run. That failure mode (KeyError/TypeError from an
-    unexpectedly-decoded {"detail": ...} auth-error body where a normal
-    response was expected) was directly observed and diagnosed in this
-    project's own test history.
+    Test-only network guard. The separate provider-safety fixture disables
+    configured email credentials by default. This additional guard fails
+    closed if a test deliberately enables SMTP without mocking its
+    transport; SMTP connection attempts cannot reach an external server.
 
-    This patches smtplib.SMTP itself to fail immediately with a realistic
-    connection error, for every test, by default — changing nothing about
-    WHETHER or WHY a real send fails, only how fast a genuine connection
-    failure surfaces. The pre-existing tests that fail because real SMTP
-    happens to be configured in this environment still fail in exactly
-    the same way (none of them assert on timing), just without the
-    multi-second real network delay. Owner-notification behavior itself
-    (2 email attempts + 2 WhatsApp attempts per paid website booking) is
-    completely unchanged in both code and outcome — only the SPEED of a
-    real SMTP failure changes, in tests only.
+    The separate _disable_external_email_providers_in_tests fixture keeps
+    delivery disabled by default. This is defense in depth for tests that
+    explicitly configure SMTP; provider-specific tests mock their
+    transports, and IPv4/IPv6 preference tests use loopback sockets only.
 
     Any test that wants to observe a successful "send" continues to do so
     via its own explicit patch("...send_email", ...) (or equivalent),

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, extractErrorMessage, type PromoCodeOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 /**
  * Admin CRUD for the promo codes the public website's checkout already
@@ -40,6 +41,7 @@ export default function PromoCodesPage() {
   useEffect(() => {
     load();
   }, []);
+  useRealtimeRefresh(["availability.changed"], load);
 
   async function handleCreate() {
     setError(null);

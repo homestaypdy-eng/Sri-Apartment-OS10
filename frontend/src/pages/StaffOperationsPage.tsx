@@ -14,6 +14,7 @@ import {
 } from "../lib/api";
 import { Card, PageHeader, SuccessBanner, Button, Badge, EmptyState, SkeletonLine } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 type Tab = "mine" | "today" | "check-ins" | "check-outs" | "housekeeping" | "maintenance" | "guest_request" | "all";
 type StatusFilter = "all" | "pending" | "in_progress" | "completed";
@@ -271,6 +272,8 @@ export default function StaffOperationsPage() {
     loadDashboard();
     loadTabData(tab);
   }
+
+  useRealtimeRefresh(["staff_operations.changed", "bookings.changed", "availability.changed", "housekeeping.changed", "maintenance.changed", "guest_requests.changed"], refreshAll);
 
   function retry() {
     setError(null);

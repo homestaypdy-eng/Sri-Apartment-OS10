@@ -3,6 +3,7 @@ import { api, extractErrorMessage, type BookingAttachmentOut, type BookingGuests
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, SkeletonRows, EmptyState, type BadgeTone } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 import GuestPicker from "../components/GuestPicker";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 // Indian comma grouping ("₹11,340", not "₹11340" or a locale-dependent
 // "₹11 340") — explicit locale rather than a bare toLocaleString(), which
@@ -165,6 +166,8 @@ export default function BookingsPage() {
       setRefreshingBookings(false);
     }
   }, [showArchived]);
+
+  useRealtimeRefresh(["bookings.changed", "availability.changed", "guests.changed", "payments.changed", "properties.changed"], refreshBookings);
 
   useEffect(() => {
     loadAll();

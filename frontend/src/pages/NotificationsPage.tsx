@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, extractErrorMessage, type NotificationLogOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 export default function NotificationsPage() {
   const { role } = useAuth();
@@ -18,6 +19,8 @@ export default function NotificationsPage() {
       setError(extractErrorMessage(err));
     }
   }
+
+  useRealtimeRefresh(["notifications.changed", "bookings.changed", "inquiries.changed", "guest_requests.changed", "maintenance.changed"], load);
 
   useEffect(() => {
     load();

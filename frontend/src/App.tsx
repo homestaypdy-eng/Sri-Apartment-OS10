@@ -1,9 +1,10 @@
 import { Suspense, lazy } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
+import { RealtimeProvider } from "./context/RealtimeContext";
 import { GuestAuthProvider, useGuestAuth } from "./context/GuestAuthContext";
 import { CustomerAuthProvider, useCustomerAuth } from "./context/CustomerAuthContext";
-import { RequireAuth, RequireAdmin, RequireNotManager } from "./components/RequireAuth";
+import { RequireAuth, RequireAdmin, RequireRoles } from "./components/RequireAuth";
 import Layout from "./components/Layout";
 import LoginPage from "./pages/LoginPage";
 import GuestLoginPage from "./pages/GuestLoginPage";
@@ -64,6 +65,7 @@ function RequireCustomerAuth({ children }: { children: React.ReactNode }) {
 export default function App() {
   return (
     <AuthProvider>
+      <RealtimeProvider>
       <GuestAuthProvider>
         <CustomerAuthProvider>
         <BrowserRouter>
@@ -90,18 +92,18 @@ export default function App() {
               <Route
                 path="staff"
                 element={
-                  <RequireNotManager>
+                  <RequireRoles allowed={["admin", "manager", "staff"]}>
                     <Suspense fallback={<PageLoading />}>
                       <StaffPage />
                     </Suspense>
-                  </RequireNotManager>
+                  </RequireRoles>
                 }
               />
               <Route path="operations" element={<Suspense fallback={<PageLoading />}><StaffOperationsPage /></Suspense>} />
               <Route path="guest-requests" element={<Suspense fallback={<PageLoading />}><GuestRequestsPage /></Suspense>} />
               <Route path="billing" element={<Suspense fallback={<PageLoading />}><BillingPage /></Suspense>} />
-              <Route path="finance" element={<Suspense fallback={<PageLoading />}><FinancePage /></Suspense>} />
-              <Route path="payment-reconciliation" element={<Suspense fallback={<PageLoading />}><PaymentReconciliationPage /></Suspense>} />
+              <Route path="finance" element={<RequireRoles allowed={["admin", "manager"]}><Suspense fallback={<PageLoading />}><FinancePage /></Suspense></RequireRoles>} />
+              <Route path="payment-reconciliation" element={<RequireRoles allowed={["admin", "manager"]}><Suspense fallback={<PageLoading />}><PaymentReconciliationPage /></Suspense></RequireRoles>} />
               <Route path="reports" element={<Suspense fallback={<PageLoading />}><ReportsPage /></Suspense>} />
               <Route path="revenue-dashboard" element={<Suspense fallback={<PageLoading />}><RevenueDashboardPage /></Suspense>} />
               <Route path="profit-simulator" element={<Suspense fallback={<PageLoading />}><ProfitSimulatorPage /></Suspense>} />
@@ -111,11 +113,11 @@ export default function App() {
               <Route
                 path="settings"
                 element={
-                  <RequireNotManager>
+                  <RequireRoles allowed={["admin"]}>
                     <Suspense fallback={<PageLoading />}>
                       <SettingsPage />
                     </Suspense>
-                  </RequireNotManager>
+                  </RequireRoles>
                 }
               />
               <Route
@@ -194,6 +196,7 @@ export default function App() {
         </BrowserRouter>
         </CustomerAuthProvider>
       </GuestAuthProvider>
+      </RealtimeProvider>
     </AuthProvider>
   );
 }

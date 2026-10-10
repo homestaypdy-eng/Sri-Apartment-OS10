@@ -21,6 +21,7 @@ import {
   type OutstandingPaymentLine,
 } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, Button, EmptyState, Spinner } from "../components/ui";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 /**
  * Revenue Dashboard — a dedicated module consolidating revenue figures that
@@ -139,6 +140,7 @@ export default function RevenueDashboardPage() {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  useRealtimeRefresh(["bookings.changed", "availability.changed", "payments.changed", "finance.changed", "properties.changed"], load);
 
   const totalRevenue = summary?.revenue.total ?? 0;
 

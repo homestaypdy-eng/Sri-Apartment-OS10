@@ -11,6 +11,124 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
 MIGRATION_STATEMENTS = [
+    # Transactional cross-worker invalidation. Each business-table trigger
+    # writes a topic-only outbox row and calls pg_notify in the same
+    # transaction; PostgreSQL delivers NOTIFY only after commit.
+    "CREATE TABLE IF NOT EXISTS realtime_outbox (id BIGSERIAL PRIMARY KEY, topic VARCHAR(64) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+    "CREATE INDEX IF NOT EXISTS ix_realtime_outbox_created_at ON realtime_outbox (created_at)",
+    """
+    CREATE OR REPLACE FUNCTION os10_notify_realtime_change() RETURNS trigger AS $$
+    DECLARE topics_csv TEXT; topic_name TEXT; event_id BIGINT;
+    BEGIN
+        topics_csv := CASE TG_TABLE_NAME
+            WHEN 'bookings' THEN 'bookings.changed,availability.changed'
+            WHEN 'booking_attachments' THEN 'bookings.changed'
+            WHEN 'booking_guests' THEN 'bookings.changed,guests.changed'
+            WHEN 'booking_holds' THEN 'availability.changed'
+            WHEN 'properties' THEN 'properties.changed,availability.changed'
+            WHEN 'property_files' THEN 'properties.changed'
+            WHEN 'units' THEN 'properties.changed,availability.changed'
+            WHEN 'unit_photos' THEN 'properties.changed'
+            WHEN 'seasonal_rates' THEN 'properties.changed,availability.changed'
+            WHEN 'long_stay_discount_tiers' THEN 'properties.changed,availability.changed'
+            WHEN 'guests' THEN 'guests.changed'
+            WHEN 'guest_documents' THEN 'guests.changed'
+            WHEN 'inquiries' THEN 'inquiries.changed'
+            WHEN 'inquiry_attachments' THEN 'inquiries.changed'
+            WHEN 'inquiry_communications' THEN 'inquiries.changed'
+            WHEN 'payments' THEN 'payments.changed,bookings.changed'
+            WHEN 'invoices' THEN 'payments.changed,bookings.changed,finance.changed'
+            WHEN 'credit_notes' THEN 'payments.changed,finance.changed'
+            WHEN 'refunds' THEN 'payments.changed,bookings.changed'
+            WHEN 'gateway_orders' THEN 'payments.changed,bookings.changed'
+            WHEN 'webhook_events' THEN 'payments.changed'
+            WHEN 'housekeeping_tasks' THEN 'housekeeping.changed,availability.changed'
+            WHEN 'housekeeping_photos' THEN 'housekeeping.changed'
+            WHEN 'maintenance_tickets' THEN 'maintenance.changed'
+            WHEN 'maintenance_photos' THEN 'maintenance.changed'
+            WHEN 'guest_requests' THEN 'guest_requests.changed'
+            WHEN 'inventory_items' THEN 'inventory.changed'
+            WHEN 'stock_movements' THEN 'inventory.changed'
+            WHEN 'suppliers' THEN 'inventory.changed'
+            WHEN 'expenses' THEN 'finance.changed'
+            WHEN 'expense_attachments' THEN 'finance.changed'
+            WHEN 'expense_payments' THEN 'finance.changed'
+            WHEN 'security_deposits' THEN 'finance.changed'
+            WHEN 'owner_withdrawals' THEN 'finance.changed'
+            WHEN 'ota_commissions' THEN 'finance.changed'
+            WHEN 'ota_payout_receipts' THEN 'finance.changed'
+            WHEN 'utility_readings' THEN 'finance.changed'
+            WHEN 'utility_reading_allocations' THEN 'finance.changed'
+            WHEN 'budgets' THEN 'finance.changed'
+            WHEN 'loans' THEN 'finance.changed'
+            WHEN 'purchase_records' THEN 'finance.changed,inventory.changed'
+            WHEN 'daily_closings' THEN 'finance.changed'
+            WHEN 'laundry_entries' THEN 'finance.changed'
+            WHEN 'loan_emi_payments' THEN 'finance.changed'
+            WHEN 'attendance' THEN 'staff_operations.changed'
+            WHEN 'leave_requests' THEN 'staff_operations.changed'
+            WHEN 'payroll' THEN 'staff_operations.changed'
+            WHEN 'shifts' THEN 'staff_operations.changed'
+            WHEN 'holidays' THEN 'staff_operations.changed'
+            WHEN 'staff_apartment_assignments' THEN 'staff_operations.changed'
+            WHEN 'staff_profiles' THEN 'staff_operations.changed'
+            WHEN 'staff_performance_notes' THEN 'staff_operations.changed'
+            WHEN 'staff_advances' THEN 'staff_operations.changed'
+            WHEN 'staff_designations' THEN 'staff_operations.changed'
+            WHEN 'notification_logs' THEN 'notifications.changed'
+            WHEN 'users' THEN 'users.changed'
+            WHEN 'audit_logs' THEN 'audit.changed'
+            WHEN 'login_events' THEN 'audit.changed'
+            WHEN 'zotel_room_mappings' THEN 'integrations.changed,properties.changed,availability.changed'
+            WHEN 'zotel_sync_logs' THEN 'integrations.changed,bookings.changed'
+            WHEN 'zotel_sync_records' THEN 'integrations.changed,bookings.changed'
+            WHEN 'business_settings' THEN 'settings.changed'
+            WHEN 'bank_settings' THEN 'settings.changed'
+            WHEN 'conversations' THEN 'messages.changed'
+            WHEN 'conversation_messages' THEN 'messages.changed'
+            WHEN 'promo_codes' THEN 'availability.changed'
+            ELSE NULL
+        END;
+        IF topics_csv IS NOT NULL THEN
+            FOREACH topic_name IN ARRAY string_to_array(topics_csv, ',') LOOP
+                INSERT INTO realtime_outbox(topic) VALUES (topic_name) RETURNING id INTO event_id;
+                PERFORM pg_notify('os10_realtime', event_id::TEXT);
+            END LOOP;
+            -- The final topic id can jump over a 1000 boundary when a
+            -- table maps to multiple topics; check the batch width so
+            -- outbox pruning cannot be skipped indefinitely.
+            IF event_id % 1000 < cardinality(string_to_array(topics_csv, ',')) THEN
+                DELETE FROM realtime_outbox WHERE created_at < now() - INTERVAL '14 days';
+            END IF;
+        END IF;
+        IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+    """,
+    """
+    DO $$ DECLARE table_name TEXT; trigger_name TEXT;
+    BEGIN
+        FOREACH table_name IN ARRAY ARRAY[
+            'bookings','booking_attachments','booking_guests','booking_holds','properties','property_files','units','unit_photos','seasonal_rates','long_stay_discount_tiers',
+            'guests','guest_documents','inquiries','inquiry_attachments','inquiry_communications','payments','invoices','credit_notes','refunds','gateway_orders','webhook_events',
+            'housekeeping_tasks','housekeeping_photos','maintenance_tickets','maintenance_photos','guest_requests','inventory_items','stock_movements',
+            'suppliers','expenses','expense_attachments','expense_payments','security_deposits','owner_withdrawals','ota_commissions',
+            'ota_payout_receipts','utility_readings','utility_reading_allocations','budgets','loans','purchase_records','daily_closings','laundry_entries',
+            'loan_emi_payments','attendance','leave_requests','payroll','shifts','holidays',
+            'staff_apartment_assignments','staff_profiles','staff_performance_notes','staff_advances','staff_designations',
+            'notification_logs','users','audit_logs','login_events','zotel_room_mappings','zotel_sync_logs','zotel_sync_records',
+            'business_settings','bank_settings','conversations','conversation_messages','promo_codes'
+        ] LOOP
+            IF to_regclass('public.' || table_name) IS NOT NULL THEN
+                trigger_name := 'trg_os10_realtime_' || table_name;
+                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = trigger_name AND NOT tgisinternal) THEN
+                    EXECUTE format('CREATE TRIGGER %I AFTER INSERT OR UPDATE OR DELETE ON public.%I FOR EACH ROW EXECUTE FUNCTION os10_notify_realtime_change()', trigger_name, table_name);
+                END IF;
+            END IF;
+        END LOOP;
+    END $$
+    """,
     # Outstanding Payments report needs a due date to compare against
     # "today" for the overdue flag. Nullable — existing bookings simply
     # have no due date until one is set, rather than a fabricated default.

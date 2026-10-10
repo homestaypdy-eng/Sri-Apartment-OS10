@@ -38,12 +38,13 @@ describe("Layout navigation — RBAC Phase B Manager awareness", () => {
     renderLayoutAs("manager");
     await waitFor(() => expect(screen.getByText("Dashboard")).toBeInTheDocument());
     for (const label of [
-      "Dashboard", "Properties & Units", "Guests", "Bookings", "Staff Operations",
+      "Dashboard", "Properties & Units", "Guests", "Bookings",
       "Inquiries", "Housekeeping", "Maintenance", "Inventory", "Guest Requests",
       "Billing", "Finance", "Reports Center", "Notifications",
     ]) {
       expect(screen.getByRole("link", { name: label })).toBeInTheDocument();
     }
+    expect(screen.getAllByRole("link", { name: "Staff Operations" })).toHaveLength(2);
     expect(screen.getByRole("link", { name: "Payment Reconciliation" })).toBeInTheDocument();
   });
 
@@ -83,14 +84,15 @@ describe("Layout navigation — RBAC Phase B Manager awareness", () => {
     for (const label of ["Settings", "Users", "Audit", "AI Strategist"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
-    expect(screen.getByText("Staff", { selector: "a" })).toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "Staff Operations" })).toHaveLength(2);
   });
 
-  it("Staff retains its previous navigation (Settings visible, Users/Audit/AI Strategist hidden — unchanged)", async () => {
+  it("Staff sees assigned operations but not owner settings or finance administration", async () => {
     renderLayoutAs("staff");
     await waitFor(() => expect(screen.getByText("Dashboard")).toBeInTheDocument());
-    expect(screen.getByText("Settings")).toBeInTheDocument();
-    expect(screen.getByText("Staff", { selector: "a" })).toBeInTheDocument();
+    expect(screen.queryByText("Settings")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Finance" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "Staff Operations" })).toHaveLength(2);
     expect(screen.queryByText("Users")).not.toBeInTheDocument();
     expect(screen.queryByText("Audit")).not.toBeInTheDocument();
     expect(screen.queryByText("AI Strategist")).not.toBeInTheDocument();

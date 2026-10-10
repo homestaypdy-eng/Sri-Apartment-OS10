@@ -10,6 +10,7 @@ import {
   type PropertyOut,
 } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, Button, Table, Badge, EmptyState, Spinner } from "../components/ui";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 function localDateValue(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -172,6 +173,9 @@ export default function AIStrategistPage() {
     loadNarrative();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // Keep deterministic, authoritative metrics fresh without rerunning the
+  // optional narrative provider on every business-data invalidation.
+  useRealtimeRefresh(["bookings.changed", "availability.changed", "payments.changed", "finance.changed", "properties.changed", "inventory.changed", "housekeeping.changed", "maintenance.changed", "guest_requests.changed"], load);
 
   return (
     <div>

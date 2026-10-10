@@ -59,6 +59,13 @@ def _make_booking(headers, unit_id, rate=3000, nights=2, days_offset=9000, sourc
     return booking, check_in
 
 
+def _month_stable_offset(days_offset):
+    """Keep the check-in and following-day report bound in the same P&L month."""
+    while (date.today() + timedelta(days=days_offset)).month != (date.today() + timedelta(days=days_offset + 1)).month:
+        days_offset += 1
+    return days_offset
+
+
 def _make_commission(headers, booking_id, channel="booking_com", percent=15, commission=900, gst=162):
     resp = client.post("/api/v1/finance/ota-commissions", headers=headers, json={
         "booking_id": booking_id, "channel": channel,
@@ -199,7 +206,7 @@ def test_finance_ota_matches_ota_reconciliation_service(headers):
 
 def test_ota_commission_not_double_counted_across_pnl_and_ota_blocks(headers):
     property_id, unit_id = _make_property_and_unit(headers, rate=2500)
-    booking, check_in = _make_booking(headers, unit_id, rate=2500, nights=2, days_offset=9400)
+    booking, check_in = _make_booking(headers, unit_id, rate=2500, nights=2, days_offset=_month_stable_offset(9400))
     commission = _make_commission(headers, booking["id"], channel="booking_com", percent=19.5, commission=975, gst=175.50)
 
     # Record + repeat a receipt — must not inflate the P&L expense figure.

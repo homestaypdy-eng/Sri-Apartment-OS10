@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, MAINTENANCE_TICKET_CATEGORIES, type MaintenanceTicketOut, type MaintenancePhotoOut, type UnitOut, type UserOut, type TimelineEvent } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner, type BadgeTone } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 const PRIORITIES = ["low", "medium", "high", "urgent"];
 const CATEGORY_LABELS: Record<string, string> = {
@@ -97,6 +98,8 @@ export default function MaintenancePage() {
       setLoading(false);
     }
   }
+
+  useRealtimeRefresh(["maintenance.changed", "finance.changed", "properties.changed", "staff_operations.changed"], loadAll);
 
   useEffect(() => {
     loadAll();

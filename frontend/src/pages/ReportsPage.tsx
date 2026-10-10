@@ -23,6 +23,7 @@ import {
   type SalesFunnelReport,
 } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, Button, EmptyState } from "../components/ui";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 function firstOfMonth(): string {
   const d = new Date();
@@ -193,6 +194,7 @@ export default function ReportsPage() {
     loadReports();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  useRealtimeRefresh(["bookings.changed", "availability.changed", "payments.changed", "finance.changed", "inquiries.changed", "guests.changed", "maintenance.changed", "housekeeping.changed", "inventory.changed"], loadReports);
 
   async function handleExport(report: "summary" | "unit_performance" | "gst" | "guest_requests" | "maintenance" | "housekeeping" | "inventory" | "enquiries" | "guests", format: "pdf" | "xlsx") {
     setError(null);

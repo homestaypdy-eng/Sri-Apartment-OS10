@@ -133,12 +133,12 @@ def test_roles_permissions_reflects_real_role_model(headers):
     assert roles == {"admin", "staff", "manager"}
 
 
-def test_roles_permissions_accessible_to_staff_too(headers):
+def test_roles_permissions_are_admin_only(headers):
     email = f"staffroles{uuid.uuid4().hex[:8]}@test.com"
     client.post("/api/v1/auth/register", headers=headers, json={"name": "Staff Roles Test", "email": email, "password": "TestPass123!", "role": "staff"})
     staff_token = client.post("/api/v1/auth/login", json={"email": email, "password": "TestPass123!"}).json()["access_token"]
     resp = client.get("/api/v1/settings/roles-permissions", headers={"Authorization": f"Bearer {staff_token}"})
-    assert resp.status_code == 200
+    assert resp.status_code == 403
 
 
 def test_backup_download_produces_valid_json_with_real_data(headers):

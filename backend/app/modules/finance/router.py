@@ -143,9 +143,14 @@ def _payment_for_idempotency_key(db: Session, key: str, fingerprint: str) -> Exp
     return existing
 
 
-@router.post("/expenses", response_model=ExpenseOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+@router.post("/expenses", response_model=ExpenseOut, status_code=201, dependencies=[Depends(require_role("admin", "manager"))])
 def create_expense(payload: ExpenseCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    expense = Expense(**payload.model_dump(), created_by=user.id)
+    values = payload.model_dump()
+    if user.role.name == "manager":
+        values["approval_status"] = "pending"
+        values["approved_by"] = None
+        values["approved_at"] = None
+    expense = Expense(**values, created_by=user.id)
     db.add(expense)
     db.flush()
     record_audit_log(
@@ -407,6 +412,8 @@ def record_expense_payment(
     expense = db.scalar(select(Expense).where(Expense.id == expense_id).with_for_update())
     if expense is None:
         raise HTTPException(404, "Expense not found")
+    if expense.approval_status != "approved":
+        raise HTTPException(409, "Expense must be approved by an admin before payment can be recorded")
 
     existing = _payment_for_idempotency_key(db, idempotency_key, fingerprint)
     if existing is not None:
@@ -547,14 +554,7 @@ def list_pending_refunds(db: Session = Depends(get_db)):
 @router.post(
     "/deposits/{deposit_id}/refund",
     response_model=SecurityDepositOut,
-    # RBAC Phase B security fix (finding I-1): this endpoint was mechanically
-    # swept into the blanket "admin, staff" -> "admin, staff, manager" edit
-    # made across this router during Phase B, but issuing a refund is
-    # explicitly out of scope for Manager (same as /payments/{id}/refund and
-    # /payment-gateway/refunds, both of which stayed admin-only). Restored to
-    # its exact pre-Phase-B authorization — Manager excluded, Admin/Staff
-    # unchanged.
-    dependencies=[Depends(require_role("admin", "staff"))],
+    dependencies=[Depends(require_role("admin"))],
 )
 def refund_deposit(deposit_id: uuid.UUID, payload: SecurityDepositRefund, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # with_for_update locks the row for the rest of this transaction, so two

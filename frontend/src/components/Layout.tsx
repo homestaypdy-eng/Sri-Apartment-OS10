@@ -4,14 +4,8 @@ import { useAuth } from "../context/AuthContext";
 import NotificationBell from "./NotificationBell";
 import logo from "../assets/logo.png";
 
-// RBAC Phase B: adminOnly items are also correctly hidden from Manager
-// (the filter below checks role === "admin", same as it always did — a
-// third role doesn't change that). hiddenFromManager is the new, opposite
-// case: routes Staff can still see but Manager's backend access doesn't
-// cover yet (the whole Staff/HR module, and Settings — see
-// RequireNotManager in RequireAuth.tsx for why: neither GET /staff/...
-// nor GET /settings was granted to Manager in Phase B Part 1).
-type NavItem = { to: string; label: string; end?: boolean; adminOnly?: boolean; hiddenFromManager?: boolean; managerOrAdminOnly?: boolean };
+type AppRole = "admin" | "manager" | "staff";
+type NavItem = { to: string; label: string; end?: boolean; roles?: readonly AppRole[] };
 type NavGroup = { label: string; items: NavItem[] };
 
 const navGroups: NavGroup[] = [
@@ -36,8 +30,8 @@ const navGroups: NavGroup[] = [
     label: "Finance",
     items: [
       { to: "/billing", label: "Billing" },
-      { to: "/finance", label: "Finance" },
-      { to: "/payment-reconciliation", label: "Payment Reconciliation", managerOrAdminOnly: true },
+      { to: "/finance", label: "Finance", roles: ["admin", "manager"] },
+      { to: "/payment-reconciliation", label: "Payment Reconciliation", roles: ["admin", "manager"] },
       { to: "/reports", label: "Reports Center" },
       { to: "/revenue-dashboard", label: "Revenue Dashboard" },
       { to: "/promo-codes", label: "Promo Codes" },
@@ -47,13 +41,13 @@ const navGroups: NavGroup[] = [
   {
     label: "Management",
     items: [
-      { to: "/staff", label: "Staff", hiddenFromManager: true },
-      { to: "/users", label: "Users", adminOnly: true },
-      { to: "/audit", label: "Audit", adminOnly: true },
+      { to: "/staff", label: "Staff Operations", roles: ["admin", "manager", "staff"] },
+      { to: "/users", label: "Users", roles: ["admin"] },
+      { to: "/audit", label: "Audit", roles: ["admin"] },
       { to: "/notifications", label: "Notifications" },
-      { to: "/zotel", label: "Zotel Integration", adminOnly: true },
-      { to: "/settings", label: "Settings", hiddenFromManager: true },
-      { to: "/ai-strategist", label: "AI Strategist", adminOnly: true },
+      { to: "/zotel", label: "Zotel Integration", roles: ["admin"] },
+      { to: "/settings", label: "Settings", roles: ["admin"] },
+      { to: "/ai-strategist", label: "AI Strategist", roles: ["admin"] },
     ],
   },
 ];
@@ -71,7 +65,7 @@ export default function Layout() {
   const visibleGroups = navGroups.map((group) => ({
     ...group,
     items: group.items.filter(
-      (item) => (!item.adminOnly || role === "admin") && (!item.hiddenFromManager || role !== "manager") && (!item.managerOrAdminOnly || role === "admin" || role === "manager")
+      (item) => Boolean(role && (item.roles ? item.roles.includes(role as AppRole) : ["admin", "manager", "staff"].includes(role)))
     ),
   })).filter((group) => group.items.length > 0);
 

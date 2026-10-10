@@ -12,6 +12,7 @@ import {
   type ZotelUnmappedRoom,
 } from "../lib/api";
 import { Badge, Button, Card, Drawer, EmptyState, ErrorBanner, PageHeader, Spinner, SuccessBanner, Table, type BadgeTone } from "../components/ui";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 function syncStatusTone(status: string): BadgeTone {
   if (status === "success") return "green";
@@ -81,6 +82,7 @@ export default function ZotelPage() {
   useEffect(() => {
     loadAll();
   }, []);
+  useRealtimeRefresh(["integrations.changed", "properties.changed", "bookings.changed"], loadAll);
 
   function unitLabel(unitId: string): string {
     const unit = units.find((u) => u.id === unitId);

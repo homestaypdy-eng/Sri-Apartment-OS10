@@ -879,6 +879,13 @@ def update_booking_status(
         refund_amount = payload.refund_amount if payload else None
         refund_reason = payload.refund_reason if payload else None
 
+        # Operational cancellation is distinct from refund authority. A
+        # non-admin may cancel, but the eligible refund remains flagged for
+        # owner review and cannot be issued as a cancellation side effect.
+        manager_review = user.role.name != "admin"
+        if manager_review and refund_amount is not None and refund_amount > 0:
+            raise HTTPException(403, "Only an admin may issue a cancellation refund")
+
         if refund_amount and refund_amount > 0:
             available = cancellation_service.refund_available_for_booking(db, booking.id)
             if refund_amount > available:
@@ -889,7 +896,10 @@ def update_booking_status(
 
         try:
             outcome = cancellation_service.cancel_booking(
-                db, booking, actor_user_id=user.id, refund_amount=refund_amount, refund_reason=refund_reason, source="manual",
+                db, booking, actor_user_id=user.id,
+                refund_amount=None if manager_review else refund_amount,
+                refund_reason=refund_reason, source="manual",
+                manual_review_only=manager_review,
             )
         except cancellation_service.CancellationRefundAmountMismatch as exc:
             raise HTTPException(409, str(exc)) from None
@@ -909,7 +919,7 @@ def update_booking_status(
     return booking
 
 
-@router.post("/bookings/{booking_id}/retry-refund", response_model=BookingOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
+@router.post("/bookings/{booking_id}/retry-refund", response_model=BookingOut, dependencies=[Depends(require_role("admin"))])
 def retry_booking_refund(
     booking_id: uuid.UUID,
     background_tasks: BackgroundTasks,
@@ -971,20 +981,18 @@ def update_booking(booking_id: uuid.UUID, payload: BookingUpdate, db: Session = 
     if booking is None:
         raise HTTPException(404, "Booking not found")
 
-    if payload.expected_updated_at is not None:
-        # Optimistic concurrency: if what the editor loaded is no longer
-        # what's in the database, someone else changed this booking in the
-        # meantime — fail the edit rather than silently overwriting it.
-        # Exact comparison (not a tolerance window) — the frontend echoes
-        # back the identical ISO timestamp string it was given, which
-        # round-trips through JSON/pydantic/psycopg without precision loss,
-        # and two genuinely distinct edits can legitimately land within the
-        # same second of each other.
-        if booking.updated_at != payload.expected_updated_at:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "This booking was changed by someone else since you opened it. Reload it and try again.",
-            )
+    if payload.expected_updated_at is None:
+        raise HTTPException(
+            status.HTTP_428_PRECONDITION_REQUIRED,
+            "expected_updated_at is required. Reload the booking before editing it.",
+        )
+    # Optimistic concurrency: if what the editor loaded is no longer what's
+    # in the database, fail rather than silently overwriting a newer edit.
+    if booking.updated_at != payload.expected_updated_at:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This booking was changed by someone else since you opened it. Reload it and try again.",
+        )
 
     changes = payload.model_dump(exclude_unset=True, exclude={"reason", "expected_updated_at"})
     if not changes:

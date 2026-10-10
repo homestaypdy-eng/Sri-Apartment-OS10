@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { api, extractErrorMessage, type UserOut } from "../lib/api";
 
 interface JwtPayload {
@@ -20,6 +20,7 @@ interface AuthContextValue {
   role: string | null;
   isAuthenticated: boolean;
   isInitializing: boolean;
+  syncRoleFromStoredSession: () => void;
   login: (email: string, password: string) => Promise<void>;
   logout: () => void;
 }
@@ -37,6 +38,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // wait for this check instead of racing it.
   const [isInitializing, setIsInitializing] = useState(true);
 
+  const syncRoleFromStoredSession = useCallback(() => {
+    const current = localStorage.getItem("access_token");
+    const payload = current ? decodeJwt(current) : null;
+    setRole(payload && payload.exp * 1000 > Date.now() ? payload.role : null);
+  }, []);
+
   useEffect(() => {
     const token = localStorage.getItem("access_token");
     if (token) {
@@ -49,7 +56,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     }
     setIsInitializing(false);
-  }, []);
+    const updateRole = () => syncRoleFromStoredSession();
+    window.addEventListener("os10:auth-updated", updateRole);
+    window.addEventListener("storage", updateRole);
+    return () => {
+      window.removeEventListener("os10:auth-updated", updateRole);
+      window.removeEventListener("storage", updateRole);
+    };
+  }, [syncRoleFromStoredSession]);
 
   async function login(email: string, password: string) {
     try {
@@ -63,14 +77,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  function logout() {
+  const logout = useCallback(() => {
     localStorage.removeItem("access_token");
     localStorage.removeItem("refresh_token");
     setRole(null);
-  }
+  }, []);
 
   return (
-    <AuthContext.Provider value={{ role, isAuthenticated: !!role, isInitializing, login, logout }}>
+    <AuthContext.Provider value={{ role, isAuthenticated: !!role, isInitializing, syncRoleFromStoredSession, login, logout }}>
       {children}
     </AuthContext.Provider>
   );

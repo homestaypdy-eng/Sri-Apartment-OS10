@@ -52,6 +52,7 @@ from app.modules.audit.schemas import record_audit_log
 from app.modules.auth.models import User
 from app.shared.file_upload import EXTENSION_BY_CONTENT_TYPE, read_and_validate_upload
 from app.shared.rbac import get_current_user, require_role
+from app.shared.staff_task_access import forbid_staff_reassignment, require_assigned_task, scoped_assignee, validate_staff_task_creation
 from fastapi.responses import FileResponse
 
 router = APIRouter(prefix="/api/v1/portal", tags=["guest-portal"])
@@ -364,6 +365,7 @@ def staff_create_request(payload: GuestRequestStaffCreate, db: Session = Depends
         raise HTTPException(400, f"Invalid priority '{payload.priority}'")
     if payload.assigned_to is not None and db.get(User, payload.assigned_to) is None:
         raise HTTPException(404, "Assigned user not found")
+    validate_staff_task_creation(user, payload.assigned_to)
 
     req = GuestRequest(
         guest_id=booking.guest_id,
@@ -384,8 +386,10 @@ def staff_create_request(payload: GuestRequestStaffCreate, db: Session = Depends
 
 
 @staff_router.get("", response_model=list[GuestRequestOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def list_all_requests(status: str | None = None, request_type: str | None = None, db: Session = Depends(get_db)):
+def list_all_requests(status: str | None = None, request_type: str | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     query = select(GuestRequest).order_by(GuestRequest.created_at.desc())
+    if user.role.name == "staff":
+        query = query.where(GuestRequest.assigned_to == scoped_assignee(user, None))
     if status:
         query = query.where(GuestRequest.status == status)
     if request_type:
@@ -397,9 +401,13 @@ def list_all_requests(status: str | None = None, request_type: str | None = None
 def update_request(request_id: uuid.UUID, payload: GuestRequestStaffUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from datetime import datetime, timezone
 
-    req = db.get(GuestRequest, request_id)
+    req = db.get(GuestRequest, request_id, with_for_update=True)
     if req is None:
         raise HTTPException(404, "Request not found")
+    require_assigned_task(user, req.assigned_to)
+    forbid_staff_reassignment(user, payload.model_fields_set)
+    if user.role.name == "staff" and set(payload.model_fields_set) - {"status", "staff_notes"}:
+        raise HTTPException(403, "Staff may only update the status or work notes of assigned guest requests")
 
     changes = []
     if payload.status is not None:
@@ -448,6 +456,7 @@ def submit_guest_feedback(request_id: uuid.UUID, payload: GuestFeedbackCreate, d
     req = db.get(GuestRequest, request_id)
     if req is None:
         raise HTTPException(404, "Request not found")
+    require_assigned_task(user, req.assigned_to)
     req.guest_feedback_rating = payload.rating
     req.guest_feedback_text = payload.text
     record_audit_log(db, user.id, "guest_request.feedback", entity_type="guest_request", entity_id=str(req.id), details=f"Rating: {payload.rating}/5" + (f" — {payload.text}" if payload.text else ""))
@@ -456,7 +465,7 @@ def submit_guest_feedback(request_id: uuid.UUID, payload: GuestFeedbackCreate, d
     return req
 
 
-@staff_router.post("/{request_id}/approve-extension", response_model=GuestRequestOut, dependencies=[Depends(require_role("admin", "staff", "manager"))])
+@staff_router.post("/{request_id}/approve-extension", response_model=GuestRequestOut, dependencies=[Depends(require_role("admin", "manager"))])
 def approve_extension_request(request_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
     The real business-workflow gap this closes: an extend_stay request
@@ -479,6 +488,7 @@ def approve_extension_request(request_id: uuid.UUID, db: Session = Depends(get_d
     req = db.get(GuestRequest, request_id, with_for_update=True)
     if req is None:
         raise HTTPException(404, "Request not found")
+    require_assigned_task(user, req.assigned_to)
     if req.status == "resolved":
         raise HTTPException(409, "This extension request has already been resolved.")
     if req.request_type != "extend_stay":

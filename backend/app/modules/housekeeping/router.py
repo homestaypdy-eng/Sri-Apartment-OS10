@@ -16,6 +16,7 @@ from app.modules.notifications.service import trigger_housekeeping_task_created
 from app.modules.properties.models import Unit
 from app.shared.file_upload import read_and_validate_upload, IMAGE_CONTENT_TYPES
 from app.shared.rbac import get_current_user, require_role
+from app.shared.staff_task_access import forbid_staff_reassignment, require_assigned_task, scoped_assignee, validate_staff_task_creation
 
 PHOTO_STORAGE_DIR = os.environ.get("HOUSEKEEPING_PHOTO_STORAGE_DIR", "/tmp/sri_apartment_housekeeping_photos")
 os.makedirs(PHOTO_STORAGE_DIR, exist_ok=True)
@@ -32,6 +33,7 @@ def create_task(payload: HousekeepingTaskCreate, db: Session = Depends(get_db), 
         raise HTTPException(400, f"Invalid task_type '{payload.task_type}'")
     if payload.assigned_to is not None and db.get(User, payload.assigned_to) is None:
         raise HTTPException(404, "Assigned user not found")
+    validate_staff_task_creation(user, payload.assigned_to)
 
     task = HousekeepingTask(
         unit_id=payload.unit_id,
@@ -56,8 +58,12 @@ def list_tasks(
     limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     query = select(HousekeepingTask)
+    assigned_to = scoped_assignee(user, None)
+    if user.role.name == "staff":
+        query = query.where(HousekeepingTask.assigned_to == assigned_to)
     if unit_id:
         query = query.where(HousekeepingTask.unit_id == unit_id)
     if status:
@@ -74,6 +80,10 @@ def update_task(task_id: uuid.UUID, payload: HousekeepingTaskUpdate, db: Session
     task = db.get(HousekeepingTask, task_id, with_for_update=True)
     if task is None:
         raise HTTPException(404, "Task not found")
+    require_assigned_task(user, task.assigned_to)
+    forbid_staff_reassignment(user, payload.model_fields_set)
+    if user.role.name == "staff" and set(payload.model_fields_set) - {"status", "notes"}:
+        raise HTTPException(403, "Staff may only update the status or notes of assigned housekeeping work")
 
     # Canonical mutation workflow (app/modules/housekeeping/service.py) —
     # also called by staff_ops/router.py's unified Staff Operations
@@ -99,6 +109,7 @@ async def upload_housekeeping_photo(task_id: uuid.UUID, caption: str | None = No
     task = db.get(HousekeepingTask, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    require_assigned_task(user, task.assigned_to)
 
     ext = os.path.splitext(file.filename or "")[1]
     stored_name = f"{task_id}_{uuid.uuid4().hex[:8]}{ext}"
@@ -123,15 +134,21 @@ async def upload_housekeeping_photo(task_id: uuid.UUID, caption: str | None = No
 
 
 @router.get("/{task_id}/photos", response_model=list[HousekeepingPhotoOut], dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def list_housekeeping_photos(task_id: uuid.UUID, db: Session = Depends(get_db)):
+def list_housekeeping_photos(task_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    task = db.get(HousekeepingTask, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    require_assigned_task(user, task.assigned_to)
     return db.scalars(select(HousekeepingPhoto).where(HousekeepingPhoto.task_id == task_id)).all()
 
 
 @router.get("/{task_id}/photos/{photo_id}/download", dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def download_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db)):
+def download_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     photo = db.get(HousekeepingPhoto, photo_id)
     if photo is None or photo.task_id != task_id:
         raise HTTPException(404, "Photo not found")
+    task = db.get(HousekeepingTask, task_id)
+    require_assigned_task(user, task.assigned_to if task else None)
     if not os.path.exists(photo.file_path):
         raise HTTPException(404, "The stored file is missing from disk")
     return FileResponse(photo.file_path, media_type=photo.content_type, filename=photo.filename)
@@ -139,6 +156,8 @@ def download_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Ses
 
 @router.delete("/{task_id}/photos/{photo_id}", status_code=204, dependencies=[Depends(require_role("admin", "staff", "manager"))])
 def delete_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role.name == "staff":
+        raise HTTPException(403, "Staff cannot delete housekeeping evidence")
     photo = db.get(HousekeepingPhoto, photo_id)
     if photo is None or photo.task_id != task_id:
         raise HTTPException(404, "Photo not found")
@@ -150,7 +169,7 @@ def delete_housekeeping_photo(task_id: uuid.UUID, photo_id: uuid.UUID, db: Sessi
 
 
 @router.get("/{task_id}/timeline", dependencies=[Depends(require_role("admin", "staff", "manager"))])
-def get_housekeeping_timeline(task_id: uuid.UUID, db: Session = Depends(get_db)):
+def get_housekeeping_timeline(task_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Every audit-logged event for this task, oldest first — same pattern
     as the booking timeline (a thin read over the shared AuditLog table,
     filtered to this one entity)."""
@@ -159,6 +178,7 @@ def get_housekeeping_timeline(task_id: uuid.UUID, db: Session = Depends(get_db))
     task = db.get(HousekeepingTask, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    require_assigned_task(user, task.assigned_to)
 
     logs = db.scalars(
         select(AuditLog).where(AuditLog.entity_type == "housekeeping_task", AuditLog.entity_id == str(task_id)).order_by(AuditLog.created_at.asc())

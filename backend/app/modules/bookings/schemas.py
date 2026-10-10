@@ -296,11 +296,8 @@ class BookingUpdate(BaseModel):
     departure_time: str | None = None
     reason: str | None = None  # optional free-text reason, logged to the audit trail
     # Optimistic-concurrency token: the value of BookingOut.updated_at the
-    # editor loaded before making changes. Optional and backward-compatible
-    # — omitted entirely, the request is applied without a staleness check
-    # (existing callers keep working); provided, it's compared against the
-    # booking's current updated_at and the request is rejected with 409 if
-    # someone else changed the booking in the meantime.
+    # editor loaded before making changes. The API returns HTTP 428 when an
+    # older client omits it, preventing unchecked stale writes.
     expected_updated_at: datetime | None = None
 
 

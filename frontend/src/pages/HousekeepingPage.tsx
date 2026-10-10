@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, extractErrorMessage, type HousekeepingTaskOut, type HousekeepingPhotoOut, type UnitOut, type UserOut, type TimelineEvent, type InventoryItemOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Spinner, type BadgeTone } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 const TASK_TYPES = ["routine", "checkout_clean", "deep_clean", "inspection"];
 
@@ -85,6 +86,8 @@ export default function HousekeepingPage() {
       setLoading(false);
     }
   }
+
+  useRealtimeRefresh(["housekeeping.changed", "availability.changed", "inventory.changed", "staff_operations.changed"], loadAll);
 
   useEffect(() => {
     loadAll();

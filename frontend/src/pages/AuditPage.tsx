@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, extractErrorMessage, type AuditLogOut, type LoginEventOut } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, Table, Badge } from "../components/ui";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 export default function AuditPage() {
   const [logs, setLogs] = useState<AuditLogOut[]>([]);
@@ -8,14 +9,20 @@ export default function AuditPage() {
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"logs" | "logins">("logs");
 
+  async function load() {
+    try {
+      const [l, li] = await Promise.all([api.get("/audit/logs"), api.get("/audit/logins")]);
+      setLogs(l.data);
+      setLogins(li.data);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }
+
   useEffect(() => {
-    Promise.all([api.get("/audit/logs"), api.get("/audit/logins")])
-      .then(([l, li]) => {
-        setLogs(l.data);
-        setLogins(li.data);
-      })
-      .catch((err) => setError(extractErrorMessage(err)));
+    void load();
   }, []);
+  useRealtimeRefresh(["audit.changed"], load);
 
   return (
     <div>

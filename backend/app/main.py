@@ -47,6 +47,7 @@ from app.modules.portal.auth_email_router import router as portal_email_auth_rou
 from app.modules.properties.router import router as properties_router
 from app.modules.public_booking.router import promo_admin_router, router as public_booking_router
 from app.modules.reports.router import router as reports_router
+from app.shared.realtime_router import router as realtime_router
 from app.modules.settings.router import router as settings_router
 from app.modules.staff.router import router as staff_router
 from app.modules.staff_ops.router import router as staff_ops_router
@@ -193,6 +194,7 @@ app.include_router(public_booking_router)
 app.include_router(promo_admin_router)
 app.include_router(finance_router)
 app.include_router(messaging_router)
+app.include_router(realtime_router)
 
 
 @app.get("/health")

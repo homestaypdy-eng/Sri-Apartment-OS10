@@ -149,7 +149,7 @@ def refund_payment(payment_id: uuid.UUID, payload: RefundCreate, db: Session = D
     return refund
 
 
-@router.get("/payments/{booking_id}", response_model=list[PaymentOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/payments/{booking_id}", response_model=list[PaymentOut], dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def list_payments_for_booking(booking_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(Payment).where(Payment.booking_id == booking_id)).all()
 
@@ -268,7 +268,7 @@ def generate_invoice(booking_id: uuid.UUID, db: Session = Depends(get_db), user:
     return invoice
 
 
-@router.get("/invoices/{invoice_id}/pdf", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/invoices/{invoice_id}/pdf", dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def download_invoice_pdf(invoice_id: uuid.UUID, db: Session = Depends(get_db)):
     invoice = db.get(Invoice, invoice_id)
     if invoice is None:
@@ -287,7 +287,7 @@ def download_invoice_pdf(invoice_id: uuid.UUID, db: Session = Depends(get_db)):
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"{invoice.invoice_no.replace('/', '_')}.pdf")
 
 
-@router.get("/invoices/by-booking/{booking_id}", response_model=InvoiceOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/invoices/by-booking/{booking_id}", response_model=InvoiceOut, dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def get_invoice_by_booking(booking_id: uuid.UUID, db: Session = Depends(get_db)):
     invoice = db.scalar(select(Invoice).where(Invoice.booking_id == booking_id))
     if invoice is None:
@@ -295,7 +295,7 @@ def get_invoice_by_booking(booking_id: uuid.UUID, db: Session = Depends(get_db))
     return invoice
 
 
-@router.post("/invoices/{invoice_id}/send/email", response_model=SendInvoiceEmailResponse, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/invoices/{invoice_id}/send/email", response_model=SendInvoiceEmailResponse, dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def send_invoice_email(invoice_id: uuid.UUID, payload: SendInvoiceEmailRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     invoice = db.get(Invoice, invoice_id)
     if invoice is None:
@@ -333,7 +333,7 @@ def send_invoice_email(invoice_id: uuid.UUID, payload: SendInvoiceEmailRequest, 
     return SendInvoiceEmailResponse(sent=bool(sent), to_email=to_email)
 
 
-@router.post("/invoices/{invoice_id}/send/whatsapp", response_model=SendInvoiceWhatsAppResponse, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/invoices/{invoice_id}/send/whatsapp", response_model=SendInvoiceWhatsAppResponse, dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def send_invoice_whatsapp(invoice_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     from urllib.parse import quote as _urlquote
 
@@ -405,12 +405,12 @@ def create_credit_note(invoice_id: uuid.UUID, payload: CreditNoteCreate, db: Ses
     return credit_note
 
 
-@router.get("/invoices/{invoice_id}/credit-notes", response_model=list[CreditNoteOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/invoices/{invoice_id}/credit-notes", response_model=list[CreditNoteOut], dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def list_credit_notes(invoice_id: uuid.UUID, db: Session = Depends(get_db)):
     return db.scalars(select(CreditNote).where(CreditNote.invoice_id == invoice_id)).all()
 
 
-@router.get("/credit-notes/{credit_note_id}/pdf", dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/credit-notes/{credit_note_id}/pdf", dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def download_credit_note_pdf(credit_note_id: uuid.UUID, db: Session = Depends(get_db)):
     credit_note = db.get(CreditNote, credit_note_id)
     if credit_note is None:

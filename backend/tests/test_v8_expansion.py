@@ -159,7 +159,7 @@ def test_booking_edit_can_update_guest_count(headers):
         "unit_id": unit_id, "guest_id": guest["id"],
         "check_in": (date.today() + timedelta(days=2110)).isoformat(), "check_out": (date.today() + timedelta(days=2112)).isoformat(),
     }).json()
-    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"adults": 3, "extra_bed": True})
+    resp = client.patch(f"/api/v1/bookings/{booking['id']}", headers=headers, json={"adults": 3, "extra_bed": True, "expected_updated_at": booking["updated_at"]})
     assert resp.status_code == 200, resp.text
     assert resp.json()["adults"] == 3
     assert resp.json()["extra_bed"] is True

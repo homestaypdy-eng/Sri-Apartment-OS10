@@ -3,12 +3,14 @@ import uuid
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.modules.auth.models import User
+from app.core.security import hash_password
+from app.modules.auth.models import Role, User
+from app.modules.auth.schemas import UserCreate, UserOut
 from app.modules.staff import hr_policy
 from app.modules.staff.models import (
     Attendance,
@@ -45,6 +47,9 @@ from app.modules.staff.schemas import (
     StaffApartmentAssignmentOut,
     StaffDesignationCreate,
     StaffDesignationOut,
+    StaffOperationalUserOut,
+    StaffOnboardingCreate,
+    StaffOnboardingOut,
     StaffDesignationUpdate,
     StaffPerformanceNoteCreate,
     StaffPerformanceNoteOut,
@@ -59,6 +64,79 @@ from app.modules.properties.models import Unit
 from app.shared.rbac import get_current_user, require_role
 
 router = APIRouter(prefix="/api/v1/staff", tags=["staff"])
+
+
+@router.get("/operational-users", response_model=list[StaffOperationalUserOut], dependencies=[Depends(require_role("admin", "manager"))])
+def list_operational_users(db: Session = Depends(get_db)):
+    """Minimal active staff roster for daily scheduling; never exposes account credentials/contact details."""
+    rows = db.scalars(select(User).where(User.is_active.is_(True)).order_by(User.name)).all()
+    return [StaffOperationalUserOut(id=row.id, name=row.name, role=row.role.name) for row in rows if row.role.name == "staff"]
+
+
+def _ensure_employee_id_available(db: Session, employee_id: str | None, *, excluding_profile_id: uuid.UUID | None = None) -> None:
+    normalized = employee_id.strip() if employee_id else None
+    if not normalized:
+        return
+    query = select(StaffProfile.id).where(func.lower(StaffProfile.employee_id) == normalized.lower())
+    if excluding_profile_id is not None:
+        query = query.where(StaffProfile.id != excluding_profile_id)
+    if db.scalar(query) is not None:
+        raise HTTPException(409, "Employee ID is already in use")
+
+
+@router.post("/onboard", response_model=StaffOnboardingOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+def onboard_staff(payload: StaffOnboardingCreate, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
+    """Create the existing canonical User + StaffProfile in one transaction.
+
+    This phase intentionally creates a Staff login: true loginless employee
+    identities require a separate approved architecture decision.
+    """
+    account = UserCreate(name=payload.name, email=payload.email, password=payload.password, role="staff")
+    if db.scalar(select(User.id).where(func.lower(User.email) == str(account.email).lower())) is not None:
+        raise HTTPException(409, "Email already registered")
+
+    role = db.scalar(select(Role).where(Role.name == "staff"))
+    if role is None:
+        raise HTTPException(409, "Staff role is not provisioned")
+
+    user = User(name=account.name.strip(), email=str(account.email).lower(), password_hash=hash_password(account.password), role_id=role.id)
+    db.add(user)
+    try:
+        db.flush()
+        profile_payload = StaffProfileCreate.model_validate({**payload.profile, "user_id": user.id})
+        _ensure_employee_id_available(db, profile_payload.employee_id)
+        if profile_payload.employee_id:
+            profile_payload.employee_id = profile_payload.employee_id.strip()
+        if profile_payload.designation_id is not None:
+            designation = db.get(StaffDesignation, profile_payload.designation_id)
+            if designation is None or not designation.is_active:
+                raise HTTPException(404, "Active designation not found")
+        if profile_payload.supervisor_user_id is not None:
+            if profile_payload.supervisor_user_id == user.id:
+                raise HTTPException(400, "A staff member cannot be their own supervisor")
+            if db.get(User, profile_payload.supervisor_user_id) is None:
+                raise HTTPException(404, "Supervisor user not found")
+        profile = StaffProfile(**profile_payload.model_dump())
+        db.add(profile)
+        for unit_id in dict.fromkeys(payload.assigned_unit_ids):
+            unit = db.get(Unit, unit_id)
+            if unit is None:
+                raise HTTPException(404, "Assigned apartment not found")
+            if not unit.is_active or not unit.property.is_active:
+                raise HTTPException(409, "An assigned apartment or property is inactive")
+            db.add(StaffApartmentAssignment(user_id=user.id, unit_id=unit_id))
+        db.flush()
+        record_audit_log(db, actor.id, "staff.onboard", entity_type="user", entity_id=str(user.id), details=f"Staff account and profile created for {user.email}")
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Staff account, employee ID, or apartment assignment conflicts with an existing record")
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(user)
+    db.refresh(profile)
+    return StaffOnboardingOut(user=UserOut(id=user.id, name=user.name, email=user.email, role="staff", is_active=user.is_active), profile=profile)
 
 
 def _resolved_policy_for_user(db: Session, user_id: uuid.UUID) -> tuple[StaffProfile | None, StaffDesignation | None, hr_policy.ResolvedPolicy]:
@@ -106,8 +184,14 @@ def _maybe_compute_attendance_hours(record: Attendance, db: Session) -> None:
 
 # --- Attendance ---
 
-@router.post("/attendance", response_model=AttendanceOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
+@router.post("/attendance", response_model=AttendanceOut, status_code=201, dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def mark_attendance(payload: AttendanceCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role.name == "staff" and payload.user_id != user.id:
+        raise HTTPException(403, "You can only record your own attendance")
+    if user.role.name == "manager" and payload.user_id != user.id:
+        target = db.get(User, payload.user_id)
+        if target is None or target.role.name != "staff":
+            raise HTTPException(403, "Managers may record attendance only for operational staff")
     record = Attendance(**payload.model_dump())
     db.add(record)
     try:
@@ -122,15 +206,21 @@ def mark_attendance(payload: AttendanceCreate, db: Session = Depends(get_db), us
     return record
 
 
-@router.get("/attendance", response_model=list[AttendanceOut], dependencies=[Depends(require_role("admin", "staff"))])
-def list_attendance(user_id: uuid.UUID | None = None, limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
+@router.get("/attendance", response_model=list[AttendanceOut], dependencies=[Depends(require_role("admin", "manager", "staff"))])
+def list_attendance(user_id: uuid.UUID | None = None, limit: int = Query(200, ge=1, le=500), offset: int = Query(0, ge=0), db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
+    if actor.role.name == "staff":
+        if user_id is not None and user_id != actor.id:
+            raise HTTPException(403, "You can only view your own attendance")
+        user_id = actor.id
     query = select(Attendance).order_by(Attendance.date.desc(), Attendance.id)
+    if actor.role.name == "manager":
+        query = query.join(User, Attendance.user_id == User.id).where((User.role.has(name="staff")) | (User.id == actor.id))
     if user_id:
         query = query.where(Attendance.user_id == user_id)
     return db.scalars(query.offset(offset).limit(limit)).all()
 
 
-@router.patch("/attendance/{attendance_id}", response_model=AttendanceOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.patch("/attendance/{attendance_id}", response_model=AttendanceOut, dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def update_attendance(attendance_id: uuid.UUID, payload: AttendanceUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
     Records a check-out (or corrects/backfills a missed one) on an
@@ -143,8 +233,12 @@ def update_attendance(attendance_id: uuid.UUID, payload: AttendanceUpdate, db: S
     record = db.get(Attendance, attendance_id)
     if record is None:
         raise HTTPException(404, "Attendance record not found")
-    if user.role.name != "admin" and record.user_id != user.id:
+    if user.role.name == "staff" and record.user_id != user.id:
         raise HTTPException(403, "You can only update your own attendance")
+    if user.role.name == "manager" and record.user_id != user.id:
+        target = db.get(User, record.user_id)
+        if target is None or target.role.name != "staff":
+            raise HTTPException(403, "Managers may update attendance only for operational staff")
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(400, "No fields to update were provided")
@@ -157,7 +251,7 @@ def update_attendance(attendance_id: uuid.UUID, payload: AttendanceUpdate, db: S
     return record
 
 
-@router.get("/attendance/monthly-summary", response_model=AttendanceMonthlySummaryOut, dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/attendance/monthly-summary", response_model=AttendanceMonthlySummaryOut, dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def attendance_monthly_summary(
     user_id: uuid.UUID = Query(...),
     year: int = Query(...),
@@ -172,8 +266,12 @@ def attendance_monthly_summary(
     anything and never computes a salary deduction — excess leave days are
     surfaced as a count only (see hr_policy.split_free_and_excess_leave).
     """
-    if actor.role.name != "admin" and actor.id != user_id:
+    if actor.role.name == "staff" and actor.id != user_id:
         raise HTTPException(403, "You can only view your own attendance summary")
+    if actor.role.name == "manager" and actor.id != user_id:
+        target = db.get(User, user_id)
+        if target is None or target.role.name != "staff":
+            raise HTTPException(403, "Managers may view attendance summaries only for operational staff")
 
     attendance_rows = db.scalars(
         select(Attendance).where(
@@ -207,6 +305,8 @@ def attendance_monthly_summary(
 
 @router.post("/leave", response_model=LeaveRequestOut, status_code=201, dependencies=[Depends(require_role("admin", "staff"))])
 def apply_leave(payload: LeaveRequestCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role.name == "staff" and payload.user_id != user.id:
+        raise HTTPException(403, "You can only submit your own leave request")
     if payload.to_date < payload.from_date:
         raise HTTPException(400, "to_date must be on or after from_date")
     leave = LeaveRequest(**payload.model_dump(), status="pending")
@@ -219,8 +319,12 @@ def apply_leave(payload: LeaveRequestCreate, db: Session = Depends(get_db), user
 
 
 @router.get("/leave", response_model=list[LeaveRequestOut], dependencies=[Depends(require_role("admin", "staff"))])
-def list_leave(user_id: uuid.UUID | None = None, status: str | None = None, db: Session = Depends(get_db)):
+def list_leave(user_id: uuid.UUID | None = None, status: str | None = None, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
     query = select(LeaveRequest).order_by(LeaveRequest.created_at.desc())
+    if actor.role.name == "staff":
+        if user_id is not None and user_id != actor.id:
+            raise HTTPException(403, "You can only view your own leave requests")
+        user_id = actor.id
     if user_id:
         query = query.where(LeaveRequest.user_id == user_id)
     if status:
@@ -267,8 +371,12 @@ def generate_payroll(payload: PayrollCreate, db: Session = Depends(get_db), user
 
 
 @router.get("/payroll", response_model=list[PayrollOut], dependencies=[Depends(require_role("admin", "staff"))])
-def list_payroll(user_id: uuid.UUID | None = None, db: Session = Depends(get_db)):
+def list_payroll(user_id: uuid.UUID | None = None, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
     query = select(Payroll).order_by(Payroll.period_year.desc(), Payroll.period_month.desc())
+    if actor.role.name == "staff":
+        if user_id is not None and user_id != actor.id:
+            raise HTTPException(403, "You can only view your own payroll records")
+        user_id = actor.id
     if user_id:
         query = query.where(Payroll.user_id == user_id)
     return db.scalars(query).all()
@@ -420,8 +528,12 @@ def get_resolved_policy(user_id: uuid.UUID, db: Session = Depends(get_db), actor
 
 # --- Shifts ---
 
-@router.post("/shifts", response_model=ShiftOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+@router.post("/shifts", response_model=ShiftOut, status_code=201, dependencies=[Depends(require_role("admin", "manager"))])
 def create_shift(payload: ShiftCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role.name == "manager":
+        target = db.get(User, payload.user_id)
+        if target is None or target.role.name != "staff":
+            raise HTTPException(403, "Managers may schedule only operational staff")
     shift = Shift(**payload.model_dump())
     db.add(shift)
     db.flush()
@@ -431,9 +543,15 @@ def create_shift(payload: ShiftCreate, db: Session = Depends(get_db), user: User
     return shift
 
 
-@router.get("/shifts", response_model=list[ShiftOut], dependencies=[Depends(require_role("admin", "staff"))])
-def list_shifts(user_id: uuid.UUID | None = None, db: Session = Depends(get_db)):
+@router.get("/shifts", response_model=list[ShiftOut], dependencies=[Depends(require_role("admin", "manager", "staff"))])
+def list_shifts(user_id: uuid.UUID | None = None, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
     query = select(Shift).order_by(Shift.date.desc())
+    if actor.role.name == "staff":
+        if user_id is not None and user_id != actor.id:
+            raise HTTPException(403, "You can only view your own shifts")
+        user_id = actor.id
+    elif actor.role.name == "manager":
+        query = query.join(User, Shift.user_id == User.id).where((User.role.has(name="staff")) | (User.id == actor.id))
     if user_id:
         query = query.where(Shift.user_id == user_id)
     return db.scalars(query).all()
@@ -441,7 +559,7 @@ def list_shifts(user_id: uuid.UUID | None = None, db: Session = Depends(get_db))
 
 # --- Holidays ---
 
-@router.post("/holidays", response_model=HolidayOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+@router.post("/holidays", response_model=HolidayOut, status_code=201, dependencies=[Depends(require_role("admin", "manager"))])
 def create_holiday(payload: HolidayCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     holiday = Holiday(**payload.model_dump())
     db.add(holiday)
@@ -456,15 +574,18 @@ def create_holiday(payload: HolidayCreate, db: Session = Depends(get_db), user: 
     return holiday
 
 
-@router.get("/holidays", response_model=list[HolidayOut], dependencies=[Depends(require_role("admin", "staff"))])
+@router.get("/holidays", response_model=list[HolidayOut], dependencies=[Depends(require_role("admin", "manager", "staff"))])
 def list_holidays(db: Session = Depends(get_db)):
     return db.scalars(select(Holiday).order_by(Holiday.date.asc())).all()
 
 
-@router.post("/apartment-assignments", response_model=StaffApartmentAssignmentOut, status_code=201, dependencies=[Depends(require_role("admin"))])
+@router.post("/apartment-assignments", response_model=StaffApartmentAssignmentOut, status_code=201, dependencies=[Depends(require_role("admin", "manager"))])
 def create_apartment_assignment(payload: StaffApartmentAssignmentCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    if db.get(User, payload.user_id) is None:
+    target_user = db.get(User, payload.user_id)
+    if target_user is None:
         raise HTTPException(404, "Staff user not found")
+    if user.role.name == "manager" and target_user.role.name != "staff":
+        raise HTTPException(403, "Managers may assign apartments only to operational staff")
     unit = db.get(Unit, payload.unit_id)
     if unit is None:
         raise HTTPException(404, "Unit not found")
@@ -483,9 +604,15 @@ def create_apartment_assignment(payload: StaffApartmentAssignmentCreate, db: Ses
     return assignment
 
 
-@router.get("/apartment-assignments", response_model=list[StaffApartmentAssignmentOut], dependencies=[Depends(require_role("admin", "staff"))])
-def list_apartment_assignments(user_id: uuid.UUID | None = None, unit_id: uuid.UUID | None = None, db: Session = Depends(get_db)):
+@router.get("/apartment-assignments", response_model=list[StaffApartmentAssignmentOut], dependencies=[Depends(require_role("admin", "manager", "staff"))])
+def list_apartment_assignments(user_id: uuid.UUID | None = None, unit_id: uuid.UUID | None = None, db: Session = Depends(get_db), actor: User = Depends(get_current_user)):
     query = select(StaffApartmentAssignment)
+    if actor.role.name == "staff":
+        if user_id is not None and user_id != actor.id:
+            raise HTTPException(403, "You can only view your own apartment assignments")
+        user_id = actor.id
+    elif actor.role.name == "manager":
+        query = query.join(User, StaffApartmentAssignment.user_id == User.id).where((User.role.has(name="staff")) | (User.id == actor.id))
     if user_id:
         query = query.where(StaffApartmentAssignment.user_id == user_id)
     if unit_id:
@@ -493,11 +620,15 @@ def list_apartment_assignments(user_id: uuid.UUID | None = None, unit_id: uuid.U
     return db.scalars(query).all()
 
 
-@router.delete("/apartment-assignments/{assignment_id}", status_code=204, dependencies=[Depends(require_role("admin"))])
+@router.delete("/apartment-assignments/{assignment_id}", status_code=204, dependencies=[Depends(require_role("admin", "manager"))])
 def delete_apartment_assignment(assignment_id: uuid.UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     assignment = db.get(StaffApartmentAssignment, assignment_id)
     if assignment is None:
         raise HTTPException(404, "Assignment not found")
+    if user.role.name == "manager":
+        target_user = db.get(User, assignment.user_id)
+        if target_user is None or target_user.role.name != "staff":
+            raise HTTPException(403, "Managers may remove apartment assignments only for operational staff")
     record_audit_log(db, user.id, "staff.apartment_assignment.delete", entity_type="staff_apartment_assignment", entity_id=str(assignment.id), details=f"user={assignment.user_id}, unit={assignment.unit_id}")
     db.delete(assignment)
     db.commit()
@@ -531,6 +662,9 @@ def create_staff_profile(payload: StaffProfileCreate, db: Session = Depends(get_
         raise HTTPException(404, "User not found")
     if db.scalar(select(StaffProfile).where(StaffProfile.user_id == payload.user_id)) is not None:
         raise HTTPException(409, "This user already has a staff profile")
+    _ensure_employee_id_available(db, payload.employee_id)
+    if payload.employee_id:
+        payload.employee_id = payload.employee_id.strip()
     if payload.supervisor_user_id is not None:
         if payload.supervisor_user_id == payload.user_id:
             raise HTTPException(400, "A staff member cannot be their own supervisor")
@@ -572,6 +706,9 @@ def update_staff_profile(profile_id: uuid.UUID, payload: StaffProfileUpdate, db:
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(400, "No fields to update were provided")
+    if "employee_id" in changes:
+        _ensure_employee_id_available(db, changes["employee_id"], excluding_profile_id=profile.id)
+        changes["employee_id"] = changes["employee_id"].strip() if changes["employee_id"] else None
     if "supervisor_user_id" in changes and changes["supervisor_user_id"] is not None:
         if changes["supervisor_user_id"] == profile.user_id:
             raise HTTPException(400, "A staff member cannot be their own supervisor")

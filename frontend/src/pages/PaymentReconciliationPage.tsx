@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, extractErrorMessage } from "../lib/api";
 import { Badge, Card, EmptyState, ErrorBanner, PageHeader, Table } from "../components/ui";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 type ReconciliationCase = {
   id: string;
@@ -21,11 +22,16 @@ export default function PaymentReconciliationPage() {
   const [cases, setCases] = useState<ReconciliationCase[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    api.get("/payment-gateway/reconciliation")
-      .then(({ data }) => setCases(data))
-      .catch((err) => setError(extractErrorMessage(err)));
-  }, []);
+  async function load() {
+    try {
+      const { data } = await api.get("/payment-gateway/reconciliation");
+      setCases(data);
+      setError(null);
+    } catch (err) { setError(extractErrorMessage(err)); }
+  }
+
+  useEffect(() => { void load(); }, []);
+  useRealtimeRefresh(["payments.changed", "bookings.changed"], load);
 
   return (
     <div>

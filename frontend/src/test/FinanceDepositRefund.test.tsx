@@ -100,9 +100,9 @@ describe("FinancePage — Deposits tab refund visibility (RBAC Phase B security 
     await waitFor(() => expect(apiPost).toHaveBeenCalledWith(`/finance/deposits/${DEPOSIT.id}/refund`, { refund_amount: 500 }));
   });
 
-  it("Staff retains the Refund control (existing behavior unchanged)", async () => {
+  it("Staff cannot see the owner-only Refund control", async () => {
     await renderFinanceAs("staff");
     await waitFor(() => expect(screen.getByText("₹5,000")).toBeInTheDocument());
-    expect(screen.getByRole("button", { name: "Refund" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Refund" })).not.toBeInTheDocument();
   });
 });

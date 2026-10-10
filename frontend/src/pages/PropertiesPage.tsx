@@ -13,6 +13,7 @@ import {
 } from "../lib/api";
 import { Card, PageHeader, ErrorBanner, SuccessBanner, Button, Table, Badge, EmptyState, Drawer, type BadgeTone } from "../components/ui";
 import { useAuth } from "../context/AuthContext";
+import { useRealtimeRefresh } from "../lib/realtime";
 
 // Property.property_type stays an unconstrained backend string — this is a
 // suggested vocabulary for the dropdown, not an enforced one. "Other" falls
@@ -441,6 +442,8 @@ export default function PropertiesPage() {
       setError(extractErrorMessage(err));
     }
   }
+
+  useRealtimeRefresh(["properties.changed", "availability.changed", "maintenance.changed", "housekeeping.changed"], loadAll);
 
   useEffect(() => {
     loadAll();
