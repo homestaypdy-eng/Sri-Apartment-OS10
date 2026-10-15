@@ -1549,3 +1549,8 @@ This rule has changed before (this structure itself replaced a flat-12% system o
 
 This completes the requested Phase 9 scope (full frontend for all Phase 8 modules, mobile responsiveness, PWA packaging), with the limitations above stated plainly. Natural next candidates, roughly in order of practical value: (1) real device/browser QA once you have physical devices or a Playwright-capable environment, (2) remove the `dev_magic_token` testability concession before onboarding real guests, (3) wire Settings into PDF generation, (4) Alembic migrations before the next schema change, (5) real SMTP/Razorpay credentials plus end-to-end delivery/payment verification. Say the word on which, and I'll build and test it the same way: real code, run against a real database, with a test suite you can rerun.
 
+
+
+## Customer website (port 5175)
+
+The customer-facing application is in [customer-website](customer-website/README.md). It has independent npm scripts and build/test checks. Adding its source does not deploy the site or publish local backend changes.

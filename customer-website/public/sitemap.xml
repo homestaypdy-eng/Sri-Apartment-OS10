@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Apartment URLs below are a snapshot of what's actually live on OS10
+  (verified in WEBSITE-01/02 against the running instance: Flat A1, A2,
+  B3, B4, C5, C6 — the same six units GET /api/v1/public/units returns
+  today). This is hand-maintained, not generated — if OS10's unit list
+  changes (a unit added, renamed, or deactivated), this file needs a
+  matching update, or it will drift. Generating it at deploy time from a
+  real API call remains a documented follow-up, not done here.
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://sriapartment.in/</loc></url>
+  <url><loc>https://sriapartment.in/apartments</loc></url>
+  <url><loc>https://sriapartment.in/apartments/A1</loc></url>
+  <url><loc>https://sriapartment.in/apartments/A2</loc></url>
+  <url><loc>https://sriapartment.in/apartments/B3</loc></url>
+  <url><loc>https://sriapartment.in/apartments/B4</loc></url>
+  <url><loc>https://sriapartment.in/apartments/C5</loc></url>
+  <url><loc>https://sriapartment.in/apartments/C6</loc></url>
+  <url><loc>https://sriapartment.in/amenities</loc></url>
+  <url><loc>https://sriapartment.in/gallery</loc></url>
+  <url><loc>https://sriapartment.in/faq</loc></url>
+  <url><loc>https://sriapartment.in/location</loc></url>
+  <url><loc>https://sriapartment.in/contact</loc></url>
+  <url><loc>https://sriapartment.in/book</loc></url>
+</urlset>

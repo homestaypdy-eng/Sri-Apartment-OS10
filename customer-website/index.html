@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+    <title>Sri Apartment Homestay Pondicherry — Book Direct</title>
+    <meta name="description" content="Comfortable accommodations in Moolakulam, Puducherry. Book direct for instant confirmation and no OTA fees." />
+    <!-- Domain carried over from the Enterprise v5 prototype's own metadata,
+         not independently re-verified this phase — confirm ownership before
+         relying on it for canonical/OG URLs in production. -->
+    <link rel="canonical" href="https://sriapartment.in/" />
+    <meta name="robots" content="index, follow" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Sri Apartment Homestay Pondicherry — Book Direct" />
+    <meta property="og:description" content="Comfortable accommodations in Moolakulam, Puducherry. Book direct for instant confirmation and no OTA fees." />
+    <meta property="og:url" content="https://sriapartment.in/" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Sri Apartment Homestay Pondicherry — Book Direct" />
+    <meta name="twitter:description" content="Comfortable accommodations in Moolakulam, Puducherry." />
+
+    <!--
+      Structured data — verified facts only (address, phone, email,
+      check-in/out times). Deliberately NO aggregateRating / starRating /
+      reviewCount: WEBSITE-00 flagged the Enterprise v5 prototype for
+      showing an unverified "4.8 · 324 reviews" claim in both its hero
+      copy and this same schema block. Add a rating block here only once
+      there's a real, verifiable source for the numbers.
+      No numberOfRooms either (Phase 3): this static file can't reflect
+      OS10's live inventory count, and hardcoding a number here would
+      immediately go stale the moment inventory changes in OS10 Admin —
+      omitted rather than risk a permanent, wrong claim.
+    -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "LodgingBusiness",
+        "name": "Sri Apartment Homestay",
+        "description": "Comfortable accommodations in Moolakulam, Puducherry.",
+        "telephone": "+918870237237",
+        "email": "homestaypdy@gmail.com",
+        "address": {
+          "@type": "PostalAddress",
+          "streetAddress": "163, 2nd Cross St, MGR Nagar South Extension, Ranga Nagar, Moolakulam",
+          "addressLocality": "Puducherry",
+          "postalCode": "605010",
+          "addressCountry": "IN"
+        },
+        "checkinTime": "12:30",
+        "checkoutTime": "11:00",
+        "currenciesAccepted": "INR",
+        "paymentAccepted": "UPI, Credit Card, Debit Card, Net Banking, Razorpay"
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,31 @@
+name: Customer website checks
+on:
+  push:
+    paths:
+      - 'customer-website/**'
+      - '.github/workflows/customer-website.yml'
+  pull_request:
+    paths:
+      - 'customer-website/**'
+      - '.github/workflows/customer-website.yml'
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: customer-website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: customer-website/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+      - run: npm run build
+        env:
+          VITE_API_BASE_URL: https://os10-api.example.invalid

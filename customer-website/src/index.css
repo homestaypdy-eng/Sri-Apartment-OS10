@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+/*
+  Brand tokens carried over from the Enterprise v5 prototype
+  (SriApartment-Enterprise-v5-gst.html) — same green/gold/cream palette,
+  same Cormorant Garamond + Jost type pairing. This is the one part of the
+  prototype we DO port directly: it's pure design, no business logic.
+*/
+@theme {
+  --font-serif: "Cormorant Garamond", ui-serif, Georgia, serif;
+  --font-sans: "Jost", ui-sans-serif, system-ui, sans-serif;
+
+  --color-brand-green: #0f3d3a;
+  --color-brand-green-2: #165c57;
+  --color-brand-green-3: #0a2a28;
+  --color-brand-green-4: #1e6b65;
+
+  --color-brand-gold: #c9a14a;
+  --color-brand-gold-2: #e8c270;
+  --color-brand-gold-3: #f5e9cc;
+  --color-brand-gold-4: #7a5c1e;
+
+  --color-brand-cream: #fdfaf5;
+  --color-brand-cream-2: #f7f2e8;
+  --color-brand-cream-3: #ede8da;
+
+  --color-brand-ink: #181816;
+  --color-brand-ink-2: #3a3a36;
+  /* Accessibility fix (Lighthouse audit): the original #7a7a70 measured
+     3.88-4.33:1 against this site's actual backgrounds (brand-cream,
+     brand-cream-2, white) — below WCAG AA's 4.5:1 minimum for normal
+     text. Darkened just enough to clear 4.5:1 against all of them
+     (5.04-5.62:1) while keeping the same hue/character — this is the
+     minimal change that passes, not a redesign. */
+  --color-brand-muted: #686860;
+  --color-brand-border: #ddd8cc;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-brand-cream text-brand-ink font-sans antialiased;
+  }
+
+  /* Respect reduced-motion preference (Step 17) — smooth scroll and any
+     future CSS transitions/animations back off for users who asked for it. */
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* Visible focus ring everywhere by default (Step 17) — WEBSITE-00 found
+     the prototype had no focus style at all on the booking-bar inputs.
+     Fixing it once, globally, here means no component can regress it. */
+  :focus-visible {
+    outline: 2px solid var(--color-brand-gold);
+    outline-offset: 2px;
+  }
+}
